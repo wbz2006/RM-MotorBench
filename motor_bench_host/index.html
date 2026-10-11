@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>电机测试台 · Motor Bench</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" id="linkDot"></span>
+        <h1>电机测试台</h1>
+      </div>
+      <div class="link-state">
+        <span id="linkText">未连接</span>
+        <span class="fw" id="fwText"></span>
+      </div>
+      <button id="estop" class="estop" title="立即停止全部电机">急停 ALL STOP</button>
+    </header>
+
+    <section class="panel serial">
+      <label>
+        串口
+        <select id="portSelect">
+          <option value="">点击刷新…</option>
+        </select>
+      </label>
+      <button id="refreshPorts">刷新</button>
+      <button id="openPort">打开</button>
+      <button id="closePort" class="ghost">关闭</button>
+      <button id="rescan" class="ghost">重新获取电机清单</button>
+    </section>
+
+    <!--
+      动态添加电机:板端启动后清单为空,需在此按"实际电调拨码 ID"现场添加。
+      这是"换电机不用重烧固件"的入口。
+    -->
+    <section class="panel addmotor">
+      <span class="panel-title">添加电机</span>
+      <label>
+        型号
+        <select id="addKind">
+          <option value="1">大疆 GM6020</option>
+          <option value="2">大疆 M3508</option>
+          <option value="3">大疆 M2006</option>
+          <option value="4">达妙 DM 系列</option>
+        </select>
+      </label>
+      <label>
+        总线
+        <select id="addBus">
+          <option value="1">CAN1</option>
+          <option value="2">CAN2</option>
+        </select>
+      </label>
+      <label>
+        电调 ID
+        <input id="addId" type="number" min="1" max="8" value="1" />
+      </label>
+      <button id="addMotor">添加</button>
+      <span id="addMsg" class="hint"></span>
+    </section>
+
+    <section class="panel hint-panel">
+      <strong>ID 冲突提示:</strong>6020 的反馈 ID 是 <code>0x204+ID</code>(0x205~0x20C),
+      3508/2006 是 <code>0x200+ID</code>(0x201~0x208),<strong>两段区间重叠</strong>。
+      所以 6020 不能与 3508/2006 挂在<strong>同一条总线</strong>上 —— 例如 6020 用 ID1 会和
+      3508 用 ID5 撞车。建议:<strong>CAN1 只接 6020,CAN2 接 3508/2006</strong>。
+      每条总线最多挂 14 颗(受 CAN 过滤器数量限制)。
+    </section>
+
+    <main id="channels" class="channels"></main>
+
+    <template id="channelTpl">
+      <article class="channel" data-empty="1">
+        <header>
+          <span class="ch-title">通道</span>
+          <span class="badge" data-role="status">未绑定</span>
+        </header>
+
+        <div class="bind-row">
+          <select data-role="motor" class="motor-select">
+            <option value="">选择电机…</option>
+          </select>
+          <select data-role="loop" class="loop-select">
+            <option value="2">速度环</option>
+            <option value="0">开环</option>
+            <option value="1">电流环</option>
+            <option value="4">角度环</option>
+          </select>
+          <button data-role="bind">绑定</button>
+          <button data-role="unbind" class="ghost">解绑</button>
+        </div>
+
+        <div class="readout">
+          <div class="metric"><span>设定</span><b data-role="ref">--</b></div>
+          <div class="metric"><span>实测转速</span><b data-role="speed">--</b></div>
+          <div class="metric"><span>电流/转矩</span><b data-role="torque">--</b></div>
+          <div class="metric"><span>角度</span><b data-role="angle">--</b></div>
+          <div class="metric"><span>温度</span><b data-role="temp">--</b></div>
+        </div>
+
+        <div class="control">
+          <input type="range" data-role="slider" min="-6000" max="6000" step="10" value="0" />
+          <div class="control-row">
+            <input type="number" data-role="num" step="1" value="0" />
+            <span class="unit" data-role="unit">rpm</span>
+            <button data-role="enable" class="enable">使能</button>
+            <button data-role="zero" class="ghost">归零</button>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <footer class="hint">
+      <p>
+        安全说明:电机在固件中预先登记,上位机只能选择清单内的电机。
+        <strong>未使能前电机不出力</strong>;约 1 秒收不到上位机心跳,A 板会自动全停;
+        关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
+      </p>
+    </footer>
+
+    <script type="module" src="ui.js"></script>
+  </body>
+</html>
