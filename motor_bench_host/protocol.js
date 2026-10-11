@@ -1,0 +1,449 @@
+/**
+ * protocol.js —— 电机测试台上位机与 A 板之间的协议实现(Node.js 侧)
+ *
+ * 与固件 modules/motor_bench/motor_bench.h 严格对应,改协议必须同时改两边。
+ *
+ * 帧格式(小端):
+ *   | 0xA5 | type | len | payload[len] | crc8 | 0x5A |
+ *   CRC 覆盖 type + len + payload(不含帧头、crc、帧尾)
+ */
+
+/** 帧头/帧尾,需与固件 MB_FRAME_HEAD / MB_FRAME_TAIL 一致 */
+export const FRAME_HEAD = 0xa5;
+export const FRAME_TAIL = 0x5a;
+
+/** 单帧最大负载长度,需与固件 MB_PAYLOAD_MAX 一致(越界即判为假帧头) */
+export const MAX_PAYLOAD = 64;
+
+/** 帧类型,需与固件 MB_FrameType_e 一致 */
+export const FrameType = {
+  HEARTBEAT: 0x01,
+  MOTOR_BIND: 0x02,
+  MOTOR_SET: 0x03,
+  MOTOR_ENABLE: 0x04,
+  ALL_STOP: 0x05,
+  QUERY: 0x06,
+  INVENTORY_QUERY: 0x07,
+  MOTOR_ADD: 0x08,
+  MOTOR_REMOVE: 0x09,
+  TELEMETRY: 0x81,
+  INVENTORY_REPORT: 0x82,
+  MOTOR_ADD_ACK: 0x8a,
+};
+
+/** 电机种类,需与固件 MB_MotorKind_e 一致 */
+export const MotorKind = {
+  NONE: 0,
+  GM6020: 1,
+  M3508: 2,
+  M2006: 3,
+  DM: 4,
+  LK: 5,
+  HT: 6,
+};
+
+export const MotorKindLabel = {
+  [MotorKind.GM6020]: '大疆 GM6020',
+  [MotorKind.M3508]: '大疆 M3508',
+  [MotorKind.M2006]: '大疆 M2006',
+  [MotorKind.DM]: '达妙 DM 系列',
+  [MotorKind.LK]: 'LK9025',
+  [MotorKind.HT]: 'HT04',
+};
+
+/** 闭环类型,需与固件 Closeloop_Type_e 一致 */
+export const LoopType = {
+  OPEN_LOOP: 0b0000,
+  CURRENT_LOOP: 0b0001,
+  SPEED_LOOP: 0b0010,
+  ANGLE_LOOP: 0b0100,
+};
+
+export const LoopLabel = {
+  [LoopType.OPEN_LOOP]: '开环',
+  [LoopType.CURRENT_LOOP]: '电流环',
+  [LoopType.SPEED_LOOP]: '速度环',
+  [LoopType.ANGLE_LOOP]: '角度环',
+};
+
+/**
+ * 单通道遥测的字节数,需与固件 MB_TelemetryItem_s 的 sizeof 一致。
+ * 结构:u16 channel_id + u16 status + f32 ref + f32 speed + f32 torque + f32 angle + i8 temp
+ *     = 2+2+4+4+4+4+1 = 21 字节(pack(1) 对齐后仍为 21)
+ */
+export const TELEMETRY_ITEM_BYTES = 21;
+
+/**
+ * CRC8 查找表 —— 逐字节取自固件 modules/algorithm/crc8.c 的 sht75_crc_table。
+ *
+ * @note 不要用"标准 CRC-8 多项式"去生成这张表:固件里这张表是由 SHT75 算法
+ *       生成的,并且更新式为 crc = table[byte ^ crc](异或后查表),
+ *       与常见的反射式实现不一致。直接原样内联可保证两端逐位一致。
+ */
+const crc8Table = Uint8Array.from([
+  0, 49, 98, 83, 196, 245, 166, 151, 185, 136, 219, 234, 125, 76, 31, 46,
+  67, 114, 33, 16, 135, 182, 229, 212, 250, 203, 152, 169, 62, 15, 92, 109,
+  134, 183, 228, 213, 66, 115, 32, 17, 63, 14, 93, 108, 251, 202, 153, 168,
+  197, 244, 167, 150, 1, 48, 99, 82, 124, 77, 30, 47, 184, 137, 218, 235,
+  61, 12, 95, 110, 249, 200, 155, 170, 132, 181, 230, 215, 64, 113, 34, 19,
+  126, 79, 28, 45, 186, 139, 216, 233, 199, 246, 165, 148, 3, 50, 97, 80,
+  187, 138, 217, 232, 127, 78, 29, 44, 2, 51, 96, 81, 198, 247, 164, 149,
+  248, 201, 154, 171, 60, 13, 94, 111, 65, 112, 35, 18, 133, 180, 231, 214,
+  122, 75, 24, 41, 190, 143, 220, 237, 195, 242, 161, 144, 7, 54, 101, 84,
+  57, 8, 91, 106, 253, 204, 159, 174, 128, 177, 226, 211, 68, 117, 38, 23,
+  252, 205, 158, 175, 56, 9, 90, 107, 69, 116, 39, 22, 129, 176, 227, 210,
+  191, 142, 221, 236, 123, 74, 25, 40, 6, 55, 100, 85, 194, 243, 160, 145,
+  71, 118, 37, 20, 131, 178, 225, 208, 254, 207, 156, 173, 58, 11, 88, 105,
+  4, 53, 102, 87, 192, 241, 162, 147, 189, 140, 223, 238, 121, 72, 27, 42,
+  193, 240, 163, 146, 5, 52, 103, 86, 120, 73, 26, 43, 188, 141, 222, 239,
+  130, 179, 224, 209, 70, 119, 36, 21, 59, 10, 89, 104, 255, 206, 157, 172,
+]);
+
+/**
+ * 计算 CRC8,与固件 crc_8() 完全一致
+ * @param {Buffer|Uint8Array} bytes
+ */
+export function crc8(bytes) {
+  let crc = 0x00; // CRC_START_8
+  for (const b of bytes) {
+    crc = crc8Table[(b ^ crc) & 0xff];
+  }
+  return crc;
+}
+
+/** 把若干片段拼成一个 Buffer */
+function concat(parts) {
+  return Buffer.concat(parts.map((p) => Buffer.from(p)));
+}
+
+/**
+ * 组装一帧
+ * @param {number} type 帧类型
+ * @param {Buffer|Uint8Array} payload 负载
+ * @returns {Buffer}
+ */
+export function buildFrame(type, payload = Buffer.alloc(0)) {
+  const body = Buffer.from(payload);
+  const checked = concat([Buffer.from([type, body.length]), body]);
+  const crc = crc8(checked);
+  return concat([
+    Buffer.from([FRAME_HEAD]),
+    checked,
+    Buffer.from([crc, FRAME_TAIL]),
+  ]);
+}
+
+/* ---------------- 各类命令帧 ---------------- */
+
+export function buildHeartbeat() {
+  return buildFrame(FrameType.HEARTBEAT, Buffer.alloc(0));
+}
+
+/**
+ * 绑定:把固件清单中的某颗电机绑到通道
+ * @param {number} channelId 0~7
+ * @param {{kind:number,canBus:number,motorId:number,outerLoop:number}} motor
+ */
+export function buildBind(channelId, motor) {
+  const payload = Buffer.from([
+    channelId,
+    motor.kind,
+    motor.canBus,
+    motor.motorId,
+    motor.outerLoop,
+  ]);
+  return buildFrame(FrameType.MOTOR_BIND, payload);
+}
+
+/**
+ * 设置参考值
+ * @param {number} channelId
+ * @param {number} ref 参考值(速度环 rpm / 电流环 A / 角度环 deg)
+ */
+export function buildSetRef(channelId, ref) {
+  const payload = Buffer.alloc(5);
+  payload.writeUInt8(channelId, 0);
+  payload.writeFloatLE(ref, 1);
+  return buildFrame(FrameType.MOTOR_SET, payload);
+}
+
+/**
+ * 使能/停止
+ * @param {number} channelId
+ * @param {boolean} enable
+ */
+export function buildEnable(channelId, enable) {
+  return buildFrame(FrameType.MOTOR_ENABLE, Buffer.from([channelId, enable ? 1 : 0]));
+}
+
+export function buildAllStop() {
+  return buildFrame(FrameType.ALL_STOP, Buffer.alloc(0));
+}
+
+export function buildQuery() {
+  return buildFrame(FrameType.QUERY, Buffer.alloc(0));
+}
+
+/** 询问板端登记了哪些电机 */
+export function buildInventoryQuery() {
+  return buildFrame(FrameType.INVENTORY_QUERY, Buffer.alloc(0));
+}
+
+/**
+ * 解析电机清单应答
+ * 布局:head(1) type(1) len(1) count(1) items[count*4] crc(1) tail(1)
+ *       每项:kind(1) can_bus(1) motor_id(1) outer_loop(1)
+ * @param {Buffer} payload 帧负载
+ */
+export function parseInventory(payload) {
+  if (payload.length < 1) return null;
+  const count = payload[0];
+  const items = [];
+  for (let i = 0; i < count; i++) {
+    const off = 1 + i * 4;
+    if (off + 4 > payload.length) break;
+    items.push({
+      kind: payload[off],
+      canBus: payload[off + 1],
+      motorId: payload[off + 2],
+      outerLoop: payload[off + 3],
+    });
+  }
+  return { count, items };
+}
+
+/** 板端返回码,需与固件 MB_Result_e 一致 */
+export const MBResult = {
+  OK: 0,
+  BAD_PARAM: 1,
+  DUPLICATE: 2,
+  NOT_PROVISIONED: 3,
+  NOT_ENABLED: 4,
+  UNSUPPORTED: 5,
+  NO_RESOURCE: 6,
+};
+
+/** 返回码 → 给人看的原因(直接用于界面提示) */
+export const MBResultText = {
+  [MBResult.OK]: '成功',
+  [MBResult.BAD_PARAM]: '参数不合法(总线只能填 1 或 2,ID 不能为 0)',
+  [MBResult.DUPLICATE]:
+    '冲突:该总线上已有电机占用同一 ID。' +
+    '注意 6020 用 0x204+ID、3508/2006 用 0x200+ID,两者区间重叠,必须分开挂在不同 CAN 总线上',
+  [MBResult.NOT_PROVISIONED]: '板端没有这颗电机,请先刷新清单',
+  [MBResult.NOT_ENABLED]: '通道未使能',
+  [MBResult.UNSUPPORTED]: '该电机种类尚未接入测试台',
+  [MBResult.NO_RESOURCE]: '资源不足:该 CAN 总线的滤波器已用完(每条总线最多 14 颗)',
+};
+
+/**
+ * 构造"创建电机"帧
+ *
+ * 负载布局:kind(1) can_bus(1) motor_id(1) reserved(1)
+ *
+ * @param {number} kind     MotorKind 枚举
+ * @param {number} canBus   1=CAN1 2=CAN2
+ * @param {number} motorId  电调拨码 ID
+ */
+export function buildMotorAdd(kind, canBus, motorId) {
+  const b = Buffer.alloc(4);
+  b[0] = kind;
+  b[1] = canBus;
+  b[2] = motorId;
+  b[3] = 0; // reserved
+  return buildFrame(FrameType.MOTOR_ADD, b);
+}
+
+/**
+ * 构造"移除电机"帧
+ * 负载布局与创建请求相同(复用 MB_MotorAddReq_s)
+ */
+export function buildMotorRemove(kind, canBus, motorId) {
+  const b = Buffer.alloc(4);
+  b[0] = kind;
+  b[1] = canBus;
+  b[2] = motorId;
+  b[3] = 0;
+  return buildFrame(FrameType.MOTOR_REMOVE, b);
+}
+
+/**
+ * 解析建/拆电机应答
+ * 负载布局:result(1) kind(1) can_bus(1) motor_id(1) channel_id(1) detail(1)
+ * @param {Buffer} payload 帧负载
+ * @returns {{result:number, kind:number, canBus:number, motorId:number,
+ *            channelId:number, detail:number}|null}
+ */
+export function parseMotorAddAck(payload) {
+  if (payload.length < 6) return null;
+  return {
+    result: payload[0],
+    kind: payload[1],
+    canBus: payload[2],
+    motorId: payload[3],
+    channelId: payload[4],
+    detail: payload[5], // 该总线剩余过滤器个数
+  };
+}
+
+/* ---------------- 上报帧构造(用于自测与上位机模拟) ---------------- */
+
+/**
+ * 组装心跳应答帧
+ *
+ * @note 与固件 MB_HeartbeatAck_s 一致的统一格式:
+ *         head type len body(len) crc tail
+ *       body = fw_major fw_minor inventory flags uptime(2) seq(2) = 9 字节
+ *
+ * @param {{fwMajor?:number,fwMinor?:number,inventory?:number,flags?:number,uptime?:number,seq?:number}} f
+ * @returns {Buffer}
+ */
+export function buildHeartbeatAck(f = {}) {
+  const body = Buffer.alloc(9);
+  body[0] = f.fwMajor ?? 1;
+  body[1] = f.fwMinor ?? 0;
+  body[2] = f.inventory ?? 0;
+  body[3] = f.flags ?? 0;
+  body.writeUInt16LE(f.uptime ?? 0, 4);
+  body.writeUInt16LE(f.seq ?? 0, 6);
+
+  return buildFrame(FrameType.HEARTBEAT, body);
+}
+
+/**
+ * 组装遥测帧
+ *
+ * 格式与固件一致:head type len body(len) crc tail,
+ * body = count(1) + seq(2) + items[count*21]
+ *
+ * @param {Array<{channelId:number,online?:boolean,enabled?:boolean,ref?:number,speed?:number,torque?:number,angle?:number,temperature?:number}>} items
+ * @param {number} seq
+ * @returns {Buffer}
+ */
+export function buildTelemetry(items, seq = 0) {
+  const body = Buffer.alloc(3 + items.length * TELEMETRY_ITEM_BYTES);
+  body[0] = items.length;
+  body.writeUInt16LE(seq, 1);
+
+  items.forEach((it, i) => {
+    const off = 3 + i * TELEMETRY_ITEM_BYTES;
+    body.writeUInt16LE(it.channelId, off);
+    body.writeUInt16LE((it.online ? 1 : 0) | (it.enabled ? 2 : 0), off + 2);
+    body.writeFloatLE(it.ref ?? 0, off + 4);
+    body.writeFloatLE(it.speed ?? 0, off + 8);
+    body.writeFloatLE(it.torque ?? 0, off + 12);
+    body.writeFloatLE(it.angle ?? 0, off + 16);
+    body.writeInt8(it.temperature ?? -128, off + 20);
+  });
+
+  return buildFrame(FrameType.TELEMETRY, body);
+}
+
+/* ---------------- 解析 ---------------- */
+
+/**
+ * 心跳应答解析
+ * 布局:head(1) type(1) len(1) body(9) crc(1) tail(1)
+ *       body = fw_major fw_minor inventory flags uptime(2) seq(2)
+ * @param {Buffer} payload 帧负载(由 FrameParser 给出)
+ */
+export function parseHeartbeatAck(payload) {
+  if (payload.length < 9) return null;
+  return {
+    fwVersion: `${payload[0]}.${payload[1]}`,
+    inventoryCount: payload[2],
+    boardFlags: payload[3],
+    anyMotorOnline: (payload[3] & 0x01) !== 0,
+    uptimeS: payload.readUInt16LE(4),
+    seq: payload.readUInt16LE(6),
+  };
+}
+
+/**
+ * 遥测帧解析
+ * 布局:head(1) type(1) len(1) body(len) crc(1) tail(1)
+ *       body = count(1) + seq(2) + items[count*21]
+ * @param {Buffer} payload 帧负载(由 FrameParser 给出)
+ */
+export function parseTelemetry(payload) {
+  if (payload.length < 3) return null;
+  const count = payload[0];
+  const seq = payload.readUInt16LE(1);
+  const items = [];
+  for (let i = 0; i < count; i++) {
+    const off = 3 + i * TELEMETRY_ITEM_BYTES;
+    if (off + TELEMETRY_ITEM_BYTES > payload.length) break;
+    items.push({
+      channelId: payload.readUInt16LE(off),
+      status: payload.readUInt16LE(off + 2),
+      online: (payload.readUInt16LE(off + 2) & 0x01) !== 0,
+      enabled: (payload.readUInt16LE(off + 2) & 0x02) !== 0,
+      ref: payload.readFloatLE(off + 4),
+      speed: payload.readFloatLE(off + 8),
+      torque: payload.readFloatLE(off + 12),
+      angle: payload.readFloatLE(off + 16),
+      temperature: payload.readInt8(off + 20),
+    });
+  }
+  return { count, seq, items };
+}
+
+/**
+ * 流式解包器:喂入任意长度的字节流,吐出解析成功的完整帧
+ * @note  串口是字节流,一次 read 可能拿到半帧或多帧,必须做重同步
+ */
+export class FrameParser {
+  constructor() {
+    this.buffer = Buffer.alloc(0);
+  }
+
+  /**
+   * @param {Buffer} chunk 新收到的字节
+   * @returns {Array<{type:number,payload:Buffer}>} 完整帧列表
+   */
+  push(chunk) {
+    this.buffer = concat([this.buffer, chunk]);
+    const frames = [];
+    let i = 0;
+
+    while (i < this.buffer.length) {
+      // 1. 对齐帧头
+      if (this.buffer[i] !== FRAME_HEAD) {
+        i += 1;
+        continue;
+      }
+      // 2. 长度是否够读出头部
+      if (this.buffer.length - i < 3) break;
+
+      const type = this.buffer[i + 1];
+      const payloadLen = this.buffer[i + 2];
+
+      // 负载长度越界 => 该帧一定不是真帧头(多半是数据里恰好出现 0xA5)。
+      // 必须立刻右移重找帧头,否则会一直等一帧永远不会到来的数据,导致整条流卡死。
+      if (payloadLen > MAX_PAYLOAD) {
+        i += 1;
+        continue;
+      }
+
+      const frameLen = 5 + payloadLen;
+      if (this.buffer.length - i < frameLen) break; // 半帧,等下次
+
+      // 3. CRC 与帧尾校验
+      const crc = crc8(this.buffer.subarray(i + 1, i + 3 + payloadLen));
+      if (crc !== this.buffer[i + 3 + payloadLen] || this.buffer[i + 4 + payloadLen] !== FRAME_TAIL) {
+        i += 1; // 坏帧,右移重找帧头
+        continue;
+      }
+
+      frames.push({
+        type,
+        frame: Buffer.from(this.buffer.subarray(i, i + frameLen)), // 完整帧
+        payload: this.buffer.subarray(i + 3, i + 3 + payloadLen), // 纯负载
+      });
+      i += frameLen;
+    }
+
+    this.buffer = this.buffer.subarray(i);
+    return frames;
+  }
+}
