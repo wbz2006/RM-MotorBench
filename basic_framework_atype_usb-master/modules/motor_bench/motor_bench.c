@@ -94,6 +94,10 @@ static uint32_t mb_hb_count = 0;               /* 【诊断】累计收到的心
  * ============================================================ */
 #define MB_USB_TX_RING_SIZE 1024 /* 需 >= 单帧最大长度 176,取约 5 倍余量 */
 
+/* 通用上报帧的栈上缓冲上限:head+type+len+body+crc+tail = 5 + body。
+ * body 最大为 PID 报表 38 字节,取 64 已留足余量。 */
+#define MB_TYPED_FRAME_MAX 64
+
 static uint8_t mb_usb_tx_ring[MB_USB_TX_RING_SIZE];
 static volatile uint16_t mb_usb_tx_head = 0; /* 生产者写位置 */
 static volatile uint16_t mb_usb_tx_tail = 0; /* 消费者读位置 */
@@ -329,6 +333,10 @@ static void MotorBenchSendInventory(void);
 static void MotorBenchStopAll(void);
 static void MotorBenchHandleAdd(const uint8_t *payload, uint16_t payload_len);
 static void MotorBenchHandleRemove(const uint8_t *payload, uint16_t payload_len);
+static void MotorBenchHandleEnable(uint8_t *buf, uint16_t len);
+static void MotorBenchHandleSetPid(uint8_t *buf, uint16_t len);
+static void MotorBenchHandleQueryPid(uint8_t *buf, uint16_t len);
+static void MotorBenchHandleUnbind(uint8_t *buf, uint16_t len);
 static void MotorBenchSendAddAck(const MB_MotorAddAck_s *ack);
 static uint8_t MotorBenchSetLoopInstance(MB_MotorKind_e kind, void *instance, Closeloop_Type_e loop);
 
@@ -1112,16 +1120,24 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
          *     - INVENTORY_QUERY    询问电机清单
          *     - MOTOR_ADD          创建电机(默认停止,需再显式 enable 才会转)
          *     - MOTOR_REMOVE       移除电机(内部会先停止该电机)
+         *     - MOTOR_UNBIND       解绑通道(释放 is_used,使该通道能改绑其它电机)
          *
          * 早期版本先后漏放行 INVENTORY_QUERY 与 MOTOR_ADD/MOTOR_REMOVE,
          * 表现为"上位机下发了但板子毫无反应"。
+         *
+         * @note MOTOR_UNBIND 必须在白名单里,且**理由与上面几条不同**:
+         *   它不是只读查询,而是"解除通道占用",属安全/维护类动作。
+         *   把它挡在门闩外的后果是:心跳稍有波动时用户点"解绑"没反应,
+         *   通道被旧电机一直占着,随后改绑失败 → 表现为"所有电机都不转"。
+         *   而它本身不会让电机动(MotorBenchUnbind 内部先停机),放行是安全的。
          */
         if (!mb_link_online &&
             type != MB_FRAME_HEARTBEAT &&
             type != MB_FRAME_QUERY &&
             type != MB_FRAME_INVENTORY_QUERY &&
             type != MB_FRAME_MOTOR_ADD &&
-            type != MB_FRAME_MOTOR_REMOVE)
+            type != MB_FRAME_MOTOR_REMOVE &&
+            type != MB_FRAME_MOTOR_UNBIND)
         {
             /*
              * 【诊断】拒绝时把门闩的真实状态一并打出来。
@@ -1165,6 +1181,15 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
             break;
         case MB_FRAME_MOTOR_REMOVE:
             MotorBenchHandleRemove(payload, payload_len);
+            break;
+        case MB_FRAME_PID_SET:
+            MotorBenchHandleSetPid(payload, payload_len);
+            break;
+        case MB_FRAME_PID_QUERY:
+            MotorBenchHandleQueryPid(payload, payload_len);
+            break;
+        case MB_FRAME_MOTOR_UNBIND:
+            MotorBenchHandleUnbind(payload, payload_len);
             break;
         default:
             LOGWARNING("[motor_bench] unknown frame type 0x%02X", type);
@@ -1231,6 +1256,266 @@ static void MotorBenchHandleEnable(uint8_t *buf, uint16_t len)
     MotorBenchSetEnable(buf[0], buf[1]);
 }
 
+/**
+ * @brief 把一段 body 按统一帧格式发出(head/type/len/crc/tail)
+ *
+ * @note 所有上报帧都走这里,避免各帧自己拼帧头时算错 CRC 覆盖范围。
+ *       历史上(2026-10-08)正是因为变长帧错用定长结构体偏移,
+ *       crc 与 tail 落在数组空槽上,导致上位机丢掉整帧。
+ *       CRC 覆盖 type + len + body,即 buf[1] 起的 2 + body_len 个字节。
+ */
+static void MotorBenchSendTypedFrame(uint8_t type, const uint8_t *body, uint8_t body_len)
+{
+    uint8_t buf[MB_TYPED_FRAME_MAX];
+    if (!body || body_len == 0 || (uint16_t)(5 + body_len) > sizeof(buf))
+        return;
+
+    buf[0] = MB_FRAME_HEAD;
+    buf[1] = type;
+    buf[2] = body_len;
+    memcpy(&buf[3], body, body_len);
+    buf[3 + body_len] = crc_8(&buf[1], (uint16_t)(2 + body_len));
+    buf[4 + body_len] = MB_FRAME_TAIL;
+
+    MotorBenchSend(buf, (uint16_t)(5 + body_len));
+}
+
+/**
+ * @brief 处理"解绑通道"帧
+ *
+ * 负载 2 字节:reserved(1) channel_id(1)
+ *
+ * @attention 这个帧的存在理由(实测故障):
+ *   界面上一直有"解绑"按钮,但它只下发 enable=0 —— 电机停了,
+ *   而固件侧 mb_channels[ch].is_used 仍是 1、motor_ptr 仍指着原来那颗。
+ *   用户接着把通道改绑成另一颗电机,MotorBenchBind 撞上
+ *   `if (mb_channels[channel_id].is_used) return MB_ERR_DUPLICATE` ——
+ *   绑定被静默拒绝,而界面已经以为解绑成功、显示"未绑定"。
+ *   表现:换完电机之后**所有通道都不再响应**,最难查的一种故障。
+ *
+ *   MotorBenchUnbind() 早就写好了却没有任何帧能触发它,等于死代码。
+ */
+static void MotorBenchHandleUnbind(uint8_t *buf, uint16_t len)
+{
+    uint8_t result;
+    if (len < 2)
+    {
+        result = MB_ERR_BAD_PARAM;
+        return; /* 长度不对,连 channel 都没有,无法回应答 */
+    }
+
+    uint8_t ch = buf[1];
+    result = MotorBenchUnbind(ch);
+
+    /* 无论成败都回应答:上位机要靠它区分"板子没收到"与"板子拒绝了" */
+    uint8_t ack[2];
+    ack[0] = ch;
+    ack[1] = result;
+    MotorBenchSendTypedFrame(MB_FRAME_UNBIND_ACK, ack, sizeof(ack));
+
+    LOGINFO("[motor_bench] unbind ch=%d result=%d", ch, (int)result);
+}
+
+/* ---------------- PID 运行期整定 ---------------- */
+/**
+ * @brief 处理"设置 PID"帧
+ *
+ * 负载 21 字节,布局见 MB_PidSetReq_s(与 protocol.js buildSetPid 逐字节对应)。
+ *
+ * @note 定点还原:Kp/Ki/Kd 为 u16×100 需除 100;
+ *       MaxOut/IntegralLimit 为 s32 整数值,直接用(电流量级,×100 会溢出 u16)。
+ */
+static void MotorBenchHandleSetPid(uint8_t *buf, uint16_t len)
+{
+    if (len < (uint16_t)sizeof(MB_PidSetReq_s))
+        return;
+
+    /* 按小端读取(与上位机 writeUInt16LE/writeInt32LE 一致)。
+     * STM32F4 本就是小端,这里显式重组以免依赖平台字节序。 */
+    uint16_t kp = (uint16_t)(buf[4] | (buf[5] << 8));
+    uint16_t ki = (uint16_t)(buf[6] | (buf[7] << 8));
+    uint16_t kd = (uint16_t)(buf[8] | (buf[9] << 8));
+    /* 小端重组辅助:s32 占 4 字节,手工拼比 memcpy 到 int32_t 更直观 */
+    int32_t maxout = (int32_t)((uint32_t)buf[10] | ((uint32_t)buf[11] << 8) |
+                               ((uint32_t)buf[12] << 16) | ((uint32_t)buf[13] << 24));
+    int32_t intlim = (int32_t)((uint32_t)buf[14] | ((uint32_t)buf[15] << 8) |
+                               ((uint32_t)buf[16] << 16) | ((uint32_t)buf[17] << 24));
+    uint16_t improve = (uint16_t)(buf[2] | (buf[3] << 8));
+
+    MotorBenchSetPid(buf[0], buf[1],
+                      (float)kp / 100.0f, (float)ki / 100.0f, (float)kd / 100.0f,
+                      (float)maxout, (float)intlim, improve);
+}
+
+/**
+ * @brief 处理"查询 PID"帧
+ */
+static void MotorBenchHandleQueryPid(uint8_t *buf, uint16_t len)
+{
+    if (len < (uint16_t)sizeof(MB_PidQueryReq_s))
+        return;
+    /* channel_id 在第 4 字节(索引 3),与 MB_PidQueryReq_s 布局一致 */
+    MotorBenchQueryPid(buf[3]);
+}
+
+/**
+ * @brief 运行期设置某通道某环的 PID 参数
+ *
+ * @attention 为什么写入前要停机并清积分:
+ *   实测教训(2026-10-09)——切换闭环类型时只改字段不清 PID 状态,
+ *   电机立即剧烈抖动。原因是各环量纲不同(角度 deg / 转速 rpm / 电流 A),
+ *   残留的积分项与历史误差是按旧量纲累积的,换参数瞬间接管会输出突跳。
+ *   整定参数同理:一边运行一边改 Kp/Ki,若不清历史量,新旧参数之间
+ *   的误差累积会一次性释放出来。
+ */
+uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, float kd,
+                         float max_out, float integral_limit, uint16_t improve)
+{
+    if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
+        return MB_ERR_BAD_PARAM;
+
+    /* 参数合理性:停机、拒收 NaN,负值钳到 0 */
+    if (!(kp >= 0.0f) || !(ki >= 0.0f) || !(kd >= 0.0f))
+        return MB_ERR_BAD_PARAM;
+    if (!(max_out >= 0.0f) || !(integral_limit >= 0.0f))
+        return MB_ERR_BAD_PARAM;
+
+    MB_MotorChannel_s *ch = &mb_channels[channel_id];
+    void *inst = ch->motor_ptr;
+
+    /*
+     * 写入前停机:整定期间不应继续以旧参考值驱动。
+     * 注意只停该实例,不影响其它通道的电机。
+     */
+    MotorBenchForceStopInstance(ch->kind, inst);
+
+    /* 选出目标环的 PIDInstance */
+    PIDInstance *target = NULL;
+    switch (ch->kind)
+    {
+    case MB_MOTOR_GM6020:
+    case MB_MOTOR_M3508:
+    case MB_MOTOR_M2006:
+    {
+        DJIMotorInstance *m = (DJIMotorInstance *)inst;
+        if (!m)
+            return MB_ERR_BAD_PARAM;
+        if (loop == MB_PID_LOOP_SPEED)
+            target = &m->motor_controller.speed_PID;
+        else if (loop == MB_PID_LOOP_CURRENT)
+            target = &m->motor_controller.current_PID;
+        else if (loop == MB_PID_LOOP_ANGLE)
+        {
+            target = &m->motor_controller.angle_PID;
+            /* 位置环要参与控制,close_loop 里必须有 ANGLE 位.
+             * 否则 PIDCalculate 永远不被调用,改了参数也没效果。 */
+            m->motor_settings.close_loop_type |= ANGLE_LOOP;
+        }
+        break;
+    }
+    case MB_MOTOR_DM:
+    case MB_MOTOR_LK:
+    case MB_MOTOR_HT:
+    {
+        /* 达妙/LK/HT 的三环结构在各自驱动内部,这里不直接改,
+         * 由后续按型号扩展;当前返回明确的不支持码而非静默丢弃。 */
+        return MB_ERR_UNSUPPORTED;
+    }
+    default:
+        return MB_ERR_UNSUPPORTED;
+    }
+
+    if (!target)
+        return MB_ERR_UNSUPPORTED;
+
+    /*
+     * 只改"整定参数",保留运行历史(Measure/Err/ITerm 等)不重置 ——
+     * 那样会让电机瞬间失稳。真正需要清历史量的场景(切环)由
+     * DJIMotorChangeLoop() 负责。这里只覆盖参数。
+     */
+    target->Kp = kp;
+    target->Ki = ki;
+    target->Kd = kd;
+    target->MaxOut = max_out;
+    target->IntegralLimit = integral_limit;
+    if (improve)
+        target->Improve = (PID_Improvement_e)improve;
+
+    /* 回执,让上位机确认参数已落盘而不是默默超时 */
+    MB_PidSetAck_s ack;
+    memset(&ack, 0, sizeof(ack));
+    ack.channel_id = channel_id;
+    ack.loop = loop;
+    ack.result = MB_OK;
+    ack.detail = 0;
+    MotorBenchSendTypedFrame(MB_FRAME_PID_SET_ACK, (const uint8_t *)&ack, sizeof(ack));
+
+    LOGINFO("[motor_bench] pid set: ch=%u loop=%u Kp=%.3f Ki=%.3f Kd=%.3f MaxOut=%.1f IntLim=%.1f",
+            channel_id, loop, (double)kp, (double)ki, (double)kd, (double)max_out,
+            (double)integral_limit);
+    return MB_OK;
+}
+
+/**
+ * @brief 查询某通道三套 PID 并上报
+ *
+ * @note 上报内容来自电机实例里**当前生效**的 PID,
+ *       所以上位机能读到"默认值"或"运行期被改过之后的值"。
+ */
+uint8_t MotorBenchQueryPid(uint8_t channel_id)
+{
+    if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
+        return MB_ERR_BAD_PARAM;
+
+    MB_MotorChannel_s *ch = &mb_channels[channel_id];
+    MB_PidReport_s rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.channel_id = channel_id;
+    rep.kind = (uint8_t)ch->kind;
+
+    if (ch->kind == MB_MOTOR_DM || ch->kind == MB_MOTOR_LK || ch->kind == MB_MOTOR_HT)
+    {
+        /* 非 DJI 系暂无逐环读取接口,回一个空报表让上位机知道"查了但没数据" */
+        MotorBenchSendTypedFrame(MB_FRAME_PID_REPORT, (const uint8_t *)&rep, sizeof(rep));
+        return MB_ERR_UNSUPPORTED;
+    }
+
+    DJIMotorInstance *m = (DJIMotorInstance *)ch->motor_ptr;
+    if (!m)
+        return MB_ERR_BAD_PARAM;
+
+    const PIDInstance *srcs[3] = {
+        &m->motor_controller.speed_PID,
+        &m->motor_controller.current_PID,
+        &m->motor_controller.angle_PID,
+    };
+
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        /* MaxOut/IntegralLimit 是电流量级,直接取整数值;
+         * 负值钳到 0(PID 限幅应为非负) */
+        float kp = srcs[i]->Kp, ki = srcs[i]->Ki, kd = srcs[i]->Kd;
+        float mo = srcs[i]->MaxOut, il = srcs[i]->IntegralLimit;
+        if (kp < 0.0f) kp = 0.0f;
+        if (ki < 0.0f) ki = 0.0f;
+        if (kd < 0.0f) kd = 0.0f;
+        if (mo < 0.0f) mo = 0.0f;
+        if (il < 0.0f) il = 0.0f;
+
+        /* 小系数 u16×100,上限 655.35;超过则截断 */
+        rep.loop_kp_x100[i] = kp > 655.0f ? 65500u : (uint16_t)(kp * 100.0f + 0.5f);
+        rep.loop_ki_x100[i] = ki > 655.0f ? 65500u : (uint16_t)(ki * 100.0f + 0.5f);
+        rep.loop_kd_x100[i] = kd > 655.0f ? 65500u : (uint16_t)(kd * 100.0f + 0.5f);
+        /* 大限幅按 s32 原值下发,不缩放(缩放会溢出,见 MB_PidSetReq_s 注释) */
+        rep.loop_maxout[i] = (mo > 2147483000.0f) ? 2147483000 : (int32_t)mo;
+        rep.loop_intlim[i] = (il > 2147483000.0f) ? 2147483000 : (int32_t)il;
+        rep.loop_improve[i] = (uint8_t)srcs[i]->Improve;
+    }
+
+    MotorBenchSendTypedFrame(MB_FRAME_PID_REPORT, (const uint8_t *)&rep, sizeof(rep));
+    return MB_OK;
+}
+
 /* ---------------- 上报 ---------------- */
 
 static void MotorBenchSendHeartbeatAck(void)
@@ -1283,6 +1568,17 @@ void MotorBenchTask(void)
     }
 }
 
+/*
+ * 分帧发送:每帧最多 MB_TELEMETRY_PER_FRAME 个电机(常量与容量断言在 motor_bench.h)。
+ * 上位机按 channel_id 合并,不需要关心分了几帧。
+ *
+ * @attention 为什么必须分帧:
+ *   MB_CHANNEL_MAX = 8,单帧装 8 个电机需要 3 + 8×21 = 171 字节,
+ *   远超 USB CDC 单帧上限 MB_PAYLOAD_MAX(64)。
+ *   超限的表现不是"丢几颗电机",而是**整帧被截断**,
+ *   上位机一条遥测都解析不出来 —— 于是所有卡片的状态都停在初始值,
+ *   看起来像 UI 卡死了,实际是协议层装不下。
+ */
 static void MotorBenchSendTelemetry(void)
 {
     /*
@@ -1304,31 +1600,43 @@ static void MotorBenchSendTelemetry(void)
     if (count == 0)
         return; /* 无绑定通道时不发,节省带宽 */
 
-    /* 统一帧格式:head type len body(len) crc tail
-     *   len = count(1) + seq(2) + count*21
-     * CRC 覆盖 type + len + body。*/
-    uint8_t body_len = (uint8_t)(3 + count * sizeof(MB_TelemetryItem_s));
     uint8_t buf[5 + 3 + MB_CHANNEL_MAX * sizeof(MB_TelemetryItem_s)];
 
-    buf[0] = MB_FRAME_HEAD;
-    buf[1] = MB_FRAME_TELEMETRY;
-    buf[2] = body_len;
-    buf[3] = count;
-    buf[4] = (uint8_t)(mb_tx_seq & 0xFF);
-    buf[5] = (uint8_t)((mb_tx_seq >> 8) & 0xFF);
-    mb_tx_seq++;
-
-    uint8_t off = 6;
-    for (uint8_t i = 0; i < count; i++)
+    /*
+     * 分帧发送:每帧最多 MB_TELEMETRY_PER_FRAME 个电机。
+     * 上位机按 channel_id 合并,不需要关心分了几帧。
+     */
+    for (uint8_t base = 0; base < count; base += MB_TELEMETRY_PER_FRAME)
     {
-        memcpy(&buf[off], &items[i], sizeof(MB_TelemetryItem_s));
-        off += sizeof(MB_TelemetryItem_s);
+        uint8_t n = count - base;
+        if (n > MB_TELEMETRY_PER_FRAME)
+            n = MB_TELEMETRY_PER_FRAME;
+
+        /* 统一帧格式:head type len body(len) crc tail
+         *   len = count(1) + seq(2) + n*21
+         * CRC 覆盖 type + len + body。*/
+        uint8_t body_len = (uint8_t)(3 + n * sizeof(MB_TelemetryItem_s));
+
+        buf[0] = MB_FRAME_HEAD;
+        buf[1] = MB_FRAME_TELEMETRY;
+        buf[2] = body_len;
+        buf[3] = n;
+        buf[4] = (uint8_t)(mb_tx_seq & 0xFF);
+        buf[5] = (uint8_t)((mb_tx_seq >> 8) & 0xFF);
+        mb_tx_seq++;
+
+        uint8_t off = 6;
+        for (uint8_t i = 0; i < n; i++)
+        {
+            memcpy(&buf[off], &items[base + i], sizeof(MB_TelemetryItem_s));
+            off += sizeof(MB_TelemetryItem_s);
+        }
+
+        buf[off] = crc_8(&buf[1], (uint16_t)(2 + body_len));
+        buf[off + 1] = MB_FRAME_TAIL;
+
+        MotorBenchSend(buf, (uint16_t)(off + 2));
     }
-
-    buf[off] = crc_8(&buf[1], (uint16_t)(2 + body_len));
-    buf[off + 1] = MB_FRAME_TAIL;
-
-    MotorBenchSend(buf, (uint16_t)(off + 2));
 }
 
 /* ---------------- 电机清单应答 ---------------- */

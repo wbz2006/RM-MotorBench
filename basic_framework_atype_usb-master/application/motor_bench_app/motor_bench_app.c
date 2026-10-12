@@ -57,34 +57,126 @@
  *   导致 CAN 实例与过滤器泄漏。
  */
 
+/* ---------------- PID 默认参数表 ----------------
+ *
+ * 来源:gimbal-fed infantry 工程的实机整定值(2026-10-12 迁移)。
+ * 原工程机器人已稳定运行,比测试台此前的"通用经验值"更可靠。
+ *
+ *   电机型号     用途          取值位置
+ *   --------     ----------    -----------------------
+ *   M3508        摩擦轮        shoot.c  friction_config
+ *   M2006        拨弹盘        shoot.c  loader_config  (速度环部分)
+ *   GM6020       yaw 轴        gimbal.c yaw_config    (速度环部分)
+ *   DM 达妙       保持不变       沿用原测试台经验值
+ *
+ * [!] 重要前提:原工程三组参数均开启电流环(close_loop_type 含 CURRENT_LOOP),
+ *     电流环 Kp≈0.7 / Ki≈0.1 / IntegralLimit=5000~10000。
+ *     测试台此前只开速度环,若只搬速度环参数而不补电流环,
+ *     "同样的参数"不会有同样的效果 —— 速度环输出直接进入电流指令,
+ *     缺少电流内环的整形,响应与稳定性都会变差。
+ *
+ *     GM6020 yaw 的速度环 Kp=50 / Ki=200 数值很大,
+ *     这是原工程配合 CURRENT_LOOP + 梯形积分 + 500Hz 控制频率的结果,
+ *     单独使用时不会得到相应表现。迁移时一并保留三环配置。
+ * ================================================================ */
+
+/*
+ * 枚举顺序(motor_def.h):MOTOR_TYPE_NONE=0, GM6020, M3508, M2006, LK9025, HT04
+ * 注意 MOTOR_TYPE_NONE 在**开头**且等于 0,不能拿它当数组大小。
+ * 这里用最大的电机类型 + 1 作为表容量,并用静态断言保证枚举变动时立刻报错,
+ * 而不是静默索引越界。
+ *
+ * 只支持 DJI 三型;若某型号无实参,保持零值 + 在下方注释说明。
+ */
+#define BENCH_PID_TABLE_SIZE (HT04 + 1)
+_Static_assert(BENCH_PID_TABLE_SIZE > 0, "PID table size must be positive");
+/* 确保我们用到的型号都在表范围内(编译期校验,避免索引越界) */
+_Static_assert(GM6020 < BENCH_PID_TABLE_SIZE, "GM6020 out of PID table");
+_Static_assert(M3508 < BENCH_PID_TABLE_SIZE, "M3508 out of PID table");
+_Static_assert(M2006 < BENCH_PID_TABLE_SIZE, "M2006 out of PID table");
+
+typedef struct
+{
+    float Kp;
+    float Ki;
+    float Kd;
+    float MaxOut;
+    float IntegralLimit;
+    PID_Improvement_e Improve;
+} BenchPidSet_s;
+
+/* DJI 速度环:ref 单位为 rpm,输出为发送电流值。
+ * M3508 最大约 16000,M2006 最大约 10000,GM6020 最大约 30000。 */
+static const BenchPidSet_s bench_dji_speed_pid[BENCH_PID_TABLE_SIZE] = {
+    [M3508] = {20.0f, 1.0f, 0.0f, 15000.0f, 10000.0f, PID_Integral_Limit},
+    [M2006] = {10.0f, 1.0f, 0.0f, 5000.0f, 5000.0f, PID_Integral_Limit},
+    [GM6020] = {50.0f, 200.0f, 0.0f, 20000.0f, 3000.0f,
+                PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement},
+};
+
+/* DJI 电流环:速度环输出作为电流参考,输出为发送电流值 */
+static const BenchPidSet_s bench_dji_current_pid[BENCH_PID_TABLE_SIZE] = {
+    [M3508] = {0.7f, 0.1f, 0.0f, 15000.0f, 10000.0f, PID_Integral_Limit},
+    [M2006] = {0.7f, 0.1f, 0.0f, 5000.0f, 5000.0f, PID_Integral_Limit},
+    /* 原工程 GM6020 yaw 未单独给 current_PID(其靠 speed_PID.MaxOut=20000 限幅),
+     * 这里沿用与 M3508 相同的通用电流环参数,保证 GM6020 也有电流内环 */
+    [GM6020] = {0.7f, 0.1f, 0.0f, 20000.0f, 3000.0f, PID_Integral_Limit},
+};
+
+static const BenchPidSet_s bench_dji_angle_pid[BENCH_PID_TABLE_SIZE] = {
+    [GM6020] = {8.0f, 0.0f, 0.0f, 500.0f, 100.0f,
+                PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement},
+};
+
 /**
- * @brief 生成一台 DJI 电机的初始化配置(速度环整定值取自实验室通用经验值)
- * @param ref 输出参数
+ * @brief 把一组 PID 配置写入目标结构
+ */
+static void BenchApplyPid(PID_Init_Config_s *dst, const BenchPidSet_s *src)
+{
+    dst->Kp = src->Kp;
+    dst->Ki = src->Ki;
+    dst->Kd = src->Kd;
+    dst->MaxOut = src->MaxOut;
+    dst->IntegralLimit = src->IntegralLimit;
+    dst->Improve = src->Improve;
+}
+
+/**
+ * @brief 生成一台 DJI 电机的初始化配置
+ * @param type M3508 / M2006 / GM6020 —— 决定采用哪一套 PID 实参
+ * @param tx_id 电调拨码 ID(1~8);rx_id 由框架按型号计算
+ *
+ * @note 默认开启 速度+电流 双环(与来源工程一致)。
+ *       运行期可在上位机切换到仅速度环或速度+位置环。
  */
 static void BenchBuildDJIConfig(Motor_Init_Config_s *ref, Motor_Type_e type, CAN_HandleTypeDef *bus, uint8_t tx_id)
 {
+    /* 只对 DJI 三型有实参;其它型号退回 M3508 通用参数,
+     * 并保证索引在表范围内(编译期已断言,这里再兜一次运行期) */
+    if (type != M3508 && type != M2006 && type != GM6020)
+        type = M3508;
+
     ref->motor_type = type;
     ref->can_init_config.can_handle = bus;
     ref->can_init_config.tx_id = tx_id;
 
     ref->controller_setting_init_config.outer_loop_type = SPEED_LOOP;
-    ref->controller_setting_init_config.close_loop_type = SPEED_LOOP;
+    /*
+     * @attention 必须含 CURRENT_LOOP。
+     *   原工程三组参数都在电流环闭环下整定;去掉电流环,
+     *   speed_PID 的输出将直接作为未整形的电流指令,
+     *   低速爬行与负载突变时的表现都会明显变差。
+     */
+    ref->controller_setting_init_config.close_loop_type = SPEED_LOOP | CURRENT_LOOP;
     ref->controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
     ref->controller_setting_init_config.feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL;
     ref->controller_setting_init_config.angle_feedback_source = MOTOR_FEED;
     ref->controller_setting_init_config.speed_feedback_source = MOTOR_FEED;
 
-    /*
-     * 速度环:ref 单位为 rpm(驱动内部 speed_aps/6.0f 换算为 rpm 后比较),
-     * 输出为发送电流值,M3508 最大约 16000,M2006 最大约 10000,
-     * GM6020 最大约 30000,这里留出余量。
-     */
-    ref->controller_param_init_config.speed_PID.Kp = 8.0f;
-    ref->controller_param_init_config.speed_PID.Ki = 2.0f;
-    ref->controller_param_init_config.speed_PID.Kd = 0.0f;
-    ref->controller_param_init_config.speed_PID.MaxOut = (type == M2006) ? 9000.0f : 15000.0f;
-    ref->controller_param_init_config.speed_PID.Improve = PID_Integral_Limit;
-    ref->controller_param_init_config.speed_PID.IntegralLimit = 4000.0f;
+    BenchApplyPid(&ref->controller_param_init_config.speed_PID, &bench_dji_speed_pid[type]);
+    BenchApplyPid(&ref->controller_param_init_config.current_PID, &bench_dji_current_pid[type]);
+    /* 位置环参数仅 GM6020 有实参;其余型号为零值(未指定,由上层整定) */
+    BenchApplyPid(&ref->controller_param_init_config.angle_PID, &bench_dji_angle_pid[type]);
 }
 
 /**

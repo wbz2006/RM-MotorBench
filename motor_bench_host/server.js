@@ -33,6 +33,12 @@ import {
   buildInventoryQuery,
   buildMotorAdd,
   buildMotorRemove,
+  buildUnbind,
+  parseUnbindAck,
+  buildSetPid,
+  buildPidQuery,
+  parsePidReport,
+  parsePidSetAck,
   parseHeartbeatAck,
   parseTelemetry,
   parseInventory,
@@ -219,6 +225,41 @@ wss.on('connection', (ws) => {
         }));
         ws.send(JSON.stringify({ type: 'error', message: '串口未连接,请先打开串口' }));
       }
+    } else if (cmd.type === 'unbind') {
+      /*
+       * 解绑通道:释放固件侧的通道占用,使该通道能改绑别的电机。
+       *
+       * @attention 不能用 enable=0 代替。只停机不解绑的话,
+       *   mb_channels[ch].is_used 仍是 1,下一次 bind 会撞上
+       *   MB_ERR_DUPLICATE 被静默拒绝 —— 界面以为换成功了,实际没换。
+       */
+      const { channelId } = cmd;
+      if (!writeToSerial(buildUnbind(channelId))) {
+        ws.send(JSON.stringify({
+          type: 'unbindAck',
+          data: { channelId, result: MBResult.BAD_PARAM },
+        }));
+        ws.send(JSON.stringify({ type: 'error', message: '串口未连接,请先打开串口' }));
+      }
+    } else if (cmd.type === 'pidSet') {      /*
+       * 运行期写入 PID。板端回 0x8C 帧确认,驱动前会停机并清历史量。
+       *
+       * @attention 未使能也允许下发 —— 整定本来就是"电机不转时先把参数调好"。
+       *   这与 MOTOR_SET 不同(那条要求已使能,防止误转)。
+       */
+      const { channelId, loop, pid } = cmd;
+      if (!writeToSerial(buildSetPid(channelId, loop, pid || {}))) {
+        ws.send(JSON.stringify({
+          type: 'pidAck',
+          data: { channelId, loop, result: MBResult.BAD_PARAM, detail: 0 },
+        }));
+        ws.send(JSON.stringify({ type: 'error', message: '串口未连接,请先打开串口' }));
+      }
+    } else if (cmd.type === 'pidQuery') {
+      const { channelId } = cmd;
+      if (!writeToSerial(buildPidQuery(channelId))) {
+        ws.send(JSON.stringify({ type: 'error', message: '串口未连接,请先打开串口' }));
+      }
     } else {
       handleCommand(cmd);
     }
@@ -285,6 +326,15 @@ async function openSerial(portPath, baud) {
         } else if (fr.type === FrameType.MOTOR_ADD_ACK) {
           const ack = parseMotorAddAck(fr.payload);
           if (ack) broadcast({ type: 'motorAck', data: ack });
+        } else if (fr.type === FrameType.PID_REPORT) {
+          const rep = parsePidReport(fr.payload);
+          if (rep) broadcast({ type: 'pidReport', data: rep });
+        } else if (fr.type === FrameType.PID_SET_ACK) {
+          const ack = parsePidSetAck(fr.payload);
+          if (ack) broadcast({ type: 'pidAck', data: ack });
+        } else if (fr.type === FrameType.UNBIND_ACK) {
+          const ack = parseUnbindAck(fr.payload);
+          if (ack) broadcast({ type: 'unbindAck', data: ack });
         }
       }
     });

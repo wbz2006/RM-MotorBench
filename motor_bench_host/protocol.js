@@ -26,9 +26,15 @@ export const FrameType = {
   INVENTORY_QUERY: 0x07,
   MOTOR_ADD: 0x08,
   MOTOR_REMOVE: 0x09,
+  PID_SET: 0x0a,
+  PID_QUERY: 0x0b,
+  MOTOR_UNBIND: 0x0c,
   TELEMETRY: 0x81,
   INVENTORY_REPORT: 0x82,
   MOTOR_ADD_ACK: 0x8a,
+  PID_REPORT: 0x8b,
+  PID_SET_ACK: 0x8c,
+  UNBIND_ACK: 0x8d,
 };
 
 /** 电机种类,需与固件 MB_MotorKind_e 一致 */
@@ -284,6 +290,203 @@ export function parseMotorAddAck(payload) {
     channelId: payload[4],
     detail: payload[5], // 该总线剩余过滤器个数
   };
+}
+
+/* ---------------- PID 运行期整定 ---------------- */
+
+/**
+ * PID 参数的目标环 —— 与固件 MB_PidLoop_e 一致
+ *
+ * @note 定点方案(为什么不是全 u16 x100):
+ *   Kp/Ki/Kd 是小系数(u16×100 够用),但
+ *   MaxOut / IntegralLimit 是电流量级(M3508 达 15000,GM6020 达 20000),
+ *   ×100 后是 1500000/2000000,远超 u16 的 65535。
+ *   整定迁移当天就踩到这个坑:直接用 u16×100 传 MaxOut=15000
+ *   会让 Buffer.writeUInt16LE 抛 ERR_OUT_OF_RANGE。
+ *   故采用混合方案 —— 小系数 u16×100,大限幅 s32 整数值。
+ */
+export const PidLoop = {
+  SPEED: 0,
+  CURRENT: 1,
+  ANGLE: 2,
+};
+
+export const PidLoopLabel = {
+  [PidLoop.SPEED]: '速度环',
+  [PidLoop.CURRENT]: '电流环',
+  [PidLoop.ANGLE]: '位置环',
+};
+
+/**
+ * PID 默认参数 —— 与固件 motor_bench_app.c 的 bench_dji_*_pid[] 逐项对应。
+ *
+ * 来源:gimbal-fed infantry 工程实机整定值(2026-10-12 迁移)。
+ *   M3508  -> shoot.c   摩擦轮 friction_config
+ *   M2006  -> shoot.c   拨弹盘 loader_config (速度环部分)
+ *   GM6020 -> gimbal.c  yaw 轴
+ *
+ * @note 放在 protocol.js 而非 ui.js:这是**协议层数据**,不是界面状态。
+ *   ui.js 要在页面里显示默认值,selftest.js 要校验与固件一致,
+ *   两边都 import 同一份就消除了"页面显示一套、固件生效另一套"的风险。
+ */
+export const PID_DEFAULTS = {
+  // 大疆 M3508 —— 摩擦轮实参(close_loop = SPEED|CURRENT)
+  [MotorKind.M3508]: {
+    speed: { Kp: 20, Ki: 1, Kd: 0, MaxOut: 15000, IntegralLimit: 10000, improve: 0 },
+    current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 15000, IntegralLimit: 10000, improve: 0 },
+    angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+  },
+  // 大疆 M2006 —— 拨弹盘速度环实参
+  [MotorKind.M2006]: {
+    speed: { Kp: 10, Ki: 1, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
+    current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
+    angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+  },
+  // 大疆 GM6020 —— yaw 轴实参
+  [MotorKind.GM6020]: {
+    speed: { Kp: 50, Ki: 200, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 5 },
+    current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 0 },
+    angle: { Kp: 8, Ki: 0, Kd: 0, MaxOut: 500, IntegralLimit: 100, improve: 5 },
+  },
+  // 达妙 DM —— 暂不引入,延用原测试台配置(用户明确要求"达妙暂时不变")
+  [MotorKind.DM]: {
+    speed: { Kp: 5, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 8, improve: 0 },
+    current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+    angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+  },
+};
+
+/**
+ * 构造"设置 PID"帧 —— 对单个通道的单个环写入一套参数
+ *
+ * 负载布局(20 字节):
+ *   channel_id(1) loop(1) improve_flags(1) reserved(1)
+ *   Kp(2) Ki(2) Kd(2)              u16 LE 定点 x100
+ *   MaxOut(4) IntegralLimit(4)     s32 LE 整数值
+ *   tail_pad(2)
+ *
+ * @param {number} channelId 通道号
+ * @param {number} loop       PidLoop 枚举
+ * @param {{Kp:number,Ki:number,Kd:number,MaxOut:number,IntegralLimit:number,improve?:number}} pid
+ * @returns {Buffer}
+ */
+export function buildSetPid(channelId, loop, pid) {
+  /*
+   * 直接按 MB_PidSetReq_s 的内存布局写一个 20 字节 payload,不做"头+体"拼接。
+   *
+   * @attention 曾把 payload 拆成 6 字节 head + 15 字节 body 两段再 concat,
+   *   结果 head 多了 2 字节导致所有字段整体错位 ——
+   *   Kp 读出来是 0、Ki 读出来是 Kp 的值,而且**自测没抓到**,
+   *   因为测试里也照抄了同样的错偏移。
+   *   教训:协议字段偏移必须与固件 _Static_assert 的数字一致,
+   *   测试要用**固件那份偏移表**做基准,而不是"看代码数出来的"。
+   *
+   *   固件侧结构体加了 __attribute__((packed)),布局 = 声明顺序,
+   *   所以这里照声明顺序逐字节写即可,无需考虑对齐。
+   */
+  const b = Buffer.alloc(20);
+  b[0] = channelId & 0xff;
+  b[1] = loop & 0xff;
+  b[2] = (pid.improve ?? 0) & 0xff;  /* improve 只用低 8 位 */
+  b[3] = 0;                           /* reserved */
+  b.writeUInt16LE(Math.round((pid.Kp ?? 0) * 100), 4);
+  b.writeUInt16LE(Math.round((pid.Ki ?? 0) * 100), 6);
+  b.writeUInt16LE(Math.round((pid.Kd ?? 0) * 100), 8);
+  b.writeInt32LE(Math.round(pid.MaxOut ?? 0), 10);
+  b.writeInt32LE(Math.round(pid.IntegralLimit ?? 0), 14);
+  b.fill(0, 18); // tail_pad
+
+  return buildFrame(FrameType.PID_SET, b);
+}
+
+/**
+ * 构造"查询 PID"帧 —— 请求上报指定通道的三套参数
+ *
+ * 负载布局(4 字节):
+ *   reserved(1) reserved(1) reserved(1) channel_id(1)
+ *
+ * @param {number} channelId 通道号
+ * @returns {Buffer}
+ */
+export function buildPidQuery(channelId) {
+  const b = Buffer.alloc(4);
+  b[3] = channelId & 0xff;
+  return buildFrame(FrameType.PID_QUERY, b);
+}
+
+/**
+ * 解析 PID 上报 —— 固件把三套参数一次性回传
+ *
+ * 负载 49 字节,与固件 MB_PidReport_s 逐字节对应(固件已 _Static_assert 锁定):
+ *   channel_id(1) kind(1) reserved(2)
+ *   kp[3]      u16 LE 各 x100
+ *   ki[3]      u16 LE 各 x100
+ *   kd[3]      u16 LE 各 x100
+ *   maxout[3]  s32 LE 各整数值
+ *   intlim[3]  s32 LE 各整数值
+ *   improve[3] u8    各 1 字节
+ *
+ * @attention 固件侧用五个并列数组而非三个嵌套结构体,原因是 CMSIS 默认
+ *   4 字节对齐会让嵌套结构体产生填充,偏移就对不上了。
+ *   所以"某环的 MaxOut"不在"该环 Kp 后面",而在独立的 maxout 数组里。
+ */
+export function parsePidReport(payload) {
+  if (payload.length < 49) return null;
+
+  // 数组基址:kp@4, ki@10, kd@16(各 6 字节), maxout@22, intlim@34(各 12 字节), improve@46
+  const q16 = (arr, li) => payload.readUInt16LE(4 + arr * 6 + li * 2) / 100;
+  const q32 = (arr, li) => payload.readInt32LE(22 + arr * 12 + li * 4);
+  const imp = (li) => payload[46 + li];
+
+  return {
+    channelId: payload[0],
+    kind: payload[1],
+    speed: { Kp: q16(0, 0), Ki: q16(1, 0), Kd: q16(2, 0), MaxOut: q32(0, 0), IntegralLimit: q32(1, 0), improve: imp(0) },
+    current: { Kp: q16(0, 1), Ki: q16(1, 1), Kd: q16(2, 1), MaxOut: q32(0, 1), IntegralLimit: q32(1, 1), improve: imp(1) },
+    angle: { Kp: q16(0, 2), Ki: q16(1, 2), Kd: q16(2, 2), MaxOut: q32(0, 2), IntegralLimit: q32(1, 2), improve: imp(2) },
+  };
+}
+
+/**
+ * 解析 PID 设置应答
+ * 负载布局:channel_id(1) loop(1) result(1) detail(1)
+ * @returns {{channelId:number, loop:number, result:number, detail:number}|null}
+ */
+export function parsePidSetAck(payload) {
+  if (payload.length < 4) return null;
+  return {
+    channelId: payload[0],
+    loop: payload[1],
+    result: payload[2],
+    detail: payload[3],
+  };
+}
+
+/**
+ * 构造"解绑通道"帧
+ *
+ * @attention 这个帧**必须存在**,否则界面上的"解绑"按钮名不副实:
+ *   只下发 enable=0 的话,固件侧 mb_channels[ch].is_used 仍为 1,
+ *   通道还指着原来那颗电机 —— 于是紧接着绑定另一颗会被
+ *   MB_ERR_DUPLICATE 拒绝,而界面以为已经解绑成功。
+ *   实测症状:换电机后"全部电机都不转了",因为绑定被静默拒绝。
+ *
+ * 负载布局(2 字节):reserved(1) channel_id(1)
+ */
+export function buildUnbind(channelId) {
+  const b = Buffer.alloc(2);
+  b[0] = 0;
+  b[1] = channelId & 0xff;
+  return buildFrame(FrameType.MOTOR_UNBIND, b);
+}
+
+/**
+ * 解析解绑应答
+ * 负载布局:channel_id(1) result(1)
+ */
+export function parseUnbindAck(payload) {
+  if (payload.length < 2) return null;
+  return { channelId: payload[0], result: payload[1] };
 }
 
 /* ---------------- 上报帧构造(用于自测与上位机模拟) ---------------- */

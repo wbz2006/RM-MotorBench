@@ -23,6 +23,16 @@ import {
   buildMotorAdd,
   buildMotorRemove,
   parseMotorAddAck,
+  buildSetPid,
+  buildPidQuery,
+  buildUnbind,
+  parseUnbindAck,
+  parsePidReport,
+  parsePidSetAck,
+  PidLoop,
+  PID_DEFAULTS,
+  MBResult,
+  MAX_PAYLOAD,
   buildFrame,
   crc8,
 } from './protocol.js';
@@ -308,7 +318,14 @@ console.log('\n== 9. link gate allow-list covers all read-only frame types ==');
   }
 
   if (src) {
-    const gate = src.match(/if \(!mb_link_online[\s\S]{0,800}?continue;/);
+    /*
+     * @attention 窗口从 800 放宽到 2000,且优先用"从 if 到 continue;"的宽松匹配。
+     * 门闩那段周围有大量说明性注释(每个放行类型都写清了为什么),
+     * 注释一长,固定窗口就会截断匹配不到 —— 曾因此报出
+     * "gate condition not found" 的假失败。
+     * 宁可窗口放宽,也不要让注释长度决定测试成败。
+     */
+    const gate = src.match(/if \(!mb_link_online[\s\S]{0,2000}?continue;/);
     check('gate condition found in firmware', !!gate);
 
     if (gate) {
@@ -673,18 +690,21 @@ console.log('\n== 15. stream parser minimum-frame check must accept empty payloa
   check('host heartbeat parses on the JS side', parsed.length === 1);
 }
 
-console.log('\n== 16. card rebuild must re-bind its button handlers ==');
+console.log('\n== 16. new channel cards must get their handlers bound ==');
 {
   /*
    * 背景(实机现象"绑定第二个电机报 channel 0 already used"):
-   *   buildChannels() 用 innerHTML = '' 重建卡片时,会把旧卡片上的 onclick
-   *   一并销毁;而 bindEvents() 原先只在页面加载时调用一次。
-   *   清单到达触发重建后,新卡片上的按钮没有任何事件,
-   *   个别能响应的还是残留的旧闭包,其 channelId 是重建前的值 ——
-   *   于是"点通道1的绑定"实际发出 channelId=0,板端回
-   *   "bind failed: channel 0 already used"。
+   *   早期 buildChannels() 用 innerHTML='' 整体重建,旧卡片上的 onclick
+   *   一并销毁,而 bindEvents() 只在页面加载时调用一次 ——
+   *   新卡片按钮没有任何事件,残留的旧闭包 channelId 还是重建前的值。
    *
-   * 判据:buildChannels() 内部必须调用 bindEvents(),否则重建即失联。
+   * 【2026-10-12 更新】本组原断言"buildChannels 必须清空容器"已作废:
+   *   正是那行 innerHTML='' 导致加第二颗电机时,通道 0 的已选电机与 rpm
+   *   全部被清空(第 20 组记录了三个由此派生的实测故障)。
+   *   现在 buildChannels 只增不减,不清空已有卡片。
+   *
+   * 但"新增卡片必须绑上事件"这条依然成立,而且更重要 ——
+   *   只增不减意味着旧卡片保留自己的 onclick,新卡片若漏绑就是死按钮。
    */
   let ui;
   try {
@@ -700,11 +720,13 @@ console.log('\n== 16. card rebuild must re-bind its button handlers ==');
     check('buildChannels found', !!bc);
     if (bc) {
       const body = strip(bc[0]);
-      check('buildChannels clears the container (rebuild happens)',
-        /innerHTML\s*=\s*''/.test(body));
-      check('buildChannels re-binds events after rebuild',
+      /* 见上方说明:清空容器已从"必须"改为"禁止",由第 20 组断言 */
+      check('buildChannels does NOT wipe existing cards',
+        !/innerHTML\s*=\s*''/.test(body),
+        'innerHTML="" destroys user state (selected motor, rpm) — see group 20');
+      check('buildChannels binds events for the newly added cards',
         /bindEvents\(\)/.test(body),
-        'without this, rebuilt cards have NO handlers and clicks do nothing');
+        'new cards must not be dead buttons');
     }
 
     /*
@@ -716,6 +738,510 @@ console.log('\n== 16. card rebuild must re-bind its button handlers ==');
     check('bindEvents is not called again at top level',
       topLevelCalls === 0,
       `found ${topLevelCalls} stray top-level call(s)`);
+  }
+}
+
+console.log('\n== 17. PID protocol: frame layout, fixed-point, defaults ==');
+{
+  /*
+   * 背景:PID 运行期整定纯靠一帧二进制传递 5 个参数 × 3 环,
+   * 布局一旦错,固件与上位机会把字段读串位。而串位的表现不是"报错",
+   * 而是"Kp 被当成 Ki 用"这种静默错值,极难发现。
+   *
+   * 因此这里把字节级布局与固件 _Static_assert 的偏移逐一对应验证。
+   *
+   * @attention 定点混合方案(不是统一 ×100):
+   *   Kp/Ki/Kd   u16 × 100  → 两位小数
+   *   MaxOut/IntLim s32 原值 → 电流量级(15000×100 会溢出 u16)
+   *   这正是迁移当天 Buffer.writeUInt16LE 抛 ERR_OUT_OF_RANGE 的原因,
+   *   本组测试就是用来防止回归。
+   */
+
+  // ---- 17.1 PID_SET 帧 ----
+  /*
+   * 偏移基准 = 固件 MB_PidSetReq_s 的 _Static_assert 数字,不是"看代码数出来的"。
+   *   payload 内: channel@0 loop@1 improve@2 kp@4 ki@6 kd@8 maxout@10 intlim@14
+   *   帧内偏移 = payload 偏移 + 3(head+type+len)
+   */
+  const pid = { Kp: 20, Ki: 1, Kd: 0, MaxOut: 15000, IntegralLimit: 10000 };
+  const f = buildSetPid(2, PidLoop.SPEED, pid);
+  const B = 3; // payload 起点在帧内
+
+  check('PID_SET frame head 0xA5', f[0] === 0xa5);
+  check('PID_SET type 0x0a', f[1] === 0x0a);
+  check('PID_SET payload len 20', f[2] === 20, `got ${f[2]}`);
+  check('PID_SET total len 25', f.length === 25, `got ${f.length}`);
+  check('PID_SET channel_id @payload0', f[0 + B] === 2);
+  check('PID_SET loop @payload1', f[1 + B] === PidLoop.SPEED);
+
+  // 小系数:u16 LE × 100
+  check('Kp 20 -> 2000 (LE)', f.readUInt16LE(4 + B) === 2000, `got ${f.readUInt16LE(4 + B)}`);
+  check('Ki 1 -> 100 (LE)', f.readUInt16LE(6 + B) === 100, `got ${f.readUInt16LE(6 + B)}`);
+  check('Kd 0 -> 0', f.readUInt16LE(8 + B) === 0);
+  // 大限幅:s32 原值,不缩放
+  check('MaxOut 15000 stays 15000', f.readInt32LE(10 + B) === 15000, `got ${f.readInt32LE(10 + B)}`);
+  check('IntLim 10000 stays 10000', f.readInt32LE(14 + B) === 10000, `got ${f.readInt32LE(14 + B)}`);
+
+  // improve 是 u8 @payload2,其后 reserved 占 1 字节
+  const f3 = buildSetPid(0, PidLoop.SPEED, { ...pid, improve: 5 });
+  check('improve u8 @payload2', f3[2 + B] === 5, `got ${f3[2 + B]}`);
+
+  // 小数:0.7*100=70、0.1*100=10 精确(选值避免二进制浮点误差)
+  const f2 = buildSetPid(0, PidLoop.CURRENT, { Kp: 0.7, Ki: 0.1, MaxOut: 20000 });
+  check('fractional Kp 0.7 -> 70', f2.readUInt16LE(4 + B) === 70);
+  check('fractional Ki 0.1 -> 10', f2.readUInt16LE(6 + B) === 10);
+  check('GM6020 MaxOut 20000 stays 20000', f2.readInt32LE(10 + B) === 20000);
+
+  const frames = new FrameParser().push(f);
+  check('PID_SET round-trips through parser', frames.length === 1);
+  check('PID_SET round-trip type', frames[0].type === 0x0a);
+
+  // ---- 17.2 PID_QUERY ----
+  const q = buildPidQuery(5);
+  check('PID_QUERY type 0x0b', q[1] === 0x0b);
+  check('PID_QUERY payload len 4', q[2] === 4);
+  check('PID_QUERY channel_id @payload3', q[3 + B] === 5);
+
+  // ---- 17.3 PID_REPORT 解析 ----
+  /*
+   * 手工构造一包与固件布局一致的报表。三个环参数刻意不同,
+   * 只有布局完全正确才能三个环都对上。
+   */
+  const rep = Buffer.alloc(49);
+  rep[0] = 3;                        // channel
+  rep[1] = MotorKind.GM6020;         // kind
+  const put16 = (arr, li, v) => rep.writeUInt16LE(v, 4 + arr * 6 + li * 2);
+  const put32 = (arr, li, v) => rep.writeInt32LE(v, 22 + arr * 12 + li * 4);
+  // 速度环(6020 yaw 实参)
+  put16(0, 0, 5000); put16(1, 0, 20000); put16(2, 0, 0);
+  put32(0, 0, 20000); put32(1, 0, 3000);
+  // 电流环
+  put16(0, 1, 70);    put16(1, 1, 10);    put16(2, 1, 0);
+  put32(0, 1, 20000); put32(1, 1, 3000);
+  // 位置环
+  put16(0, 2, 800);   put16(1, 2, 0);     put16(2, 2, 0);
+  put32(0, 2, 500);   put32(1, 2, 100);
+  rep[46] = 5; rep[47] = 0; rep[48] = 5;
+
+  const rp = parsePidReport(rep);
+  check('PID_REPORT parses', !!rp);
+  check('PID_REPORT channelId', rp.channelId === 3);
+  check('PID_REPORT kind', rp.kind === MotorKind.GM6020);
+  check('PID_REPORT speed Kp=50', rp.speed.Kp === 50, `got ${rp.speed.Kp}`);
+  check('PID_REPORT speed Ki=200', rp.speed.Ki === 200, `got ${rp.speed.Ki}`);
+  check('PID_REPORT speed MaxOut=20000', rp.speed.MaxOut === 20000, `got ${rp.speed.MaxOut}`);
+  check('PID_REPORT current Kp=0.7', rp.current.Kp === 0.7, `got ${rp.current.Kp}`);
+  check('PID_REPORT current Ki=0.1', rp.current.Ki === 0.1, `got ${rp.current.Ki}`);
+  check('PID_REPORT angle Kp=8', rp.angle.Kp === 8, `got ${rp.angle.Kp}`);
+  check('PID_REPORT angle MaxOut=500', rp.angle.MaxOut === 500, `got ${rp.angle.MaxOut}`);
+  check('PID_REPORT angle IntLim=100', rp.angle.IntegralLimit === 100);
+  check('PID_REPORT improve per loop',
+    rp.speed.improve === 5 && rp.current.improve === 0 && rp.angle.improve === 5);
+
+  check('PID_REPORT rejects short', parsePidReport(rep.subarray(0, 20)) === null);
+  check('PID_REPORT rejects empty', parsePidReport(Buffer.alloc(0)) === null);
+
+  // ---- 17.4 PID_SET_ACK ----
+  const pa = parsePidSetAck(Buffer.from([0x07, 0x02, 0x00, 0x00]));
+  check('PID_SET_ACK channelId', pa.channelId === 7);
+  check('PID_SET_ACK loop', pa.loop === 2);
+  check('PID_SET_ACK result OK', pa.result === MBResult.OK);
+  check('PID_SET_ACK rejects short', parsePidSetAck(Buffer.from([0, 0])) === null);
+
+  // ---- 17.5 页面默认值与固件表一致 ----
+  /* 上位机 PID_DEFAULTS 是"页面初始显示值",固件 bench_dji_*_pid[] 是"建电机时写入值"。
+   * 两边必须一致,否则用户会看到页面写 A、实际生效 B。 */
+  check('M3508 speed Kp=20 (摩擦轮)', PID_DEFAULTS[MotorKind.M3508].speed.Kp === 20);
+  check('M3508 speed MaxOut=15000', PID_DEFAULTS[MotorKind.M3508].speed.MaxOut === 15000);
+  check('M2006 speed Kp=10 (拨弹盘)', PID_DEFAULTS[MotorKind.M2006].speed.Kp === 10);
+  check('M2006 speed MaxOut=5000', PID_DEFAULTS[MotorKind.M2006].speed.MaxOut === 5000);
+  check('GM6020 speed Kp=50 (yaw)', PID_DEFAULTS[MotorKind.GM6020].speed.Kp === 50);
+  check('GM6020 speed Ki=200', PID_DEFAULTS[MotorKind.GM6020].speed.Ki === 200);
+  check('GM6020 speed MaxOut=20000 (超出 u16×100,验证协议容量)', 
+    PID_DEFAULTS[MotorKind.GM6020].speed.MaxOut === 20000);
+  /* DJI 三型必须带电流环参数 —— 这三组实参都是在电流内环下整定的,
+   * 少了电流环"同样的 Kp/Ki"不会有同样效果。
+   * 达妙不在此列:用户明确要求"达妙暂时不变",固件侧也没开电流环。 */
+  const djiKinds = [MotorKind.M3508, MotorKind.M2006, MotorKind.GM6020];
+  check('DJI 三型都带电流环参数(三环闭环必要条件)',
+    djiKinds.every((k) => PID_DEFAULTS[k].current.Kp > 0));
+  check('达妙暂不引入电流环(延用原值,用户要求不变)',
+    PID_DEFAULTS[MotorKind.DM].current.Kp === 0);
+  check('达妙参数暂不引入(延用原值)',
+    PID_DEFAULTS[MotorKind.DM].speed.Kp === 5);
+}
+
+console.log('\n== 18. PID panel must stay visible (disable, not hide) ==');
+{
+  /*
+   * 实机反馈:「并没有看到 pid 参数的输入入口」。
+   * 原因:index.html 里 PID 面板带 hidden 属性,未绑定电机时整块隐藏,
+   * 而卡片下半部分在页面上并不显眼,用户根本不知道这个功能存在。
+   *
+   * "不用重烧固件就能改 PID"是本测试台的核心卖点之一,入口藏起来等于没做。
+   * 正确做法:面板常驻可见,未绑定时 disabled 灰显并提示。
+   *
+   * 判据:
+   *   1. index.html 的 pid-panel 不得带 hidden 属性
+   *   2. ui.js 的 initPidPanel 不得再操作 .hidden
+   *   3. 必须切换 disabled(输入框 + 环选择器 + 三个按钮)
+   *   4. 换选电机要刷新面板,否则会出现"选了 M2006 却摆着 M3508 的参数"
+   */
+  let html, uiSrc;
+  try {
+    const base = new URL('./', import.meta.url);
+    html = readFileSync(new URL('index.html', base), 'utf8');
+    uiSrc = readFileSync(new URL('ui.js', base), 'utf8');
+  } catch {
+    console.log('  SKIP  index.html / ui.js not reachable');
+  }
+
+  if (html) {
+    const panel = html.match(/<div class="pid-panel"[^>]*>/);
+    check('pid-panel element found in template', !!panel);
+    if (panel) {
+      check('pid-panel is NOT hidden (must stay visible)',
+        !/\shidden\b/.test(panel[0]),
+        `got: ${panel[0]}`);
+    }
+    check('pid panel has an explicit "先绑定" hint',
+      /先绑定电机后可用/.test(html));
+  }
+
+  if (uiSrc) {
+    const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const fn = uiSrc.match(/function initPidPanel\([^)]*\)\s*\{[\s\S]*?\n\}/);
+    check('initPidPanel found', !!fn);
+    if (fn) {
+      const body = strip(fn[0]);
+      check('initPidPanel no longer hides the panel',
+        !/\.hidden\s*=/.test(body),
+        'hiding makes the feature undiscoverable');
+      check('initPidPanel toggles disabled instead',
+        /\.disabled\s*=/.test(body));
+      check('initPidPanel disables all five inputs',
+        /'pKp'[\s\S]*'pKi'[\s\S]*'pKd'[\s\S]*'pMaxOut'[\s\S]*'pIntLim'/.test(body));
+      check('initPidPanel disables the apply/query/reset buttons',
+        /'pidApply'[\s\S]*'pidQuery'[\s\S]*'pidReset'/.test(body));
+    }
+    check('motor dropdown change refreshes the PID panel',
+      /r\('motor'\)\.onchange\s*=\s*\(\)\s*=>\s*initPidPanel\(/.test(uiSrc),
+      'otherwise selecting a different motor shows the wrong defaults');
+  }
+}
+
+console.log('\n== 19. telemetry frame must be split to fit the 64B USB limit ==');
+{
+  /*
+   * 实机症状:绑定 2 颗电机一切正常,绑到第 3 颗时
+   *   - 卡片右上角一直"未绑定",点了绑定没反应
+   *   - 使能后按钮也不变色
+   * 看起来像 UI 卡死,实际是**整帧遥测被 USB 层截断**,上位机一条都解析不出。
+   *
+   * 算术(这就是全部):
+   *   负载 = count(1) + seq(2) + count × 21
+   *   count=2 → 3 + 42 = 45  ✓  ≤ 64
+   *   count=3 → 3 + 63 = 66  ✗  >  64  ← 第 3 颗就断了
+   *
+   * 修复:固件按 MB_TELEMETRY_PER_FRAME 分帧发送,上位机按 channel_id 合并。
+   * 本组测试锁定两件事:
+   *   1. 固件必须分帧(且常量在头文件里,不重复推导)
+   *   2. 上位机 MAX_PAYLOAD 与固件 MB_PAYLOAD_MAX 一致,且不小于分帧后的单帧
+   */
+  let fw;
+  try {
+    fw = readFileSync(new URL(
+      '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c', import.meta.url,
+    ), 'utf8');
+  } catch {
+    console.log('  SKIP  firmware motor_bench.c not reachable');
+  }
+
+  if (fw) {
+    const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const body = strip(fw);
+
+    check('MB_TELEMETRY_PER_FRAME is defined in the header, not the .c',
+      !/#define\s+MB_TELEMETRY_PER_FRAME/.test(body),
+      'keep the capacity constant in one place (motor_bench.h)');
+
+    const fn = fw.match(/static void MotorBenchSendTelemetry\(void\)\s*\{[\s\S]*?\n\}/);
+    check('MotorBenchSendTelemetry found', !!fn);
+    if (fn) {
+      const fbody = strip(fn[0]);
+      check('telemetry is sent inside a per-frame loop',
+        /for\s*\(\s*uint8_t base\s*=/.test(fbody),
+        'single-shot send cannot hold 3+ motors in 64 bytes');
+      check('loop clamps per-frame count to MB_TELEMETRY_PER_FRAME',
+        /n\s*>\s*MB_TELEMETRY_PER_FRAME/.test(fbody));
+      check('items are indexed by base offset',
+        /items\[base\s*\+\s*i\]/.test(fbody),
+        'without base offset every frame would resend channel 0');
+      check('body_len uses the clamped n, not the total count',
+        /3\s*\+\s*n\s*\*\s*sizeof\(MB_TelemetryItem_s\)/.test(fbody));
+    }
+  }
+
+  /* 上位机侧:MAX_PAYLOAD 必须与固件一致,且容得下分帧后的整帧 */
+  check('host MAX_PAYLOAD is 64 (must match firmware MB_PAYLOAD_MAX)', MAX_PAYLOAD === 64);
+
+  const ITEM = 21;
+  const perFrame = Math.floor((MAX_PAYLOAD - 3) / ITEM);
+  check('per-frame motor capacity is 2 at 64B', perFrame === 2, `got ${perFrame}`);
+  check('a full telemetry frame fits the USB packet',
+    5 + 3 + perFrame * ITEM <= 64,
+    `frame = ${5 + 3 + perFrame * ITEM} bytes`);
+
+  /*
+   * 端到端:构造 8 个电机的遥测,按每帧 2 个切分,
+   * 每一帧都必须能被 FrameParser 正常解析出全部 item。
+   * 这正是上位机合并数据时看到的东西。
+   */
+  const ids = [0, 1, 2, 3, 4, 5, 6, 7];
+  const frames = [];
+  for (let base = 0; base < ids.length; base += perFrame) {
+    const chunk = ids.slice(base, base + perFrame);
+    const body = Buffer.alloc(3 + chunk.length * ITEM);
+    body[0] = chunk.length;
+    body.writeUInt16LE(base, 1);
+    chunk.forEach((id, k) => {
+      const off = 3 + k * ITEM;
+      body.writeUInt16LE(id, off);       // channel_id
+      body.writeUInt16LE(0x03, off + 2); // status: online + enabled
+    });
+    const fr = Buffer.alloc(5 + body.length);
+    fr[0] = 0xa5; fr[1] = 0x81; fr[2] = body.length;
+    body.copy(fr, 3);
+    fr[3 + body.length] = crc8(fr.subarray(1, 3 + body.length));
+    fr[4 + body.length] = 0x5a;
+    frames.push(fr);
+  }
+
+  check('8 motors produce 4 frames', frames.length === 4, `got ${frames.length}`);
+
+  const seen = [];
+  for (const fr of frames) {
+    check(`frame payload ${fr[2]}B <= 64`, fr[2] <= 64, `got ${fr[2]}`);
+    const parsed = new FrameParser().push(fr);
+    check('frame parses', parsed.length === 1);
+    if (parsed.length) {
+      const tm = parseTelemetry(parsed[0].payload);
+      /*
+       * count 在**负载的第 0 字节**,帧内偏移是 3(head+type+len)。
+       * 别写 fr[0] —— 那是帧头 0xA5 = 165,会得到一条莫名其妙的
+       * "expected 165 items" 断言。帧内下标 ≠ 负载下标,这是分帧调试最容易错的一处。
+       */
+      const expected = fr[3];
+      check('telemetry items parsed', tm && tm.items.length === expected,
+        `expected ${expected} items, got ${tm ? tm.items.length : 0}`);
+      if (tm) tm.items.forEach((it) => seen.push(it.channelId));
+    }
+  }
+
+  check('all 8 channels survive the split', seen.length === 8, `got ${seen.length}`);
+  check('channel ids are unique and ordered',
+    JSON.stringify(seen) === JSON.stringify(ids), `got ${JSON.stringify(seen)}`);
+}
+
+console.log('\n== 20. adding a motor must not destroy channel UI state ==');
+{
+  /*
+   * 三个实测故障,同一个根因:
+   *   1. 先加 6020 再加 2006 → 通道 0 的电机选择消失(要重新选),
+   *      但通道 0 控制的其实还是那颗 6020;
+   *   2. 已设好的 rpm 自动归零;
+   *   3. 先 6020 后 3508 → 两个通道被一起清空,且之后无法二次绑定。
+   *
+   * 根因是两条错误假设:
+   *   (a) `CHANNEL_COUNT !== inventory.length` → 任何数量变化都重建卡片,
+   *       而 buildChannels() 里的 `host.innerHTML=''` 会销毁所有卡片状态;
+   *   (b) `fillMotorOptions()` 无条件重建 <option>,把已选值打回 "";
+   *   两者都建立在"电机数 == 通道数"这个错误前提上 ——
+   *   实际通道是独立控制位(固件 MB_CHANNEL_MAX = 8),与电机总数无关。
+   *
+   * 判据(对着源码断言,因为这些是"不该再犯"的结构性约束):
+   *   1. buildChannels 里不得再出现 host.innerHTML = ''
+   *   2. buildChannels 必须只增不减(Math.max(have, ...))
+   *   3. fillMotorOptions 必须在重建 option 前记住三元组、重建后恢复
+   *   4. 清单处理器不得再以 CHANNEL_COUNT !== inventory.length 为重建条件
+   *   5. startInventoryFetch 重入时必须先清旧定时器(否则拉取会静默停摆)
+   */
+  let ui;
+  try {
+    ui = readFileSync(new URL('./ui.js', import.meta.url), 'utf8');
+  } catch {
+    console.log('  SKIP  ui.js not reachable');
+  }
+
+  if (ui) {
+    /* 剥注释后再匹配,否则会被注释里引用的旧代码骗到 */
+    const code = ui.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+    /* --- buildChannels --- */
+    const bc = ui.match(/function buildChannels\([^)]*\)\s*\{[\s\S]*?\n\}/);
+    check('buildChannels found', !!bc);
+    if (bc) {
+      const bcode = bc[0].replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+      check('buildChannels does NOT wipe the container',
+        !/host\.innerHTML\s*=\s*''/.test(bcode),
+        'innerHTML="" destroys every channel card and all user state');
+      check('buildChannels is additive (never shrinks)',
+        /Math\.max\(/.test(bcode),
+        'cards must only grow; shrinking deletes a channel the user is using');
+      check('buildChannels appends from the existing count',
+        /for\s*\(\s*let i\s*=\s*have\s*;/.test(bcode));
+      check('buildChannels returns early when the count is unchanged',
+        /have\s*===\s*n/.test(bcode),
+        'touching the DOM when nothing changed still loses input state');
+    }
+
+    /* --- fillMotorOptions --- */
+    const fm = ui.match(/function fillMotorOptions\(\)\s*\{[\s\S]*?\n\}/);
+    check('fillMotorOptions found', !!fm);
+    if (fm) {
+      const fcode = fm[0].replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+      check('fillMotorOptions remembers the selection before rebuilding',
+        /prevKey\s*=/.test(fcode),
+        'otherwise every inventory refresh clears the dropdown');
+      check('fillMotorOptions keys on (kind,bus,id), not index',
+        /\$\{.*kind.*\}\s*:\s*\$\{.*canBus.*\}\s*:\s*\$\{.*motorId.*\}/.test(fcode),
+        'indices shift when motors are added/removed');
+      check('fillMotorOptions restores the selection after rebuilding',
+        /sel\.value\s*=\s*restoredIdx/.test(fcode));
+    }
+
+    /* --- inventory handler:不再以数量变化重建 --- */
+    check('inventory handler no longer rebuilds on count mismatch',
+      !/CHANNEL_COUNT\s*!==\s*inventory\.length/.test(code),
+      'this single condition caused all three symptoms');
+
+    /* --- startInventoryFetch 竞态 --- */
+    const sf = ui.match(/function startInventoryFetch\(\)\s*\{[\s\S]*?\n\}/);
+    check('startInventoryFetch found', !!sf);
+    if (sf) {
+      const scode = sf[0].replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+      check('startInventoryFetch clears the previous timer on re-entry',
+        /if\s*\(\s*inventoryTimer\s*\)\s*\{[\s\S]*?clearInterval/.test(scode),
+        'a stale timer makes the re-fetch a no-op -> inventory never refreshes again');
+      check('startInventoryFetch does NOT bail out on an active timer',
+        !/if\s*\(inventoryTimer\)\s*return/.test(scode));
+    }
+
+    /* --- 端到端语义:通道数与电机数解耦 --- */
+    check('CHANNEL_COUNT is not derived from inventory length',
+      !/CHANNEL_COUNT\s*=\s*inventory\.length/.test(code),
+      'channels and motors are independent; MB_CHANNEL_MAX is 8 either way');
+  }
+}
+
+console.log('\n== 21. "unbind" must really unbind, not just stop ==');
+{
+  /*
+   * 实测故障(安全级):通道 2 先绑 M3508,点"解绑"换成 M2006,
+   *   结果**所有电机都不转了**,且界面无任何错误提示。
+   *
+   * 根因是"解绑"按钮名不副实 —— 它只下发 enable=0(那是"停机"):
+   *   电机确实停了,但固件侧 mb_channels[ch].is_used 仍为 1、
+   *   motor_ptr 仍指着原来那颗。
+   *   紧接着绑定另一颗,MotorBenchBind 撞上
+   *     if (mb_channels[channel_id].is_used) return MB_ERR_DUPLICATE;
+   *   被**静默拒绝**。而界面早已把本地状态清掉、显示"未绑定",
+   *   于是用户看到的是"换了电机但什么都不动了"。
+   *
+   * MotorBenchUnbind() 早已实现却没有任何帧能触发它,等于死代码。
+   *
+   * 判据:
+   *   1. 协议有 MOTOR_UNBIND(0x0C) 与 UNBIND_ACK(0x8D),能构帧能解析
+   *   2. 固件 dispatch 处理该帧,且实现里调用 MotorBenchUnbind
+   *   3. UNBIND 在门闩白名单内(否则心跳波动时点解绑没反应)
+   *   4. 界面下发的是 unbind 指令,**不是**只用 enable:false 冒充
+   *   5. 界面等 unbindAck 到达才清状态(失败时显示原因)
+   */
+  let ui, srv, fwC, fwH;
+  try {
+    const b = new URL('./', import.meta.url);
+    ui = readFileSync(new URL('ui.js', b), 'utf8');
+    srv = readFileSync(new URL('server.js', b), 'utf8');
+    fwC = readFileSync(new URL('../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c', b), 'utf8');
+    fwH = readFileSync(new URL('../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.h', b), 'utf8');
+  } catch {
+    console.log('  SKIP  source files not reachable');
+  }
+
+  /* --- 1. 帧定义与编解码 --- */
+  check('MOTOR_UNBIND frame type is 0x0C', FrameType.MOTOR_UNBIND === 0x0c,
+    `got ${FrameType.MOTOR_UNBIND}`);
+  check('UNBIND_ACK frame type is 0x8D', FrameType.UNBIND_ACK === 0x8d,
+    `got ${FrameType.UNBIND_ACK}`);
+
+  const ub = buildUnbind(3);
+  check('unbind frame head 0xA5', ub[0] === 0xa5);
+  check('unbind frame type 0x0C', ub[1] === 0x0c);
+  check('unbind payload len 2', ub[2] === 2, `got ${ub[2]}`);
+  check('unbind channel_id @payload1', ub[4] === 3, `got ${ub[4]}`);
+  check('unbind frame round-trips', new FrameParser().push(ub).length === 1);
+
+  const ua = parseUnbindAck(Buffer.from([0x02, 0x00]));
+  check('unbindAck channelId', ua.channelId === 2);
+  check('unbindAck result OK', ua.result === MBResult.OK);
+  check('unbindAck rejects short', parseUnbindAck(Buffer.from([0])) === null);
+
+  /* --- 2. 固件侧 --- */
+  if (fwC && fwH) {
+    const stripFw = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+    check('firmware declares MB_FRAME_MOTOR_UNBIND',
+      /MB_FRAME_MOTOR_UNBIND\s*=\s*0x0C/.test(fwH));
+    check('firmware declares MB_FRAME_UNBIND_ACK',
+      /MB_FRAME_UNBIND_ACK\s*=\s*0x8D/.test(fwH));
+    check('MotorBenchUnbind is declared in the header',
+      /uint8_t MotorBenchUnbind\(uint8_t channel_id\)/.test(fwH));
+
+    const fwCode = stripFw(fwC);
+
+    check('dispatch handles MOTOR_UNBIND',
+      /case MB_FRAME_MOTOR_UNBIND:[\s\S]*?MotorBenchHandleUnbind/.test(fwCode),
+      'without this the frame is silently dropped as "unknown frame type"');
+    check('handler calls MotorBenchUnbind',
+      /static void MotorBenchHandleUnbind[\s\S]*?MotorBenchUnbind\(ch\)/.test(fwCode));
+    check('handler sends an UNBIND_ACK (success or failure)',
+      /static void MotorBenchHandleUnbind[\s\S]*?MB_FRAME_UNBIND_ACK/.test(fwCode),
+      'the UI must not clear its state on a guess');
+    check('UNBIND is on the link-gate allow-list',
+      /type\s*!=\s*MB_FRAME_MOTOR_UNBIND/.test(fwCode),
+      'otherwise a marginal heartbeat makes "unbind" silently do nothing');
+  }
+
+  /* --- 3. 界面侧 --- */
+  if (ui && srv) {
+    /* 剥注释:否则注释里引用的旧代码会被误判成真实实现 */
+    const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const uiCode = strip(ui);
+    const srvCode = strip(srv);
+
+    const unb = ui.match(/r\('unbind'\)\.onclick[\s\S]*?\n\s*\};/);
+    check('unbind button handler found', !!unb);
+    if (unb) {
+      const b = strip(unb[0]);
+      check('unbind button sends a real unbind command',
+        /type:\s*'unbind'/.test(b),
+        'sending only enable:false leaves the channel occupied -> rebind is rejected');
+      check('unbind button still stops the motor first',
+        /type:\s*'enable'[\s\S]*?enable:\s*false/.test(b),
+        'safety first: do not rely on the unbind frame arriving');
+      check('unbind button does NOT clear local state immediately',
+        !/telemetryByChannel\.delete/.test(b),
+        'clearing before the ack hides firmware rejections');
+    }
+    check('UI clears channel state on unbindAck',
+      /case 'unbindAck'/.test(uiCode) &&
+      /telemetryByChannel\.delete\(d\.channelId\)/.test(uiCode));
+    check('UI reports unbind failure instead of hiding it',
+      /解绑失败/.test(uiCode));
+    check('server forwards the unbind command',
+      /cmd\.type === 'unbind'/.test(srvCode) && /buildUnbind\(/.test(srvCode));
+    check('server broadcasts unbindAck from the board',
+      /FrameType\.UNBIND_ACK/.test(srvCode) && /parseUnbindAck/.test(srvCode));
   }
 }
 
