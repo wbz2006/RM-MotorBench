@@ -306,6 +306,99 @@ button:disabled {
   font-weight: 600;
 }
 
+/* ---------------- PID 整定面板 ---------------- */
+
+.pid-panel {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.pid-panel[data-collapsed="1"] .pid-grid,
+.pid-panel[data-collapsed="1"] .pid-actions {
+  display: none;
+}
+
+.pid-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.pid-head .panel-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.pid-head select,
+.pid-head button {
+  font-size: 12px;
+  padding: 4px 9px;
+}
+
+/* 把"读回板端值"和"收起"推到右侧 */
+.pid-head button {
+  margin-left: 0;
+}
+
+.pid-head button.ghost:last-child {
+  margin-left: auto;
+}
+
+.pid-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 8px;
+}
+
+.pid-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pid-grid input {
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pid-grid input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.pid-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.pid-actions .hint {
+  font-size: 12px;
+}
+
+.hint.ok {
+  color: var(--ok);
+}
+
+.hint.error {
+  color: var(--danger);
+}
+
 .control {
   display: flex;
   flex-direction: column;

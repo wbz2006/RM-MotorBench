@@ -38,7 +38,12 @@
 /** 通道数上限 */
 #define MB_CHANNEL_MAX 8
 
-/** 单帧最大负载长度,越界即判定为假帧头(用于流式重同步) */
+/** 单帧最大负载长度,越界即判定为假帧头(用于流式重同步)
+ *
+ * @note 64 不是随意取的:USB CDC 单帧上限,也是上位机 MAX_PAYLOAD 的约定值。
+ *       **任何变长负载帧都必须检查它** —— 超过就会被 USB 层截断,
+ *       上位机解析失败,而现象往往表现成"UI 不更新",极难往协议层想。
+ */
 #define MB_PAYLOAD_MAX 64
 
 /** 串口接收缓冲区大小 */
@@ -85,9 +90,15 @@ typedef enum
      */
     MB_FRAME_MOTOR_ADD = 0x08,
     MB_FRAME_MOTOR_REMOVE = 0x09,
+    MB_FRAME_PID_SET = 0x0A,   /* 运行期写入单通道单环 PID 参数 */
+    MB_FRAME_PID_QUERY = 0x0B, /* 请求上报单通道三套 PID 参数 */
+    MB_FRAME_MOTOR_UNBIND = 0x0C, /* 解绑通道(释放 is_used,否则无法改绑) */
     MB_FRAME_TELEMETRY = 0x81,    /* 板端遥测上报(仅板端发出) */
     MB_FRAME_INVENTORY_REPORT = 0x82, /* 电机清单应答(仅板端发出) */
     MB_FRAME_MOTOR_ADD_ACK = 0x8A,   /* 建电机结果应答(仅板端发出) */
+    MB_FRAME_PID_REPORT = 0x8B,      /* PID 参数应答(仅板端发出) */
+    MB_FRAME_PID_SET_ACK = 0x8C,     /* PID 写入结果应答(仅板端发出) */
+    MB_FRAME_UNBIND_ACK = 0x8D,      /* 解绑结果应答(仅板端发出) */
 } MB_FrameType_e;
 
 /** 支持的电机种类,与 motor_def.h / 各驱动一一对应 */
@@ -183,6 +194,101 @@ typedef struct
     int8_t temperature;   /* 温度,未知为 -128 */
 } MB_TelemetryItem_s;
 
+/**
+ * PID 参数的目标环 —— 与 protocol.js 的 PidLoop 一致
+ */
+typedef enum
+{
+    MB_PID_LOOP_SPEED = 0,   /* 速度环 */
+    MB_PID_LOOP_CURRENT = 1, /* 电流环 */
+    MB_PID_LOOP_ANGLE = 2,   /* 位置环 */
+} MB_PidLoop_e;
+
+/**
+ * 设置 PID 请求体,21 字节(4 头 + 17 体)
+ *
+ * @note 定点方案 —— 为什么大小不一:
+ *   Kp/Ki/Kd 是小系数,用 u16×100 保留两位小数;
+ *   但 MaxOut / IntegralLimit 是**电流量级**:
+ *   M3508 摩擦轮 MaxOut=15000,GM6020 yaw 达 20000。
+ *   若也按 ×100 传输,15000→1500000 已超出 u16 上限(65535),
+ *   Buffer.writeUInt16LE 直接抛 ERR_OUT_OF_RANGE。
+ *   (这是迁移当天实际踩到的坑,不是假想风险)
+ *   故:小系数 u16×100,大限幅 s32 整数原值,混合布局。
+ *
+ * 布局:
+ *   channel_id(1) loop(1) improve_flags(1) reserved(1)
+ *   Kp(2) Ki(2) Kd(2)                     u16×100
+ *   MaxOut(4) IntegralLimit(4)            s32 整数值
+ *   reserved(4)
+ */
+typedef struct __attribute__((packed))
+{
+    /*
+     * @attention 必须 packed。
+     *   协议结构体代表的是**线上字节序列**,不是内存里的变量布局。
+     *   不加 packed 时编译器会按对齐插入填充字节:
+     *   uint8_t×3 之后 uint16 跳到偏移 4,int32 再跳到 16,
+     *   sizeof 变成 26 而不是声明的 20 —— 上位机按 20 解析,
+     *   就会把填充字节当成参数值,表现为"参数莫名其妙变大"。
+     *   加 packed 后布局 = 声明顺序,sizeof = 字段之和。
+     */
+    uint8_t channel_id;    /* 目标通道 @0 */
+    uint8_t loop;          /* MB_PidLoop_e @1 */
+    uint8_t improve_flags; /* PID_Improvement_e 低 8 位 @2 */
+    uint8_t reserved;      /* 填 0 @3(占 improve 的高字节) */
+    uint16_t kp_x100;      /* round(Kp * 100) @4 */
+    uint16_t ki_x100;      /* round(Ki * 100) @6 */
+    uint16_t kd_x100;      /* round(Kd * 100) @8 */
+    int32_t max_out;       /* MaxOut 整数值,电流量级 @10 */
+    int32_t integral_limit;/* IntegralLimit 整数值 @14 */
+    uint8_t tail_pad[2];   /* 凑整,填 0 @18 */
+} MB_PidSetReq_s;
+
+/** PID 查询请求体,4 字节 */
+typedef struct
+{
+    uint8_t reserved[3];
+    uint8_t channel_id; /* 目标通道 */
+} MB_PidQueryReq_s;
+
+/**
+ * PID 上报体,43 字节
+ *
+ * 布局(与 protocol.js parsePidReport 逐字节对应):
+ *   channel_id(1) kind(1) reserved(2)
+ *   kp[3]      u16 x100     → @4  (6 字节)
+ *   ki[3]      u16 x100     → @10
+ *   kd[3]      u16 x100     → @16
+ *   maxout[3]  s32 整数值   → @22 (12 字节)
+ *   intlim[3]  s32 整数值   → @34
+ *   improve[3] u8          → @46
+ *
+ * @note MaxOut/IntegralLimit 用 s32 而非 u16,原因见 MB_PidSetReq_s 注释
+ *       (15000×100 会超出 u16)。这里存整数值不放大,所以 4 字节足够。
+ */
+typedef struct __attribute__((packed))
+{
+    uint8_t channel_id;
+    uint8_t kind;
+    uint8_t reserved[2];
+    uint16_t loop_kp_x100[3];      /* 每环 Kp   x100 */
+    uint16_t loop_ki_x100[3];      /* 每环 Ki   x100 */
+    uint16_t loop_kd_x100[3];      /* 每环 Kd   x100 */
+    int32_t loop_maxout[3];        /* 每环 MaxOut,整数值 */
+    int32_t loop_intlim[3];        /* 每环 IntegralLimit,整数值 */
+    uint8_t loop_improve[3];       /* 每环 improve 标志,各 1 字节 */
+} MB_PidReport_s;
+
+/** PID 写入结果应答,4 字节 */
+typedef struct
+{
+    uint8_t channel_id;
+    uint8_t loop;
+    uint8_t result;  /* MB_Result_e */
+    uint8_t detail;  /* 附加信息 */
+} MB_PidSetAck_s;
+
 /** 遥测帧:body = count(1) + seq(2) + items[count*21] */
 typedef struct
 {
@@ -269,6 +375,59 @@ _Static_assert(offsetof(MB_MotorAddReq_s, motor_id) == 2, "addreq motor_id @2");
 _Static_assert(offsetof(MB_MotorAddAck_s, result) == 0, "addack result @0");
 _Static_assert(offsetof(MB_MotorAddAck_s, channel_id) == 4, "addack channel @4");
 _Static_assert(offsetof(MB_MotorAddAck_s, detail) == 5, "addack detail @5");
+
+/* PID 帧布局 —— 与 protocol.js 的 buildSetPid / parsePidReport 逐字节对应
+ *
+ * @attention 大小与偏移必须与上位机约定完全一致,否则两边解析会对错字段。
+ *   实测过的偏移(编译期已锁定):
+ *     set  req(21B): channel@0 loop@1 improve@2 kp@4 ki@6 kd@8
+ *                    maxout@10 intlim@14
+ *     set  req(20B): channel@0 loop@1 improve@2 kp@4 ki@6 kd@8
+ *                    maxout@10 intlim@14 tail@18
+ *     report(49B) : channel@0 kind@1 kp@4 ki@10 kd@16
+ *                    maxout@22 intlim@34 improve@46
+ *
+ * @attention 两个 PID 结构体都加了 __attribute__((packed))。
+ *   协议结构体代表**线上字节序列**,不是内存变量布局。
+ *   不加 packed,编译器会按对齐插填充字节(uint8×3 后 uint16 跳到 4、
+ *   int32 再跳到 16),sizeof 与声明的数字对不上,
+ *   上位机按标称长度解析就会把填充字节当成参数值。 */
+_Static_assert(sizeof(MB_PidSetReq_s) == 20, "pid set req must be 20 bytes");
+_Static_assert(sizeof(MB_PidQueryReq_s) == 4, "pid query req must be 4 bytes");
+_Static_assert(sizeof(MB_PidReport_s) == 49, "pid report must be 49 bytes");
+_Static_assert(sizeof(MB_PidReport_s) <= MB_PAYLOAD_MAX,
+               "PID report must fit in one USB CDC frame (64B)");
+
+/*
+ * 遥测帧的容量约束 —— MB_CHANNEL_MAX(8) 个电机**装不进一帧**:
+ *   3(头: count+seq) + 8×21 = 171 字节,远超 64。
+ * 因此 MotorBenchSendTelemetry() 必须按 MB_TELEMETRY_PER_FRAME 分帧发送。
+ * 若有人改回单帧一次性发送,这条断言挡不住(它只约束常量),
+ * 但至少把"单帧最多几个"这个数字写死在头文件里,不会再各处重复推导。
+ */
+#define MB_TELEMETRY_PER_FRAME ((MB_PAYLOAD_MAX - 3) / (int)sizeof(MB_TelemetryItem_s))
+_Static_assert(MB_TELEMETRY_PER_FRAME >= 1,
+               "telemetry frame must hold at least one motor item");
+_Static_assert(3 + MB_TELEMETRY_PER_FRAME * sizeof(MB_TelemetryItem_s) <= MB_PAYLOAD_MAX,
+               "telemetry frame would overflow MB_PAYLOAD_MAX");
+_Static_assert(sizeof(MB_PidSetAck_s) == 4, "pid set ack must be 4 bytes");
+_Static_assert(offsetof(MB_PidSetReq_s, channel_id) == 0, "pidset channel @0");
+_Static_assert(offsetof(MB_PidSetReq_s, loop) == 1, "pidset loop @1");
+_Static_assert(offsetof(MB_PidSetReq_s, improve_flags) == 2, "pidset improve @2");
+_Static_assert(offsetof(MB_PidSetReq_s, kp_x100) == 4, "pidset kp @4");
+_Static_assert(offsetof(MB_PidSetReq_s, ki_x100) == 6, "pidset ki @6");
+_Static_assert(offsetof(MB_PidSetReq_s, kd_x100) == 8, "pidset kd @8");
+_Static_assert(offsetof(MB_PidSetReq_s, max_out) == 10, "pidset maxout @10");
+_Static_assert(offsetof(MB_PidSetReq_s, integral_limit) == 14, "pidset intlim @14");
+_Static_assert(offsetof(MB_PidQueryReq_s, channel_id) == 3, "pidquery channel @3");
+_Static_assert(offsetof(MB_PidReport_s, channel_id) == 0, "pidrep channel @0");
+_Static_assert(offsetof(MB_PidReport_s, kind) == 1, "pidrep kind @1");
+_Static_assert(offsetof(MB_PidReport_s, loop_kp_x100) == 4, "pidrep kp @4");
+_Static_assert(offsetof(MB_PidReport_s, loop_ki_x100) == 10, "pidrep ki @10");
+_Static_assert(offsetof(MB_PidReport_s, loop_kd_x100) == 16, "pidrep kd @16");
+_Static_assert(offsetof(MB_PidReport_s, loop_maxout) == 22, "pidrep maxout @22");
+_Static_assert(offsetof(MB_PidReport_s, loop_intlim) == 34, "pidrep intlim @34");
+_Static_assert(offsetof(MB_PidReport_s, loop_improve) == 46, "pidrep improve @46");
 
 _Static_assert(offsetof(MB_TelemetryFrame_s, head) == 0, "tm head @0");
 _Static_assert(offsetof(MB_TelemetryFrame_s, type) == 1, "tm type @1");
@@ -451,6 +610,29 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable);
  * @attention 未使能时拒绝写入,防止上电瞬间意外转动;值会被限幅到 ±MB_REF_LIMIT_*
  */
 uint8_t MotorBenchSetRef(uint8_t channel_id, float ref);
+
+/**
+ * @brief 运行期设置某通道某环的 PID 参数
+ *
+ * @param channel_id 通道号
+ * @param loop       MB_PID_LOOP_SPEED / _CURRENT / _ANGLE
+ * @param kp        比例系数(需 >= 0,负数按 0 处理)
+ * @param ki        积分系数
+ * @param kd        微分系数
+ * @param max_out   输出限幅
+ * @param integral_limit 积分限幅
+ * @param improve   PID 改进位(PID_Improvement_e 位或)
+ * @return MB_OK 等
+ *
+ * @note 写入前会停机并清除对应环的积分历史量,避免参数跳变导致输出突跳。
+ */
+uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, float kd,
+                         float max_out, float integral_limit, uint16_t improve);
+
+/**
+ * @brief 查询某通道当前生效的三套 PID(上报 MB_FRAME_PID_REPORT)
+ */
+uint8_t MotorBenchQueryPid(uint8_t channel_id);
 
 /**
  * @brief 立即停止全部已绑定电机(急停入口)

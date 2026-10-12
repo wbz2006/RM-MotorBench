@@ -110,6 +110,40 @@
             <button data-role="zero" class="ghost">归零</button>
           </div>
         </div>
+
+        <!--
+          PID 运行期整定:默认值按电机型号填充(取自实车整定值),
+          可在页面直接改并下发,不必改固件重烧。
+
+          @attention 面板**始终可见**(不再用 hidden),只是未绑定电机时
+            输入框与按钮处于 disabled 状态。
+            之前用 hidden 完全藏起来,导致用户根本不知道这个功能存在 ——
+            而测试台的卖点之一正是"不用重烧就能改参数",入口却找不到。
+        -->
+        <div class="pid-panel" data-role="pidPanel">
+          <div class="pid-head">
+            <span class="panel-title">PID 整定</span>
+            <select data-role="pidLoop" disabled>
+              <option value="0">速度环</option>
+              <option value="1">电流环</option>
+              <option value="2">位置环</option>
+            </select>
+            <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回板端值</button>
+            <button data-role="pidCollapse" class="ghost" title="收起/展开">收起</button>
+          </div>
+          <div class="pid-grid">
+            <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
+            <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
+          </div>
+          <div class="pid-actions">
+            <button data-role="pidApply" disabled>应用到电机</button>
+            <button data-role="pidReset" class="ghost" disabled>恢复该型号默认值</button>
+            <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
+          </div>
+        </div>
       </article>
     </template>
 

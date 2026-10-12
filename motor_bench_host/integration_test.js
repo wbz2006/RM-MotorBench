@@ -13,9 +13,14 @@ import path from 'node:path';
 import { crc8, buildFrame, buildBind, buildSetRef, buildEnable, MotorKind, LoopType } from './protocol.js';
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\//, '')), '..');
+/*
+ * 固件目录名迁移过一次(2026-10-11: basic_framework-atype-master → basic_framework_atype_usb-master),
+ * 这里直接写死新名字。若以后又改名,这个测试会以"找不到固件 CRC 源文件"失败 ——
+ * 那正是它该有的表现:固件找不到就没法做真正的交叉校验。
+ */
 const firmwareCrc = path.join(
   repoRoot,
-  'basic_framework_atype-master',
+  'basic_framework_atype_usb-master',
   'modules',
   'algorithm',
   'crc8.c',
@@ -59,18 +64,64 @@ fs.writeFileSync(
 
 const exePath = path.join(tmp, 'crc_probe.exe');
 
-/** 依次尝试本机可用的原生 C 编译器(MinGW/Clang/MSVC 不可,故只找 gcc 家族) */
+/**
+ * 依次尝试本机可用的原生 C 编译器
+ *
+ * @attention 为什么必须注入 MSYS2 的 PATH:
+ *   本机 gcc 来自 MSYS2(gcc 15.2.0,装在 C:\msys64\mingw64\bin),
+ *   而 `gcc --version` 能跑通、一旦真编译就 **status=1 且 stderr 完全为空**。
+ *   原因是 gcc 及其子进程(cc1/as/ld)依赖 C:\msys64\usr\bin 下的运行时
+ *   (msys-2.0.dll 等),该目录**不在 PATH 里**;缺依赖时进程直接静默退出,
+ *   连错误信息都没有 —— 只表现为"编译失败但说不出为什么"。
+ *
+ *   实测:把 C:/msys64/mingw64/bin 与 C:/msys64/usr/bin 注入子进程 env 后,
+ *   同一个 gcc 立刻编译成功。
+ *
+ * @note 绝对路径候选也要保留:MSYS2 的 gcc 目录同样不在系统 PATH。
+ */
 function findNativeCompiler() {
-  const candidates = ['gcc', 'cc', 'clang'];
+  const candidates = [
+    'gcc',
+    'cc',
+    'clang',
+    // Windows 上常见的独立安装位置
+    'C:\\msys64\\mingw64\\bin\\gcc.exe',
+    'C:\\msys64\\ucrt64\\bin\\gcc.exe',
+    'C:\\msys64\\usr\\bin\\gcc.exe',
+    'C:\\mingw64\\bin\\gcc.exe',
+    'C:\\MinGW\\bin\\gcc.exe',
+    'C:\\ProgramData\\chocolatey\\bin\\gcc.exe',
+  ];
   for (const c of candidates) {
     try {
-      execFileSync(c, ['--version'], { stdio: 'pipe' });
+      execFileSync(c, ['--version'], { stdio: 'pipe', env: compilerEnv() });
+      console.log(`用原生编译器: ${c}`);
       return c;
     } catch {
       /* 继续找下一个 */
     }
   }
   return null;
+}
+
+/**
+ * 给子进程补上 MSYS2 / MinGW 的运行时目录
+ *
+ * @note 只在"该目录确实存在"时才加,避免污染其它编译器(如 Visual Studio)。
+ */
+function compilerEnv() {
+  const env = { ...process.env };
+  const extra = [
+    'C:\\msys64\\mingw64\\bin',
+    'C:\\msys64\\ucrt64\\bin',
+    'C:\\msys64\\usr\\bin',
+    'C:\\mingw64\\bin',
+    'C:\\MinGW\\bin',
+  ].filter((p) => fs.existsSync(p));
+  if (extra.length) {
+    env.PATH = `${extra.join(';')};${env.PATH ?? ''}`;
+  }
+  return env;
 }
 
 const cc = findNativeCompiler();
@@ -89,9 +140,16 @@ try {
     '-o', exePath,
     mainPath,
     firmwareCrc,
-  ], { stdio: 'pipe' });
+  ], { stdio: 'pipe', env: compilerEnv() });
 } catch (e) {
-  console.error(`用 ${cc} 编译固件 crc8.c 失败:`, e.stderr?.toString() ?? e.message);
+  /*
+   * @attention 必须把 stderr/stdout 都打出来。
+   *   原实现只打 e.stderr,若编译器是"找不到"而非"编译错",
+   *   e.stderr 为空 → 只输出「用 gcc 编译固件 crc8.c 失败: 」,
+   *   后面什么都没有,排查时完全看不出是"没装 gcc"还是"源码有语法错"。
+   */
+  const detail = [e.stderr, e.stdout, e.message].filter(Boolean).map(String).join('\n').trim();
+  console.error(`用 ${cc} 编译固件 crc8.c 失败:\n${detail || '(无任何输出 — 通常是编译器路径不存在)'}`);
   fs.rmSync(tmp, { recursive: true, force: true });
   process.exit(2);
 }

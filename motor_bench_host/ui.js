@@ -5,7 +5,13 @@
  *   下行: hello / ports / serial / heartbeat / telemetry / error
  *   上行: listPorts / openSerial / closeSerial / bind / setRef / enable / stopAll / query
  */
-import { MotorKindLabel, MBResult, MBResultText } from './protocol.js';
+import {
+  MotorKindLabel,
+  MotorKind,
+  MBResult,
+  MBResultText,
+  PID_DEFAULTS,
+} from './protocol.js';
 
 /**
  * 当前渲染的通道卡片数
@@ -25,6 +31,9 @@ const MOTOR_SPEC = {
   [MotorKindLabel[5]]: { unit: 'rad/s', range: 40 }, // LK
   [MotorKindLabel[6]]: { unit: 'rad/s', range: 40 }, // HT
 };
+
+/** PID 面板每通道的当前环(用于收到 PID 报表时知道该往哪个输入框填) */
+const pidStateByChannel = new Map(); // ch -> {loop, kind}
 
 const $ = (sel) => document.querySelector(sel);
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
@@ -52,32 +61,56 @@ let addPendingLabel = '添加电机';
  *
  * @note 早期固定生成 4 张卡片,导致板上只有 1 颗电机时,
  *   另外 3 张全是空卡片(未绑定、全是 --),既占地方又让人误以为功能异常。
- *   改为跟随板端清单数量动态生成:
- *     - 未拿到清单时先显示 1 张占位卡片,避免空白页;
- *     - 清单到达后按数量重建,数量随增删电机自动变化。
+ *
+ * @attention 【重要·2026-10-12 修复】卡片数曾跟随"电机数"变化,
+ *   导致三个实测故障:
+ *     1. 添加第二颗电机后,通道 0 的电机下拉选择被清空(要重新选),
+ *        但通道 0 控制的其实还是原来那颗;
+ *     2. 设好的 rpm 值自动归零;
+ *     3. 先 6020 后 3508 时,两个通道被一起清空,且之后无法二次绑定。
+ *   根因是 buildChannels() 里那行 `host.innerHTML = ''` ——
+ *   它把**所有**卡片连同已选下拉值、rpm 滑块值一起销毁。
+ *   而触发重建的条件 `CHANNEL_COUNT !== inventory.length`
+ *   本身就建立在错误假设上:"电机数 == 通道数"。
+ *   实际上通道是独立的控制位(最多 MB_CHANNEL_MAX = 8),
+ *   一颗电机绑到哪个通道都行,与电机总数无关。
+ *
+ *   正确做法:卡片数**只增不减**,且只在"用户明显需要更多通道"时增长
+ *   (即电机数超过当前卡片数),增长时**保留既有卡片的全部状态**。
+ *   这样加电机不会碰已有通道的任何界面状态。
  */
 function buildChannels(count = null) {
   const host = $('#channels');
   const tpl = $('#channelTpl');
-  host.innerHTML = '';
 
-  const n = Number.isInteger(count) && count > 0 ? count : 1;
-  for (let i = 0; i < n; i++) {
+  /*
+   * 只增不减:目标数量取"当前已有"与"新请求"的较大者。
+   * @note 传 null 表示"按现有电机数补足",但绝不缩回 ——
+   *       删掉一张用户正在用的卡片,等于凭空丢失该通道的绑定与参数。
+   */
+  const want = Number.isInteger(count) && count > 0 ? count : 0;
+  const have = host.querySelectorAll('.channel').length;
+  const n = Math.max(have, want, 1);
+
+  if (have === n) {
+    CHANNEL_COUNT = n;
+    return; /* 数量没变,不要碰 DOM —— 碰了就会丢用户已填的状态 */
+  }
+
+  for (let i = have; i < n; i++) {
     const node = tpl.content.firstElementChild.cloneNode(true);
     node.dataset.ch = String(i);
     node.querySelector('.ch-title').textContent = `通道 ${i}`;
     host.appendChild(node);
   }
-  // 记录当前渲染的卡片数,供其它遍历逻辑使用
   CHANNEL_COUNT = n;
 
   /*
-   * @attention 必须在这里重新绑定事件。
-   *   innerHTML = '' 会把旧卡片连同其上所有 onclick 一起销毁,
-   *   而 bindEvents() 原先只在页面加载时执行一次 ——
-   *   清单到达触发重建后,新卡片上的按钮**全都没有事件**,
-   *   表现为"点击按钮毫无反应";个别能响应的也是残留的旧闭包,
-   *   其 channelId 还是重建前的值(实测出现"绑定通道1却报通道0已被占用")。
+   * @attention 只给**新增**的卡片绑事件,不要重新绑定全部。
+   *   bindEvents() 内部是 `for (let i = 0; i < CHANNEL_COUNT; i++)`,
+   *   会把已有卡片的 onclick 也重写一遍。
+   *   用 onclick 赋值(而非 addEventListener)所以不会叠加,
+   *   但重写时闭包捕获的 i 若与实际通道不一致,就会出现"点通道1发的是通道0"。
    */
   bindEvents();
 }
@@ -144,14 +177,42 @@ function fillMotorOptions() {
     const el = ch(i);
     if (!el) continue; // 卡片数量可能刚被重建过,跳过已不存在的卡片
     const sel = el.querySelector('[data-role="motor"]');
+
+    /*
+     * 【重要·2026-10-12 修复】记住当前选中的是哪颗电机,重建选项后恢复。
+     *
+     * 原实现无条件 innerHTML = '' 重建,每次清单刷新都把下拉值打回 ""
+     * (空 = 未选择)。实测后果:
+     *   - 添加第二颗电机后通道 0 的选择消失、要重新选一遍,
+     *     可通道 0 控制的其实还是原来那颗电机(用户以为绑定丢了);
+     *   - 两个通道会一起被清空,且之后无法二次绑定。
+     *
+     * 用 (kind, canBus, motorId) 三元组而非下标记忆:
+     * 下标会随电机增删而漂移,不可靠。
+     */
+    let prevKey = null;
+    const prevIdx = Number(sel.value);
+    if (sel.value !== '' && Number.isInteger(prevIdx) && inventory[prevIdx]) {
+      const p = inventory[prevIdx];
+      prevKey = `${p.kind}:${p.canBus}:${p.motorId}`;
+    }
+
     sel.innerHTML = '<option value="">选择电机…</option>';
-    for (const m of inventory) {
+    let restoredIdx = '';
+    inventory.forEach((m, idx) => {
       const label = `${m.label} · CAN${m.canBus}·ID${m.motorId}`;
       const opt = document.createElement('option');
-      opt.value = String(inventory.indexOf(m));
+      opt.value = String(idx);
       opt.textContent = label;
       sel.appendChild(opt);
-    }
+      if (prevKey && `${m.kind}:${m.canBus}:${m.motorId}` === prevKey) {
+        restoredIdx = String(idx);
+      }
+    });
+
+    /* 电机仍在清单里才恢复选中;被删了才回到未选择 */
+    sel.value = restoredIdx;
+
     sel.onchange = () => {
       const m = inventory[Number(sel.value)];
       const spec = m ? MOTOR_SPEC[m.label] : null;
@@ -163,6 +224,89 @@ function fillMotorOptions() {
         el.querySelector('[data-role="slider"]').max = String(spec.range);
       }
     };
+  }
+}
+
+/* ---------------- PID 整定辅助 ---------------- */
+
+/**
+ * 取某通道当前绑定电机的 kind(未绑定返回 0)
+ */
+function currentChannelKind(i) {
+  const el = ch(i);
+  if (!el) return 0;
+  const idx = Number(el.querySelector('[data-role="motor"]').value);
+  const m = inventory[idx];
+  return m ? m.kind : 0;
+}
+
+/**
+ * 把某 kind + 某环的 PID 填入输入框
+ * @param i           通道号
+ * @param loopStr     环选择器的值('0'速度 '1'电流 '2'位置)
+ * @param kindOverride 可选,指定 kind(默认取该通道绑定的电机)
+ */
+function fillPidForm(i, loopStr, kindOverride) {
+  const el = ch(i);
+  if (!el) return;
+  const kind = kindOverride || currentChannelKind(i);
+  const r = (role) => el.querySelector(`[data-role="${role}"]`);
+
+  const preset = PID_DEFAULTS[kind];
+  const loopName = ['speed', 'current', 'angle'][Number(loopStr)] || 'speed';
+  const p = preset ? preset[loopName] : null;
+
+  r('pKp').value = p ? p.Kp : 0;
+  r('pKi').value = p ? p.Ki : 0;
+  r('pKd').value = p ? p.Kd : 0;
+  r('pMaxOut').value = p ? p.MaxOut : 0;
+  r('pIntLim').value = p ? p.IntegralLimit : 0;
+
+  // 记录当前环,便于收到 PID 报表时知道该往哪个输入框填
+  pidStateByChannel.set(i, { loop: Number(loopStr), kind });
+}
+
+/**
+ * 根据"该通道是否已绑定电机"启用/禁用 PID 面板
+ *
+ * @note 面板**始终可见**,只切换 disabled。
+ *   之前用 hidden 完全隐藏,实测用户找不到这个功能 ——
+ *   而"不用重烧固件就能改 PID"正是本测试台的核心卖点之一,入口藏起来等于没做。
+ *   现在未绑定时灰显并提示"先绑定电机后可用",绑定后自动可用。
+ *
+ * @attention 必须在 fillMotorOptions() 之后调用,
+ *   否则 currentChannelKind() 拿不到电机下拉框的实际值,会误判为"未绑定"。
+ */
+function initPidPanel(i) {
+  const el = ch(i);
+  if (!el) return;
+
+  const kind = currentChannelKind(i);
+  const panel = el.querySelector('[data-role="pidPanel"]');
+  const msg = el.querySelector('[data-role="pidMsg"]');
+
+  /* 需要联动开关的控件:输入框、环选择器、两个下发/读回按钮。
+     收起按钮保持可用 —— 未绑定时也能折叠面板。 */
+  const ctrls = [
+    'pidLoop', 'pKp', 'pKi', 'pKd', 'pMaxOut', 'pIntLim',
+    'pidApply', 'pidQuery', 'pidReset',
+  ].map((role) => el.querySelector(`[data-role="${role}"]`));
+
+  for (const c of ctrls) {
+    if (c) c.disabled = !kind;
+  }
+
+  if (kind) {
+    /* 绑定后:填入该型号默认值,并清掉"先绑定"提示。
+       improve 不从页面暴露(属于协议细节),沿用默认表里的值。 */
+    fillPidForm(i, el.querySelector('[data-role="pidLoop"]').value, kind);
+    if (msg && !msg.textContent.trim()) msg.textContent = '';
+  } else {
+    if (msg) {
+      msg.className = 'hint';
+      msg.textContent = '先绑定电机后可用';
+    }
+    pidStateByChannel.delete(i);
   }
 }
 
@@ -232,12 +376,39 @@ function bindEvents() {
         motorId: m.motorId,
         outerLoop: Number(r('loop').value),
       });
+      // 绑定的同时把该型号的默认 PID 填进面板,用户点"应用"即可生效
+      initPidPanel(i);
     };
 
+    /*
+     * @attention 换选电机后必须刷新 PID 面板。
+     *   currentChannelKind() 读的是下拉框当前值,而 PID 默认值按型号不同
+     *   (M3508 Kp=20 / M2006 Kp=10 / 6020 Kp=50)。不跟着换,
+     *   会出现"下拉框选了 M2006,面板里却还摆着 M3508 的参数"。
+     */
+    r('motor').onchange = () => initPidPanel(i);
+
+    /*
+     * 【重要·2026-10-12 修复】"解绑"必须下发真正的解绑帧,
+     * 原来只发 `enable: false` —— 那是"停机",不是"解绑"。
+     *
+     * 后果(实测):电机停了,但固件侧 mb_channels[ch].is_used 仍为 1、
+     * motor_ptr 仍指着原来那颗电机。用户接着把该通道改绑成另一颗,
+     * MotorBenchBind 撞上 is_used 判定直接返回 MB_ERR_DUPLICATE,
+     * 绑定被**静默拒绝**;而界面已把本地状态清掉、显示"未绑定"。
+     * 表现:换完电机后所有通道都不再响应,且没有任何错误提示。
+     *
+     * 现在:
+     *   1. 先下发 enable=0 保证立刻停机(安全优先,不依赖下一帧)
+     *   2. 再下发 unbind 帧释放固件侧的通道占用
+     *   3. 收到 unbindAck 后才刷新界面 —— 不再"先斩后奏"
+     */
     r('unbind').onclick = () => {
+      if (!confirm('解绑后该通道将不再控制任何电机,需重新绑定。确认继续?')) return;
+      /* 先停机:安全动作不依赖解绑帧是否被接受 */
       send({ type: 'enable', channelId: i, enable: false });
-      telemetryByChannel.delete(i);
-      renderChannel(i);
+      send({ type: 'unbind', channelId: i });
+      /* 界面状态等 unbindAck 到达后再清,见 ws.onmessage 的 'unbindAck' */
     };
 
     const slider = r('slider');
@@ -266,6 +437,55 @@ function bindEvents() {
       num.value = '0';
       send({ type: 'setRef', channelId: i, ref: 0 });
     };
+
+    /* ---------------- PID 整定 ---------------- */
+    const pidLoop = r('pidLoop');
+    const pidPanel = r('pidPanel');
+    const pidMsg = r('pidMsg');
+
+    // 切环时刷新输入框为上一环 / 该型号默认值
+    pidLoop.onchange = () => {
+      fillPidForm(i, pidLoop.value);
+      pidMsg.textContent = '';
+    };
+
+    r('pidCollapse').onclick = () => {
+      pidPanel.dataset.collapsed = pidPanel.dataset.collapsed === '1' ? '0' : '1';
+      r('pidCollapse').textContent = pidPanel.dataset.collapsed === '1' ? '展开' : '收起';
+    };
+
+    r('pidReset').onclick = () => {
+      const kind = currentChannelKind(i);
+      fillPidForm(i, pidLoop.value, kind);
+      pidMsg.className = 'hint';
+      pidMsg.textContent = kind ? '已填入该型号默认值,点"应用到电机"下发' : '请先绑定电机';
+    };
+
+    r('pidQuery').onclick = () => {
+      send({ type: 'pidQuery', channelId: i });
+      pidMsg.className = 'hint';
+      pidMsg.textContent = '正在读取板端参数…';
+    };
+
+    r('pidApply').onclick = () => {
+      const kind = currentChannelKind(i);
+      if (!kind) {
+        pidMsg.className = 'hint error';
+        pidMsg.textContent = '请先绑定电机';
+        return;
+      }
+      const Kp = Number(r('pKp').value) || 0;
+      const Ki = Number(r('pKi').value) || 0;
+      const Kd = Number(r('pKd').value) || 0;
+      const MaxOut = Number(r('pMaxOut').value) || 0;
+      const IntegralLimit = Number(r('pIntLim').value) || 0;
+      if (Kp < 0 || Ki < 0 || Kd < 0) {
+        pidMsg.className = 'hint error';
+        pidMsg.textContent = 'Kp/Ki/Kd 不能为负';
+        return;
+      }
+      send({ type: 'pidSet', channelId: i, loop: Number(pidLoop.value), pid: { Kp, Ki, Kd, MaxOut, IntegralLimit } });
+    };
   }
 }
 
@@ -293,7 +513,22 @@ let inventoryTimer = null;
 let inventoryTries = 0;
 
 function startInventoryFetch() {
-  if (inventoryTimer) return; // 已在拉取中
+  /*
+   * 【2026-10-12 修复】原实现 `if (inventoryTimer) return` 有竞态:
+   *   motorAck 到达时会 `inventory.length = 0` 再调 startInventoryFetch(),
+   *   而此时上一次 startInventoryFetch() 的定时器可能仍在跑
+   *   (它每 170ms 才检查一次 inventory.length,还没轮到就收到了 ack)。
+   *   于是新调用被 `if (inventoryTimer) return` 直接丢弃,
+   *   而旧定时器随后可能因为 tries 超限自行退出 ——
+   *   结果:清单永远不再刷新,用户表现为"两个通道被清空后无法二次绑定"。
+   *
+   * 改为:重入时**先清掉旧定时器再开新的**,保证任何时刻只有一个拉取循环,
+   * 且最后一次调用总是生效。
+   */
+  if (inventoryTimer) {
+    clearInterval(inventoryTimer);
+    inventoryTimer = null;
+  }
   inventoryTries = 0;
   inventoryTimer = setInterval(() => {
     if (inventory.length) {
@@ -360,19 +595,36 @@ ws.onmessage = (ev) => {
       }));
 
       /*
-       * 通道卡片数量跟随板端电机数量:
-       * 有几颗电机就显示几张卡片,不显示多余的空卡片。
-       * 数量不变时跳过重建,避免每次上报都清空 DOM 导致闪烁与事件丢失。
-       * @note 清单为空时不重建 —— 那样会把页面清成一片空白,
-       *   反而不如保留一张占位卡片(用户正要往板上加电机)。
-       * @attention 顺序很重要:必须先 buildChannels() 再 fillMotorOptions(),
-       *   否则 fillMotorOptions 遍历的还是旧的、更少的卡片,
-       *   新建的卡片里电机下拉框会是空的。
+       * 通道卡片数量:**只增不减**,且只在"电机数超过当前卡片数"时才增长。
+       *
+       * @attention 【2026-10-12 修复】原判断是
+       *   `CHANNEL_COUNT !== inventory.length` —— 任何数量变化都重建卡片。
+       *   它建立在错误假设上:"电机数 == 通道数"。
+       *   实际通道是独立的控制位(固件 MB_CHANNEL_MAX = 8),
+       *   两颗电机完全可以只用一个通道,或者一颗电机换通道。
+       *   于是"加一颗电机"这种纯后台操作会摧毁用户正在用的界面状态:
+       *   已选电机、已设 rpm 全部归零,多通道时还会一起清空。
+       *
+       * 现在:数量够就不动 DOM,只在不够时补卡(buildChannels 内部只增不减)。
+       * 加电机不再触碰任何已有卡片。
        */
-      if (inventory.length > 0 && CHANNEL_COUNT !== inventory.length) {
-        buildChannels(inventory.length);
-      }
+      buildChannels(inventory.length);
+
+      /*
+       * 刷新各通道的电机下拉框。
+       * @attention 必须在 buildChannels() 之后 —— 新建的卡片还没有选项。
+       *   fillMotorOptions 本身会记住并恢复已有选择(见其内部注释),
+       *   所以刷新清单不会夺走用户已选的电机。
+       */
       fillMotorOptions();
+
+      /*
+       * 拿到清单后初始化各通道的 PID 面板。
+       * @attention 必须在 fillMotorOptions() 之后 —— 该函数才把
+       *   下拉框的 value 设成实际电机索引,currentChannelKind() 靠它取 kind。
+       *   顺序反了会读不到 kind,PID 面板被隐藏。
+       */
+      for (let i = 0; i < CHANNEL_COUNT; i++) initPidPanel(i);
 
       /*
        * 拿到清单即视为握手完成。
@@ -419,11 +671,85 @@ ws.onmessage = (ev) => {
       break;
     }
 
+    case 'unbindAck': {
+      /*
+       * 固件确认解绑完成 —— 这时才清界面状态。
+       *
+       * @attention 之前是"点按钮就本地清空",不等应答。绑定被固件拒绝时
+       *   (MB_ERR_DUPLICATE 等)界面与板端就会不一致:
+       *   界面显示"未绑定",板子上却还占着通道、电机照转。
+       *   改成等应答再清,失败时把真实原因显示出来。
+       */
+      const d = msg.data;
+      if (d.result === MBResult.OK) {
+        telemetryByChannel.delete(d.channelId);
+        const el = ch(d.channelId);
+        if (el) {
+          /* 下拉回到"选择电机…",滑块归零 —— 此时清状态才是安全的 */
+          el.querySelector('[data-role="motor"]').value = '';
+          el.querySelector('[data-role="slider"]').value = '0';
+          el.querySelector('[data-role="num"]').value = '0';
+          renderChannel(d.channelId);
+          initPidPanel(d.channelId);
+        }
+        setLink(true, `通道 ${d.channelId} 已解绑`);
+      } else {
+        /* 失败:界面保持原样,并说明原因,避免"看起来解绑了其实没解" */
+        setLink(true, `通道 ${d.channelId} 解绑失败: ${MBResultText[d.result] ?? d.result}`);
+      }
+      break;
+    }
+
     case 'telemetry': {
       for (const it of msg.data.items) {
         telemetryByChannel.set(it.channelId, it);
       }
       for (let i = 0; i < CHANNEL_COUNT; i++) renderChannel(i);
+      break;
+    }
+
+    case 'pidReport': {
+      /*
+       * 板端回传当前生效的三套 PID。
+       * 只填"当前选中的那个环"的输入框 —— 一次性把三套都写进去,
+       * 用户切环时会看到数值被改过,容易误以为是自己改过头。
+       */
+      const d = msg.data;
+      const st = pidStateByChannel.get(d.channelId);
+      if (!st) break;
+      const el = ch(d.channelId);
+      if (!el) break;
+      const r = (role) => el.querySelector(`[data-role="${role}"]`);
+      const cur = ['speed', 'current', 'angle'][st.loop];
+      const p = d[cur];
+      const msg2 = r('pidMsg');
+      if (p) {
+        r('pKp').value = p.Kp;
+        r('pKi').value = p.Ki;
+        r('pKd').value = p.Kd;
+        r('pMaxOut').value = p.MaxOut;
+        r('pIntLim').value = p.IntegralLimit;
+        msg2.className = 'hint';
+        msg2.textContent = '已读回板端当前生效值';
+      } else {
+        msg2.className = 'hint error';
+        msg2.textContent = '板端未返回该环参数';
+      }
+      break;
+    }
+
+    case 'pidAck': {
+      const d = msg.data;
+      const el = ch(d.channelId);
+      if (!el) break;
+      const m = el.querySelector('[data-role="pidMsg"]');
+      if (d.result === MBResult.OK) {
+        m.className = 'hint ok';
+        m.textContent = '已应用到电机';
+      } else {
+        m.className = 'hint error';
+        m.textContent = MBResultText[d.result] ?? `下发失败(错误码 ${d.result})`;
+      }
       break;
     }
 
