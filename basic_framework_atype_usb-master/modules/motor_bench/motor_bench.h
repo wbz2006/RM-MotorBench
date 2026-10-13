@@ -546,9 +546,17 @@ void MotorBenchSetMotorFactory(MB_MotorFactory_t factory, MB_MotorDestroy_t dest
  * @param kind       电机种类
  * @param can_bus    1=CAN1 2=CAN2
  * @param motor_id   电调 ID(DJI 系 1~8,达妙 1~4)
- * @param outer_loop 外层闭环:OPEN_LOOP / SPEED_LOOP / ANGLE_LOOP
- * @param instance   已由 DJIMotorInit()/DMMotorInit() 等创建好的实例指针
- * @return MB_OK 成功
+ * @param outer_loop 外层闭环。**位掩码,可叠加**:
+ *                    OPEN_LOOP(0) / CURRENT_LOOP(1) / SPEED_LOOP(2) / ANGLE_LOOP(4)
+ *                    组合值:SPEED_AND_CURRENT_LOOP(3,速度外环+电流内环)
+ *                           ANGLE_AND_SPEED_LOOP(6,位置外环+速度内环)
+ *                           ALL_THREE_LOOP(7,三环全开)
+ *
+ * @attention 位掩码里"有速度位"不代表外层就是速度环 ——
+ *   外层只能有**一个**环,组合值里的速度位表示"速度环被启用"。
+ *   例:SPEED_AND_CURRENT_LOOP(0b0011) 的外层是速度环,电流位表示电流内环也开着。
+ *       同理 ANGLE_AND_SPEED_LOOP(0b0110) 的外层是位置环。
+ *   判外层要精确匹配,不要用 `&` 判断(详见 motor_bench.c 的 need_rpm_conv)。
  *
  * @note  登记后该电机立即被置为停止状态,须由上位机 enable 才会输出。
  *        同一总线上不允许重复登记相同 ID。

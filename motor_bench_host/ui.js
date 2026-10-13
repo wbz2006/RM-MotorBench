@@ -11,7 +11,16 @@ import {
   MBResult,
   MBResultText,
   PID_DEFAULTS,
+  availableIds,
+  describeConflict,
+  findConflict,
+  usesDjiIdSegment,
+  MOTOR_ID_MIN,
+  MOTOR_ID_MAX,
+  LoopType,
 } from './protocol.js';
+import { ensureChart, getChartIfExists, dropChart } from './chart.js';
+import { LoopFishbone } from './fishbone.js';
 
 /**
  * 当前渲染的通道卡片数
@@ -48,6 +57,51 @@ function showAddMsg(text, isError) {
   const el = $('#addMsg');
   el.textContent = text;
   el.classList.toggle('error', !!isError);
+}
+
+/**
+ * 添加电机面板的实时预检 —— 在"添加"面板上给出冲突说明与可用 ID
+ *
+ * 放在模块作用域(bindEvents 之外)是为了让 ws.onmessage 里的清单刷新
+ * 也能调它:清单一变,"可用 ID"就要重算,否则提示会停留在一个过期列表上,
+ * 用户照着填反而必撞。
+ *
+ * @note 三个输入项与清单变化都会调它,所以函数体必须**幂等且无副作用** ——
+ *   它只读当前 DOM 值 + inventory,然后写一行提示。
+ */
+function refreshAddHint() {
+  const kindEl = $('#addKind');
+  const busEl = $('#addBus');
+  const idEl = $('#addId');
+  if (!kindEl || !busEl || !idEl) return;
+
+  const kind = Number(kindEl.value);
+  const canBus = Number(busEl.value);
+  const motorId = Number(idEl.value);
+
+  if (!Number.isInteger(motorId) || motorId < MOTOR_ID_MIN || motorId > MOTOR_ID_MAX) {
+    showAddMsg(`ID 需填 ${MOTOR_ID_MIN}~${MOTOR_ID_MAX} 的整数`, true);
+    return;
+  }
+
+  /* 冲突优先:直接给出"和谁撞、该改谁、能用哪些" */
+  const conflictMsg = describeConflict(canBus, inventory, kind, motorId);
+  if (conflictMsg) {
+    showAddMsg(conflictMsg, true);
+    return;
+  }
+
+  /*
+   * 无冲突时,若该总线上已有占用 ID 的电机,顺带列出可用 ID ——
+   * 用户接下来多半要接着加第二、第三颗,提前给候选省得反复试错。
+   * 该总线还是空的就不显示,避免多余的噪音。
+   */
+  if (usesDjiIdSegment(kind) && inventory.some((m) => m && m.canBus === canBus)) {
+    const free = availableIds(canBus, inventory, kind);
+    showAddMsg(`CAN${canBus} 当前可用 ID:${free.length ? free.join('、') : '(无)'}`, false);
+  } else {
+    showAddMsg('', false);
+  }
 }
 
 /** 添加/移除的待应答计时器:超时则提示"没收到板子应答",避免永久卡住 */
@@ -154,15 +208,159 @@ function renderChannel(i) {
   }
 
   const r = (role) => el.querySelector(`[data-role="${role}"]`);
-  r('ref').textContent = t ? fmt(t.ref, 0) : '--';
-  r('speed').textContent = t ? fmt(t.speed, 1) : '--';
-  r('torque').textContent = t ? fmt(t.torque, 2) : '--';
-  r('angle').textContent = t ? fmt(t.angle, 1) : '--';
-  r('temp').textContent = t && t.temperature !== -128 ? `${t.temperature} °C` : '--';
+
+  /*
+   * 数字读数行已于 2026-10-13 移除 —— 曲线已呈现这些量的走势,
+   * 数字在波动大的场合反而干扰判读(用户明确要求)。
+   * 温度是慢变量,不具备"看趋势"的必要,仍以数字显示。
+   *
+   * @attention 其余读数(设定/转速/电流/角度)的元素**已从模板删除**,
+   *   这里绝不能再 querySelector 后直接赋值 —— 会拿到 null 而抛异常,
+   *   把整个渲染打断(表现为整张卡片不再更新)。温度是唯一保留项。
+   */
+  const tempEl = r('temp');
+  if (tempEl) {
+    tempEl.textContent = t && t.temperature !== -128 ? `${t.temperature} °C` : '--';
+  }
 
   const enableBtn = r('enable');
   enableBtn.classList.toggle('on', !!(t && t.enabled));
   enableBtn.textContent = t && t.enabled ? '停机' : '使能';
+
+  /*
+   * 把本次遥测喂给曲线(2026-10-12 新增)。
+   *
+   * 为什么在 renderChannel 里 push 而不是单独开定时器:
+   *   采样频率天然与遥测到达一致(固件约 10Hz),不需要额外轮询,
+   *   也不会画出板端根本没上报的假点。
+   *
+   * 曲线放在 renderChannel 末尾而非仅在 telemetry 事件里,
+   *   是因为 renderChannel 还会在解绑、断连时以 t=null 被调用,
+   *   此时不喂点、只重绘,曲线会自然停住而不是被 0 值拉一条直线到底。
+   */
+  if (t) {
+    const canvas = el.querySelector('[data-role="chart"]');
+    if (canvas) {
+      const c = ensureChart(i, canvas);
+      /*
+       * 把界面上的滤波设置同步到实例。
+       *
+       * @attention 必须在这里同步,不能只在 onchange 里设:
+       *   曲线实例是**懒创建**的 —— 用户在通道还没收到遥测时改了滤波档位,
+       *   那一刻 getChartIfExists 返回 null,设置被静默丢弃;
+       *   等实例真正建出来时就会用默认值,与界面显示不一致。
+       *   每次 push 前对齐一次,代价可忽略(几个比较),却消除了这类漂移。
+       */
+      const fOn = r('filterOn');
+      const fAlpha = r('filterAlpha');
+      if (fOn) c.setFilter(fOn.checked);
+      if (fAlpha) c.setFilterAlpha(fAlpha.value);
+
+      c.push(t.speed, t.torque, t.ref);
+    }
+  }
+}
+
+/* ---------------- 闭环鱼骨图 ---------------- */
+
+/**
+ * 鱼骨图实例表:通道号 → LoopFishbone
+ *
+ * @note 懒创建:只有真正渲染过的通道才建实例。
+ *   鱼骨图只在 bind 时需要它的掩码,建了不用会白占 DOM 与事件。
+ */
+const fishbones = new Map();
+
+/**
+ * 取出(必要时创建)某通道的鱼骨图
+ *
+ * @param {number} i 通道号
+ * @returns {LoopFishbone|null}
+ */
+function ensureFishbone(i) {
+  if (fishbones.has(i)) return fishbones.get(i);
+  const host = ch(i)?.querySelector('[data-role="loopPicker"]');
+  if (!host) return null;
+
+  const fb = new LoopFishbone(host);
+
+  /*
+   * 悬停/聚焦/点击某个环 → 把下方 PID 卡片切到该环。
+   *
+   * @note 只切环,不管开合 —— 卡片是内嵌常驻的,不需要显示/隐藏逻辑。
+   *   曾经做成浮空(延时开合),在多层嵌套的卡片里定位失控,已回退。
+   */
+  fb.onFocusLoop = (bit) => focusPidLoop(i, bit);
+
+  fishbones.set(i, fb);
+  return fb;
+}
+
+/** 移除某通道的鱼骨图(卡片被销毁时调用) */
+function dropFishbone(i) {
+  fishbones.delete(i);
+}
+
+/**
+ * 读取某通道当前的闭环掩码
+ *
+ * @attention 鱼骨图的拓扑本身保证了两条约束,这里**不需要**再做补齐校验:
+ *   1. 位置环在速度环上游 → 点亮位置必然带着速度(关速度会连带关位置);
+ *   2. 最上游的亮节点就是外层环 → 由拓扑直接得出,不必单选。
+ *   这正是用鱼骨图替代"勾选+单选"的收益:约束从"需要代码兜底的规则"
+ *   变成了"界面上无路可走的结构"。
+ *
+ * @param {number} i 通道号
+ * @returns {number} 位掩码,与固件 Closeloop_Type_e 一致
+ */
+function readLoopMask(i) {
+  const fb = fishbones.get(i);
+  if (fb) return fb.getMask();
+  /* 鱼骨图还没建(通道未渲染过)时,退回默认值 —— 与固件建电机配置一致 */
+  return LoopType.SPEED_AND_CURRENT_LOOP;
+}
+
+/*
+ * 闭环位 → PID 环选择器下标的映射。
+ *
+ * @attention 位掩码与 pidLoop 的 <option value> 是两套编号,必须显式对应:
+ *   <option value="0">速度环 / "1">电流环 / "2">位置环
+ *   而位掩码里 电流=0b0001、速度=0b0010、位置=0b0100。
+ *   不映射的话,"点亮位置环"会打开速度环的参数 —— 调错环且毫无提示。
+ */
+const BIT_TO_PID_LOOP = {
+  0b0010: '0', // 速度环
+  0b0001: '1', // 电流环
+  0b0100: '2', // 位置环
+};
+
+/**
+ * 把 PID 卡片切到指定环(不负责显示/隐藏 —— 卡片是内嵌常驻的)
+ *
+ * @param {number} i 通道号
+ * @param {number} bit 关注的闭环位
+ *
+ * @note 之前这里还要管浮空卡片的开合与延时关闭,现在卡片常驻,
+ *   只剩"切环 + 填默认值"这一件事,逻辑干净很多。
+ */
+function focusPidLoop(i, bit) {
+  const el = ch(i);
+  if (!el) return;
+
+  const loopVal = BIT_TO_PID_LOOP[bit];
+  const sel = el.querySelector('[data-role="pidLoop"]');
+  if (loopVal === undefined || !sel) return;
+
+  sel.value = loopVal;
+  /* 切环后把该环的默认值填进输入框 */
+  fillPidForm(i, loopVal);
+
+  /* 标题写明当前是哪个环,避免"调了半天不知道在调哪个" */
+  const title = el.querySelector('[data-role="pidTitle"]');
+  if (title) {
+    const name = { 0b0100: '位置环', 0b0010: '速度环', 0b0001: '电流环' }[bit];
+    title.textContent = name ? `${name} PID` : 'PID 整定';
+  }
 }
 
 /* ---------------- 电机下拉(固件清单) ---------------- */
@@ -329,10 +527,29 @@ function bindEvents() {
     const canBus = Number($('#addBus').value);
     const motorId = Number($('#addId').value);
 
-    if (!Number.isInteger(motorId) || motorId < 1 || motorId > 8) {
-      showAddMsg('ID 需填 1~8 的整数(对应电调拨码开关)', true);
+    if (!Number.isInteger(motorId) || motorId < MOTOR_ID_MIN || motorId > MOTOR_ID_MAX) {
+      showAddMsg(`ID 需填 ${MOTOR_ID_MIN}~${MOTOR_ID_MAX} 的整数(对应电调拨码开关)`, true);
       return;
     }
+
+    /*
+     * 本地预检(2026-10-13 新增)。
+     *
+     * @attention 为什么要在界面再挡一道:
+     *   固件已经有 MotorBenchCheckRxIdFree(),会拒绝冲突配置 —— 但那要
+     *   一个来回到板子才知道结果,而且提示只出现在 RTT 里(网页上只有一句
+     *   错误码文案)。用户真正需要的是**当场知道该把拨码改成几**。
+     *   所以这里用同一套公式先算一遍,直接给出可用 ID 列表。
+     *
+     *   固件那道检查仍然保留 —— 界面可能因为清单还没刷新而与板端不一致,
+     *   固件才是最终权威。
+     */
+    const conflictMsg = describeConflict(canBus, inventory, kind, motorId);
+    if (conflictMsg) {
+      showAddMsg(conflictMsg, true);
+      return; /* 不发给板子 —— 明知会失败,不必浪费一次往返 */
+    }
+
     showAddMsg('正在添加…', false);
     addPendingLabel = '添加电机';
     send({ type: 'addMotor', kind, canBus, motorId });
@@ -357,6 +574,26 @@ function bindEvents() {
     if (confirm('确定要立即停止全部电机吗?')) send({ type: 'stopAll' });
   };
 
+  /*
+   * 添加电机三个输入项的实时预检(2026-10-13 新增)。
+   *
+   * 不等用户点「添加」再报错 —— 选完型号/总线/ID 的当下就把结果摆出来:
+   *   - 冲突 → 红字说明和谁撞、该改谁、以及当前可用 ID
+   *   - 无冲突 → 列出该总线当前可用 ID,方便接着加下一颗
+   *
+   * @attention 用 `oninput` / `onchange` 赋值,**不能用 addEventListener**。
+   *   bindEvents() 会在卡片增补时被反复调用,addEventListener 会把同一个
+   *   处理函数叠加多次 —— 拖一次数字框就触发 N 次预检,将来若有副作用
+   *   就是难查的重复执行。onXxx 赋值天然幂等(覆盖旧的)。
+   *
+   * @note 同时监听 input 与 change:数字框键盘输入触发 input,
+   *   上下箭头/失焦提交在某些浏览器只触发 change。
+   */
+  for (const id of ['#addKind', '#addBus', '#addId']) {
+    $(id).oninput = refreshAddHint;
+    $(id).onchange = refreshAddHint;
+  }
+
   // 页面关闭前尽量通知服务端全停(beforeunload + sendBeacon 兜底)
   window.addEventListener('beforeunload', () => send({ type: 'stopAll' }));
 
@@ -368,13 +605,25 @@ function bindEvents() {
       const idx = Number(r('motor').value);
       const m = inventory[idx];
       if (!m) return alert('请先选择电机');
+
+      /*
+       /*
+        * 从鱼骨图读取闭环掩码。
+        *
+        * @attention 鱼骨图的拓扑本身就保证了两条约束,无需额外补齐:
+        *   1. 位置环在速度环上游 → 点亮位置必然带着速度(关速度会连带关位置);
+        *   2. 最上游的亮节点就是外层环 → 由位置直接得出,不必单选。
+        *   这正是用鱼骨图替代"勾选+单选"的收益:
+        *   约束从"需要代码兜底的规则"变成了"界面上无路可走的结构"。
+        */
+      const mask = readLoopMask(i);
       send({
         type: 'bind',
         channelId: i,
         kind: m.kind,
         canBus: m.canBus,
         motorId: m.motorId,
-        outerLoop: Number(r('loop').value),
+        outerLoop: mask,
       });
       // 绑定的同时把该型号的默认 PID 填进面板,用户点"应用"即可生效
       initPidPanel(i);
@@ -387,6 +636,9 @@ function bindEvents() {
      *   会出现"下拉框选了 M2006,面板里却还摆着 M3508 的参数"。
      */
     r('motor').onchange = () => initPidPanel(i);
+
+    /* 建鱼骨图(懒创建,只在通道真正渲染时才建实例) */
+    ensureFishbone(i);
 
     /*
      * 【重要·2026-10-12 修复】"解绑"必须下发真正的解绑帧,
@@ -438,6 +690,43 @@ function bindEvents() {
       send({ type: 'setRef', channelId: i, ref: 0 });
     };
 
+    /* ---------------- 实时曲线 ---------------- */
+    /*
+     * 这里**不能**提前 new 曲线实例。
+     * 卡片是懒渲染的:某通道还没收到过遥测时 canvas 宽度为 0,
+     * 此时 ResizeObserver 量到 0 尺寸、后续不会自动纠正(只在真实 resize 时触发)。
+     * 所以实例交给 renderChannel 在首次有数据时创建,尺寸一定是对的。
+     */
+    r('chartWindow').onchange = () => {
+      const c = getChartIfExists(i);
+      if (c) c.setWindow(r('chartWindow').value);
+    };
+    r('chartClear').onclick = () => {
+      const c = getChartIfExists(i);
+      if (c) c.clear();
+    };
+
+    /*
+     * 滤波开关与强度(2026-10-13 用户要求:电流和转速波动太大)。
+     *
+     * @note 开关默认开启。台架上看的是趋势而非每个采样点的毛刺。
+     *   但**保留关闭选项**是有意为之:低通只能压传感器噪声,
+     *   压不住 PID 引起的低频震荡 —— 所以"开着还抖"就是控制问题,
+     *   "关掉才抖"才是噪声问题。这个开关因此也是诊断工具。
+     *
+     * @attention 与曲线实例一样用 getChartIfExists:
+     *   通道还没收到过遥测时,这两个控件操作应是静默无操作,
+     *   不能顺手创建一个尺寸为 0 的实例。
+     */
+    r('filterOn').onchange = () => {
+      const c = getChartIfExists(i);
+      if (c) c.setFilter(r('filterOn').checked);
+    };
+    r('filterAlpha').onchange = () => {
+      const c = getChartIfExists(i);
+      if (c) c.setFilterAlpha(r('filterAlpha').value);
+    };
+
     /* ---------------- PID 整定 ---------------- */
     const pidLoop = r('pidLoop');
     const pidPanel = r('pidPanel');
@@ -449,10 +738,10 @@ function bindEvents() {
       pidMsg.textContent = '';
     };
 
-    r('pidCollapse').onclick = () => {
-      pidPanel.dataset.collapsed = pidPanel.dataset.collapsed === '1' ? '0' : '1';
-      r('pidCollapse').textContent = pidPanel.dataset.collapsed === '1' ? '展开' : '收起';
-    };
+    /*
+     * 卡片已改为内嵌常驻,不再有"关闭"按钮 —— 显示即展开,无需折叠态。
+     * 切换要调的环:点鱼骨图节点,或用上面的 pidLoop 下拉。
+     */
 
     r('pidReset').onclick = () => {
       const kind = currentChannelKind(i);
@@ -636,6 +925,13 @@ ws.onmessage = (ev) => {
         clearInterval(inventoryTimer);
         inventoryTimer = null;
       }
+
+      /*
+       * 清单变了 → 重新算一遍"可用 ID"提示。
+       * 否则加完一颗电机后,添加面板上还挂着上一次算出来的可用 ID 列表,
+       * 用户照它填就会撞车 —— 提示必须跟着清单走。
+       */
+      if (typeof refreshAddHint === 'function') refreshAddHint();
       break;
     }
 

@@ -76,6 +76,17 @@
       <article class="channel" data-empty="1">
         <header>
           <span class="ch-title">通道</span>
+          <!--
+            解绑放在标题行、状态徽章之前(2026-10-13 用户要求)。
+
+            原先在 bind-row 里和「绑定」并排,混在"选电机 + 选闭环"那组里,
+            语义上属于"通道级操作"而不是"配置操作" —— 提到标题行更合理,
+            且始终可见(不会因 bind-row 换行被挤到看不见)。
+
+            放在徽章**之前**是刻意的:徽章(未绑定/已绑定/运行中)是状态显示,
+            操作按钮应在状态之前,符合"操作 → 状态"的阅读顺序。
+          -->
+          <button data-role="unbind" class="ghost unbind-btn">解绑</button>
           <span class="badge" data-role="status">未绑定</span>
         </header>
 
@@ -83,22 +94,128 @@
           <select data-role="motor" class="motor-select">
             <option value="">选择电机…</option>
           </select>
-          <select data-role="loop" class="loop-select">
-            <option value="2">速度环</option>
-            <option value="0">开环</option>
-            <option value="1">电流环</option>
-            <option value="4">角度环</option>
-          </select>
+          <!--
+            闭环鱼骨图:点亮=启用,最上游亮节点=外层环。
+
+            【为什么是鱼骨图】多环的本质是 pid_ref **顺次穿过**各环的串级结构,
+              勾选框是平的,表达不了"方向"和"必须经过"这两件事。
+              鱼骨图的主脊就是数据流:
+                设定 ──▶ [位置环] ──▶ [速度环] ──▶ [电流环] ──▶ 电调
+              于是两条约束由**拓扑**保证,不靠文字说明:
+                1. 位置环在速度环上游 → 启用位置环必然经过速度环;
+                2. 最上游的亮节点就是外层环 → 不必再单选。
+
+            @attention 电流环常亮不可关:它是最后一级,
+              关掉就只剩"位置/速度环输出直接当电流值下发"的危险组合。
+          -->
+          <div class="loop-fishbone" data-role="loopPicker"></div>
           <button data-role="bind">绑定</button>
-          <button data-role="unbind" class="ghost">解绑</button>
         </div>
 
-        <div class="readout">
-          <div class="metric"><span>设定</span><b data-role="ref">--</b></div>
-          <div class="metric"><span>实测转速</span><b data-role="speed">--</b></div>
-          <div class="metric"><span>电流/转矩</span><b data-role="torque">--</b></div>
-          <div class="metric"><span>角度</span><b data-role="angle">--</b></div>
-          <div class="metric"><span>温度</span><b data-role="temp">--</b></div>
+        <!--
+          数字读数行(设定/实测转速/电流/角度/温度)已于 2026-10-13 移除。
+          理由:曲线已经把这些量的走势完整呈现,而数字每 100ms 跳一次、
+          在波动大的场合反而干扰判读 —— 用户明确要求"这一行就没必要显示了"。
+          温度仍保留显示,但它挪到了曲线下方的曲线框里(见下)。
+
+          实时曲线:转速与电流。
+
+          为什么改成曲线(2026-10-12 用户要求):
+            数字读数只能看到"此刻是多少",而电机测试真正要判断的是
+            **波动与振荡** —— 转速抖 20 rpm、电流在正负之间来回抽,
+            数字每 100ms 刷新一次,肉眼根本看不出来。
+            曲线把一段时间内的走势摊开,震荡一眼可见。
+
+          实现:原生 <canvas>,不引任何图表库(本工程刻意零依赖)。
+          采样:每次遥测到达 push 一个点,环形保留 CHART_POINTS 个。
+          滤波:转速与电流在入图前经一阶低通(见 chart.js 的 LowPass),
+                原始值波动过大时曲线糊成一团,看不出趋势。
+        -->
+        <!--
+          PID 整定卡片 —— **内嵌固定显示**,紧跟在闭环鱼骨图下方(2026-10-13)。
+
+          【位置】放在 bind-row(电机选择 + 鱼骨图)之后、曲线之前。
+            这样"选环 → 立刻看到该环参数"的动线最短,
+            不必翻过整张曲线图去找调参入口。
+
+          【为什么不用浮空】曾改为 absolute 跟随节点,实测飘到通道卡片底部 ——
+            浮空需要可靠的定位基准与堆叠上下文,而通道卡片多层嵌套
+            (channel > bind-row > loop-fishbone),父级 overflow / transform
+            都会让 absolute 失控。内嵌常驻无此问题。
+
+          交互契约:点击鱼骨图上的环节点 → 切换该环启用状态,
+            同时把这张卡片的 pidLoop 切到对应环并填入默认值。
+            卡片常驻可见(未绑定电机时为 disabled)。
+        -->
+        <div class="pid-panel" data-role="pidPanel">
+          <div class="pid-head">
+            <span class="panel-title" data-role="pidTitle">PID 整定</span>
+            <select data-role="pidLoop" disabled>
+              <option value="0">速度环</option>
+              <option value="1">电流环</option>
+              <option value="2">位置环</option>
+            </select>
+            <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回</button>
+          </div>
+          <div class="pid-grid">
+            <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
+            <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
+          </div>
+          <div class="pid-actions">
+            <button data-role="pidApply" disabled>应用到电机</button>
+            <button data-role="pidReset" class="ghost" disabled>恢复默认值</button>
+            <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
+          </div>
+        </div>
+        <div class="chart-box">
+          <div class="chart-head">
+            <span class="panel-title">实时曲线</span>
+            <span class="chart-legend">
+              <i class="lg lg-speed"></i>实测转速
+              <i class="lg lg-torque"></i>电流
+              <i class="lg lg-ref"></i>设定值
+            </span>
+            <!--
+              温度仍以数字显示:它是慢变量,不会像转速/电流那样抖,
+              放曲线里反而占地方。留在这里也免得为它单开一行。
+            -->
+            <span class="metric-inline">温度 <b data-role="temp">--</b></span>
+            <select data-role="chartWindow" title="曲线显示的时间窗口">
+              <option value="50">50 点</option>
+              <option value="120" selected>120 点</option>
+              <option value="300">300 点</option>
+            </select>
+            <button data-role="chartClear" class="ghost" title="清空历史">清空</button>
+          </div>
+          <canvas data-role="chart" width="600" height="170"></canvas>
+          <div class="chart-foot">
+            <!--
+              滤波开关(2026-10-13 用户要求:电流和转速波动太大)。
+
+              @attention 这里曾把档位值搞反:选项写的是 0.15/0.3/0.5,
+                而代码里 alpha 是**旧值权重**(alpha 越接近 1 越平滑)。
+                于是标着"强"的 0.5 其实是**最弱**那一档 ——
+                用户选了"强"却几乎没效果,正是这个原因。
+
+              现在档位与语义对齐,并补足更强的档位:
+                alpha 越小 → 新采样占比越小 → 越平滑(但阶跃响应越滞后)
+            -->
+            <label class="chart-filter">
+              <input type="checkbox" data-role="filterOn" checked />
+              低通滤波
+            </label>
+            <select data-role="filterAlpha" title="越靠右越平滑,但阶跃响应越滞后">
+              <option value="0.1">关(直通)</option>
+              <option value="0.3">弱</option>
+              <option value="0.5">中</option>
+              <option value="0.7">强</option>
+              <option value="0.85" selected>很强</option>
+              <option value="0.95">超强</option>
+            </select>
+          </div>
         </div>
 
         <div class="control">
@@ -120,30 +237,6 @@
             之前用 hidden 完全藏起来,导致用户根本不知道这个功能存在 ——
             而测试台的卖点之一正是"不用重烧就能改参数",入口却找不到。
         -->
-        <div class="pid-panel" data-role="pidPanel">
-          <div class="pid-head">
-            <span class="panel-title">PID 整定</span>
-            <select data-role="pidLoop" disabled>
-              <option value="0">速度环</option>
-              <option value="1">电流环</option>
-              <option value="2">位置环</option>
-            </select>
-            <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回板端值</button>
-            <button data-role="pidCollapse" class="ghost" title="收起/展开">收起</button>
-          </div>
-          <div class="pid-grid">
-            <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
-            <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
-            <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
-            <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
-            <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
-          </div>
-          <div class="pid-actions">
-            <button data-role="pidApply" disabled>应用到电机</button>
-            <button data-role="pidReset" class="ghost" disabled>恢复该型号默认值</button>
-            <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
-          </div>
-        </div>
       </article>
     </template>
 

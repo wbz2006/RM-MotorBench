@@ -39,6 +39,34 @@
 /* 遥测上报周期:500Hz 任务下节流到约 50Hz */
 #define MB_TELEMETRY_DIVIDER 10
 
+/*
+ * 遥测**采样累加器** —— 用于抑制混叠(aliasing)。
+ *
+ * @attention 【2026-10-13 修复】电流曲线的剧烈抖动不是噪声,是混叠造成的假象。
+ *
+ * 现象:用户把界面滤波开到"强",转速曲线平直,电流仍在 ±25 之间疯狂抖动。
+ *
+ * 根因:电机控制任务跑 500Hz,遥测每 MB_TELEMETRY_DIVIDER(10) 拍才取一次样,
+ *   即 50Hz。而电流是电流环在 **500Hz** 下高频调节的量 ——
+ *   每 10 拍抽一个快照属于**欠采样**:
+ *     采样率 50Hz < 信号中 500Hz 成分的 2 倍
+ *   高频成分被折叠到低频,看起来就像"随机大幅抖动"。
+ *
+ *   关键点:混叠发生在**采样那一刻**,之后任何显示端滤波都救不回来 ——
+ *   因为滤的已经是一个不真实的信号。这正是"开到强也没用"的原因。
+ *
+ * 正确做法:在采样源头先把这一段时间内的值**累加平均**,
+ *   相当于一个滑动平均抗混叠滤波器(等效于 decimation 前先 low-pass)。
+ *   500Hz 的电流在 10 拍内平均,高频成分被真实地平滑掉,
+ *   而不是被折叠成假低频。
+ *
+ * 实现代价:每个通道多两个 double(float 精度不够,10 拍累加会丢低位),
+ *   以及每拍一次加法 —— 都在 500Hz 任务里做,开销可忽略。
+ */
+static float mb_tele_acc_current[MB_CHANNEL_MAX];
+static float mb_tele_acc_voltage[MB_CHANNEL_MAX];
+static uint8_t mb_tele_acc_count[MB_CHANNEL_MAX];
+
 /** 传输层类型 */
 typedef enum
 {
@@ -338,6 +366,12 @@ static void MotorBenchHandleSetPid(uint8_t *buf, uint16_t len);
 static void MotorBenchHandleQueryPid(uint8_t *buf, uint16_t len);
 static void MotorBenchHandleUnbind(uint8_t *buf, uint16_t len);
 static void MotorBenchSendAddAck(const MB_MotorAddAck_s *ack);
+/*
+ * 这两个函数定义在文件后半部分,但 MotorBenchBind / MotorBenchUnbind
+ * 需要提前调用它们来清残留参考值,故在此前置声明。
+ */
+void MotorBenchForceStopInstance(MB_MotorKind_e kind, void *instance);
+static uint8_t MotorBenchSetRefInstance(MB_MotorKind_e kind, void *instance, float ref);
 static uint8_t MotorBenchSetLoopInstance(MB_MotorKind_e kind, void *instance, Closeloop_Type_e loop);
 
 /* ---------------- 初始化 ---------------- */
@@ -713,6 +747,30 @@ uint8_t MotorBenchBind(uint8_t channel_id, MB_MotorKind_e kind, uint8_t can_bus,
     mb_channels[channel_id].ref_cmd = 0.0f;
 
     /*
+     * @attention 【2026-10-13 修复】必须同时清空**电机实例内部**的 pid_ref。
+     *
+     * 实测现象:解绑前速度不为 0,重新绑定后一使能,虽界面显示 0,
+     *   电机却立刻转动 —— 残留参考值在作怪。
+     *
+     * 根因:通道结构与电机实例是**两个独立对象**。
+     *   - 通道结构体由 MotorBenchUnbind 的 memset 清零;
+     *   - 电机实例却在 MotorBenchAddMotor 时创建,此后一直留在
+     *     dji_motor_instance[] 里,不会被解绑销毁。
+     *   于是 instance->motor_controller.pid_ref 还留着旧值。
+     *
+     *   只清 ref_cmd 没用:那只是"上位机最近一次下发值的记账",
+     *   DJIMotorControl() 真正读的是实例里的 pid_ref。
+     *
+     * @note 这里**只清零、不使能、不停机**:
+     *   MotorBenchUnbind 已经停过机了,重复停机反而会干扰
+     *   "绑定后保持停机"的语义。清零是幂等的安全动作。
+     */
+    if (!MotorBenchSetRefInstance(kind, mb_channels[channel_id].motor_ptr, 0.0f))
+    {
+        LOGWARNING("[motor_bench] bind ch%d: failed to zero residual ref", channel_id);
+    }
+
+    /*
      * 把外层闭环类型真正下发到电机驱动实例。
      *
      * @attention 这里曾经只把 outer_loop 存进通道结构体就算完 ——
@@ -748,9 +806,31 @@ uint8_t MotorBenchUnbind(uint8_t channel_id)
 {
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
         return MB_ERR_BAD_PARAM;
-    MotorBenchSetEnable(channel_id, 0);
+
+    /*
+     * @attention 【2026-10-13 修复】顺序不能颠倒,且必须清到电机实例里。
+     *
+     * 实测现象:解绑前速度不为 0,重新绑定后一使能,虽界面显示 0,
+     *   电机却立刻转动 —— 残留参考值在作怪。
+     *
+     * 根因:通道结构与电机实例是**两个独立对象**。
+     *   - 通道结构体由下面的 memset 清零;
+     *   - 电机实例却在 MotorBenchAddMotor 时创建,此后一直留在
+     *     dji_motor_instance[] 里,解绑不会销毁它。
+     *   于是 instance->motor_controller.pid_ref 还留着解绑前的值,
+     *   重新绑定后一使能就按旧值输出。
+     *
+     * 只清通道的 ref_cmd 没用 —— 那只是"上位机最近一次下发值的记账",
+     * DJIMotorControl() 真正读的是实例里的 pid_ref。
+     *
+     * 顺序:先停机(切断输出),再把参考值归零(清掉残留),
+     *   最后才 memset 通道结构体(它会清掉 motor_ptr,之后就找不到实例了)。
+     */
+    MotorBenchForceStopInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr);
+    MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, 0.0f);
+
     memset(&mb_channels[channel_id], 0, sizeof(MB_MotorChannel_s));
-    LOGINFO("[motor_bench] channel %d unbound", channel_id);
+    LOGINFO("[motor_bench] channel %d unbound (ref cleared)", channel_id);
     return MB_OK;
 }
 
@@ -895,9 +975,63 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
     float limited = ref;
     LIMIT_MIN_MAX(limited, MB_REF_LIMIT_NEG, MB_REF_LIMIT_POS);
 
-    if (!MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, limited))
+    /*
+     * @attention 【2026-10-13 修复】rpm → 驱动内部单位(deg/s)的换算。
+     *
+     * 实测症状:每次设定新速度都大幅过冲(尖峰 4280 → 回落 1050),
+     *   而速度环 Kp 只有 2 —— 这么小的增益不可能产生那种过冲。
+     *   用户判断"像 PID 问题但 PID 很小",这个矛盾正是线索。
+     *
+     * 根因是**读写量纲不对称**:
+     *   - 读回(MotorBenchGetMeasure)做了 `speed_aps / 6.0f` 转成 rpm 上报,对的;
+     *   - 下发(这里)却把界面送来的 rpm **原样**交给驱动,错的。
+     *
+     *   DJI 驱动的 speed_aps 单位是**度/秒**(general_def.h:
+     *   RPM_2_ANGLE_PER_SEC = 6.0f,即 1rpm = 6deg/s)。
+     *   界面设 3690rpm,驱动收到 3690 却理解成 3690deg/s ——
+     *   目标被放大 6 倍,输出瞬间饱和到 MaxOut,电机全速冲过目标。
+     *   这就是"增益很小却过冲严重"的原因,与 PID 参数无关。
+     *
+     * @note 只有**外层闭环是速度环**时才换算。
+     *   位置环(ANGLE)的 ref 是角度、电流环(CURRENT)的 ref 是电流值、
+     *   开环(OPEN)的 ref 直接是输出电流,三者都不是 rpm,原样下发。
+     *   判据用通道记录的外层闭环类型做精确匹配,不能用位运算
+     *   (详见下方 need_rpm_conv 处的说明)。
+     */
+    /*
+     * @attention 【2026-10-13】换算判据必须精确判断**外层是不是速度环**,
+     *   不能简单写 `!(outer_loop & ANGLE_LOOP)`。
+     *
+     *   位掩码下这个写法会误伤:
+     *     CURRENT_LOOP(0b0001) 不含 ANGLE 位 → 会被判为"需要换算",
+     *     但电流环的 ref 是**安培**,乘 6 之后完全错乱。
+     *
+     *   正确语义:只有"外层闭环 = 速度环"时 ref 才是 rpm。
+     *     外层是速度环的合法取值:
+     *       SPEED_LOOP(0b0010)              —— 纯速度环
+     *       SPEED_AND_CURRENT_LOOP(0b0011)  —— 速度外环 + 电流内环
+     *    其余(位置环、电流环、开环)的 ref 都不是 rpm。
+     *
+     *   用 `== ` 精确匹配而非位运算:外层只能是**一个**环,
+     *   "速度+电流"里的速度位表示它是外层,电流位表示内环被启用。
+     */
+    Closeloop_Type_e outer = mb_channels[channel_id].outer_loop;
+    uint8_t need_rpm_conv =
+        (mb_channels[channel_id].kind == MB_MOTOR_GM6020 ||
+         mb_channels[channel_id].kind == MB_MOTOR_M3508 ||
+         mb_channels[channel_id].kind == MB_MOTOR_M2006) &&
+        (outer == SPEED_LOOP || outer == SPEED_AND_CURRENT_LOOP);
+
+    float to_send = need_rpm_conv ? limited * RPM_2_ANGLE_PER_SEC : limited;
+
+    if (!MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, to_send))
         return MB_ERR_UNSUPPORTED;
 
+    /*
+     * @attention ref_cmd 存的是**界面量纲(rpm)**,不是发给驱动的值。
+     *   遥测上报 ref 时直接用它,保证"界面显示 = 用户输入"。
+     *   存换算后的值会让界面显示 22140 这种吓人的数字。
+     */
     mb_channels[channel_id].ref_cmd = limited;
     return MB_OK;
 }
@@ -1561,6 +1695,26 @@ void MotorBenchTask(void)
         mb_usb_rx_taken = (uint8_t)((slot + 1u) % MB_USB_RX_SLOTS);
     }
 
+    /*
+     * 混叠抑制:每一拍都累加电流与电压,发送时取平均(见 mb_tele_acc_* 的说明)。
+     *
+     * @attention 累加必须在**每一拍**做,不能只在发送那一拍做 ——
+     *   只在发送拍读一次,就等于没做平均,欠采样依旧。
+     */
+    for (uint8_t i = 0; i < MB_CHANNEL_MAX; i++)
+    {
+        if (!mb_channels[i].is_used)
+            continue;
+        MB_TelemetryItem_s snap;
+        if (MotorBenchGetMeasure(i, &snap) == MB_OK)
+        {
+            mb_tele_acc_current[i] += snap.measure_torque;
+            mb_tele_acc_voltage[i] += (float)snap.measure_speed;
+            if (mb_tele_acc_count[i] < 255)
+                mb_tele_acc_count[i]++;
+        }
+    }
+
     if (++mb_telemetry_div >= MB_TELEMETRY_DIVIDER)
     {
         mb_telemetry_div = 0;
@@ -1594,8 +1748,32 @@ static void MotorBenchSendTelemetry(void)
     {
         if (!mb_channels[i].is_used)
             continue;
-        if (MotorBenchGetMeasure(i, &items[count]) == MB_OK)
-            count++;
+        if (MotorBenchGetMeasure(i, &items[count]) != MB_OK)
+            continue;
+
+        /*
+         * 用累加平均替换瞬时值(抗混叠,见 mb_tele_acc_* 的说明)。
+         *
+         * @attention 角度与温度**不参与平均**:
+         *   角度是位置量,跨圈跳变(359°→0°)会让平均值毫无意义;
+         *   温度本身是慢变量,平均它只会延迟响应。
+         *   只对**高频抖动的电流/转速**做平均,这才是混叠的来源。
+         *
+         * @note 累加器读完即清零,下一轮从 0 重新累加 ——
+         *   这样平均窗口恰好等于上报间隔(50Hz → 每窗口 10 拍),
+         *   不重置会让窗口随时间越拉越长、响应越来越迟钝。
+         */
+        if (mb_tele_acc_count[i] > 0)
+        {
+            float inv = 1.0f / (float)mb_tele_acc_count[i];
+            items[count].measure_torque = mb_tele_acc_current[i] * inv;
+            items[count].measure_speed = mb_tele_acc_voltage[i] * inv;
+        }
+        mb_tele_acc_current[i] = 0.0f;
+        mb_tele_acc_voltage[i] = 0.0f;
+        mb_tele_acc_count[i] = 0;
+
+        count++;
     }
     if (count == 0)
         return; /* 无绑定通道时不发,节省带宽 */

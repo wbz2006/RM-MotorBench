@@ -8,7 +8,14 @@
 #include "daemon.h"
 
 #define HT_MOTOR_CNT 4
-#define CURRENT_SMOOTH_COEF 0.9f
+/*
+ * @attention 【2026-10-13】原为无前缀的 CURRENT_SMOOTH_COEF,
+ *   与 DJImotor.h、LK9025.h 同名互相覆盖,实际取值取决于包含顺序。
+ *   加 HT_ 前缀区分;取值与公式均未改动。
+ *   @note 本库的公式方向是"系数 = 新值权重",与 DJImotor 修正前一致 ——
+ *     即这里的 0.9 表示**强平滑**(不是不滤波),本身是正确的,只是命名冲突。
+ */
+#define HT_CURRENT_SMOOTH_COEF 0.9f
 #define SPEED_BUFFER_SIZE 5
 #define HT_SPEED_BIAS -0.0109901428f // 电机速度偏差,单位rad/s
 #define TORQUE_COEF_HT 3.5  // 扭矩系数,单位N.m/A
