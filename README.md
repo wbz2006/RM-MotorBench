@@ -39,6 +39,8 @@
 | [`basic_framework_atype_usb-master`](basic_framework_atype_usb-master) | **固件工程**（主工程）。基于跃鹿 `basic_framework` 的 A 板适配版，新增 USB CDC 与动态建电机 |
 | [`motor_bench_host`](motor_bench_host) | **上位机**。Node 服务（WebSocket 桥接串口）+ 原生 Web UI |
 | `电机测试台方案.md` | 完整方案文档（设计推导、协议定义、排查记录） |
+| [`basic_framework_atype_usb-master/USB排障指南.md`](basic_framework_atype_usb-master/USB排障指南.md) | USB 枚举失败（电脑报"无法识别的USB设备"）的 RTT 诊断步骤 |
+| [`basic_framework_atype_usb-master/CAN_ID冲突说明.md`](basic_framework_atype_usb-master/CAN_ID冲突说明.md) | CAN ID 冲突规则、推荐接法、实测触发与排障 |
 
 ---
 

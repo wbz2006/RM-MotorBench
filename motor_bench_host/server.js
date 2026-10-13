@@ -150,7 +150,14 @@ function handleCommand(cmd) {
           kind: cmd.kind,
           canBus: cmd.canBus,
           motorId: cmd.motorId,
-          outerLoop: cmd.outerLoop ?? LoopType.SPEED_LOOP,
+          /*
+           * @attention 默认值与固件建电机时的配置保持一致:
+           *   SPEED_AND_CURRENT_LOOP(速度外环 + 电流内环)。
+           * 原先默认是单环 SPEED_LOOP(2),而固件建电机用 3 ——
+           * 上位机旧版本若不传 outerLoop,就会静默降级成"没有电流内环",
+           * 表现为低速爬行差、负载突变时跟随不上,且没有任何报错。
+           */
+          outerLoop: cmd.outerLoop ?? LoopType.SPEED_AND_CURRENT_LOOP,
         }),
       );
       break;

@@ -63,8 +63,8 @@ static void HTMotorDecode(CANInstance *motor_can)
     measure->speed_rads = AverageFilter((uint_to_float(tmp, V_MIN, V_MAX, 12) - HT_SPEED_BIAS), measure->speed_buff, SPEED_BUFFER_SIZE);
 
     tmp = (uint16_t)(((rxbuff[4] & 0x0f) << 8) | rxbuff[5]);
-    measure->real_current = CURRENT_SMOOTH_COEF * uint_to_float(tmp, T_MIN, T_MAX, 12) +
-                            (1 - CURRENT_SMOOTH_COEF) * measure->real_current;
+    measure->real_current = HT_CURRENT_SMOOTH_COEF * uint_to_float(tmp, T_MIN, T_MAX, 12) +
+                            (1 - HT_CURRENT_SMOOTH_COEF) * measure->real_current;
 }
 
 static void HTMotorLostCallback(void *motor_ptr)
