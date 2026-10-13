@@ -1,4 +1,4 @@
-# ---- 缂栬瘧浜х墿 ----
+# ---- 编译产物 ----
 build/
 *.o
 *.d
@@ -8,27 +8,29 @@ build/
 *.map
 *.lst
 
-# ---- 渚濊禆 ----
+# ---- 依赖 ----
 node_modules/
 
-# ---- 鏂囨。閰嶅浘(鍘熸鏋惰嚜甯?浣撶Н澶т笖涓庢湰椤圭洰鏃犲叧) ----
+# ---- 文档配图(原框架自带,体积大且与本项目无关) ----
 **/.assets/
 
-# ---- 缂栬緫鍣?/ 绯荤粺 ----
+# ---- 编辑器 / 系统 ----
 .vscode/
 .idea/
 *.swp
 .DS_Store
 Thumbs.db
 
-# ---- 璋冭瘯 ----
+# ---- 调试 ----
 *.log
-.DS_Store
 
-# ---- 鏈畬鎴愮殑 CubeMX 楠ㄦ灦(2026-10-13 鐢ㄦ埛纭涓嶄笂浼? ----
-# motorbench-a/ 鏄函 CubeMX 鐢熸垚鐨勭┖宸ョ▼:鍙湁 ST HAL / CMSIS / FreeRTOS /
-# USB CDC 绛夊巶鍟嗕唬鐮?娌℃湁 bsp/ 涓?application/,涔熸病鎺ヤ换浣曟湰椤圭洰閫昏緫銆?# 鐪熸鐨勫浐浠跺伐绋嬫槸 basic_framework_atype_usb-master 鈥斺€?# 鎶婄┖楠ㄦ灦涓€骞跺叕寮€浼氳浣跨敤鑰呭垎涓嶆竻璇ョ敤鍝釜,鏁呮帓闄ゃ€?motorbench-a/
+# ---- 未完成的 CubeMX 骨架(2026-10-13 用户确认不上传) ----
+# motorbench-a/ 是纯 CubeMX 生成的空工程:只有 ST HAL / CMSIS / FreeRTOS /
+# USB CDC 等厂商代码,没有 bsp/ 与 application/,也没接任何本项目逻辑。
+# 真正的固件工程是 basic_framework_atype_usb-master
+# 把空骨架一并公开会让使用者分不清该用哪个,故排除。
+motorbench-a/
 
-# ---- 临时文件(推送脚本用的提交信息,勿提交) ----
+# ---- 临时文件(推送脚本用,勿提交) ----
 _commit_msg.txt
-_*.tmp.js
+_push.js
