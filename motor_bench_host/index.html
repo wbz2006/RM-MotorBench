@@ -111,7 +111,49 @@
             @attention 电流环常亮不可关:它是最后一级,
               关掉就只剩"位置/速度环输出直接当电流值下发"的危险组合。
           -->
-          <div class="loop-fishbone" data-role="loopPicker"></div>
+          <!--
+            闭环子卡片:**鱼骨图与 PID 整定同属一张卡片**(2026-10-14 用户要求)。
+
+            原先鱼骨图和 PID 面板各自带边框与背景,上下两个框看起来像两张卡片、
+            两件不相干的事。实际上它们是同一件事的两面 ——
+            上面选环,下面调该环的参数,合并后"选哪个环就调哪个环"是一个整体。
+
+            两段之间用一条虚线分隔,而不是再套一个带边框的框:
+            套框会重新产生"卡片里还套着卡片"的层级错觉。
+          -->
+          <div class="loop-card">
+            <div class="loop-fishbone" data-role="loopPicker"></div>
+
+            <!--
+              PID 整定 —— 常驻显示(未绑定电机时各控件为 disabled)。
+
+              交互契约:点击鱼骨图上的环节点 → 切换该环启用状态,
+                同时把本段的 pidLoop 切到对应环并填入该型号默认值。
+            -->
+            <div class="pid-panel" data-role="pidPanel">
+              <div class="pid-head">
+                <span class="panel-title" data-role="pidTitle">PID 整定</span>
+                <select data-role="pidLoop" disabled>
+                  <option value="0">速度环</option>
+                  <option value="1">电流环</option>
+                  <option value="2">位置环</option>
+                </select>
+                <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回</button>
+              </div>
+              <div class="pid-grid">
+                <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
+                <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
+                <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
+                <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
+                <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
+              </div>
+              <div class="pid-actions">
+                <button data-role="pidApply" disabled>应用到电机</button>
+                <button data-role="pidReset" class="ghost" disabled>恢复默认值</button>
+                <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!--
@@ -133,45 +175,6 @@
           滤波:转速与电流在入图前经一阶低通(见 chart.js 的 LowPass),
                 原始值波动过大时曲线糊成一团,看不出趋势。
         -->
-        <!--
-          PID 整定卡片 —— **内嵌固定显示**,紧跟在闭环鱼骨图下方(2026-10-13)。
-
-          【位置】放在 bind-row(电机选择 + 鱼骨图)之后、曲线之前。
-            这样"选环 → 立刻看到该环参数"的动线最短,
-            不必翻过整张曲线图去找调参入口。
-
-          【为什么不用浮空】曾改为 absolute 跟随节点,实测飘到通道卡片底部 ——
-            浮空需要可靠的定位基准与堆叠上下文,而通道卡片多层嵌套
-            (channel > bind-row > loop-fishbone),父级 overflow / transform
-            都会让 absolute 失控。内嵌常驻无此问题。
-
-          交互契约:点击鱼骨图上的环节点 → 切换该环启用状态,
-            同时把这张卡片的 pidLoop 切到对应环并填入默认值。
-            卡片常驻可见(未绑定电机时为 disabled)。
-        -->
-        <div class="pid-panel" data-role="pidPanel">
-          <div class="pid-head">
-            <span class="panel-title" data-role="pidTitle">PID 整定</span>
-            <select data-role="pidLoop" disabled>
-              <option value="0">速度环</option>
-              <option value="1">电流环</option>
-              <option value="2">位置环</option>
-            </select>
-            <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回</button>
-          </div>
-          <div class="pid-grid">
-            <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
-            <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
-            <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
-            <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
-            <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
-          </div>
-          <div class="pid-actions">
-            <button data-role="pidApply" disabled>应用到电机</button>
-            <button data-role="pidReset" class="ghost" disabled>恢复默认值</button>
-            <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
-          </div>
-        </div>
         <div class="chart-box">
           <div class="chart-head">
             <span class="panel-title">实时曲线</span>

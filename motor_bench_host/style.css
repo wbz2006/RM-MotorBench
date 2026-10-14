@@ -245,21 +245,32 @@ button:disabled {
   gap: 8px;
 }
 
-/* 标题行的操作按钮(绑定/解绑):比正文按钮小一号,不抢标题的视觉重量 */
+/*
+ * 标题行的操作按钮(绑定/解绑)。
+ *
+ * 2026-10-14:**这里不再覆盖字号与内边距**。
+ *   原先缩到 `11px / 2px 8px`,比页面其它按钮(使能、应用到电机)明显小一号,
+ *   同一类动作两种尺寸,用户要求「和使能的按键一样大」。
+ *   删掉覆盖后按钮直接继承全局 `button`(14px / 8px 14px),尺寸自然一致。
+ *
+ * 保留本条规则只为 flex 布局做保护:通道卡片窄时,
+ *   标题行里的按钮不被压缩变形、不在按钮内部折行。
+ */
 .ch-act {
-  padding: 2px 8px;
-  font-size: 11px;
+  flex: none;
+  white-space: nowrap;
 }
 
 .ch-title {
+  /* 标题行整体放大(2026-10-14):15px 时通道名压不住旁边的大按钮 */
   font-weight: 700;
-  font-size: 15px;
+  font-size: 17px;
 }
 
 .badge {
   /* 贴右:标题行是「通道名 / 绑定 / 解绑 / 徽章」,徽章推到最右 */
   margin-left: auto;
-  font-size: 12px;
+  font-size: 13px;
   padding: 3px 9px;
   border-radius: 999px;
   background: var(--panel-2);
@@ -320,19 +331,35 @@ button:disabled {
   font-weight: 600;
 }
 
-/* ---------------- PID 整定面板 ---------------- */
+/* ---------------- 闭环卡片(鱼骨图 + PID 整定) ---------------- */
 
-.pid-panel {
-  margin-top: 12px;
-  padding: 10px 12px;
+/*
+ * 一张卡片装两段:上面选环(鱼骨图),下面调该环的参数(PID 整定)。
+ *
+ * 2026-10-14 用户要求合并 —— 原先鱼骨图与 PID 面板各自带边框与背景,
+ * 上下两个框看起来像两张不相干的卡片,而它们其实是同一件事的两面:
+ * 上面选的是哪个环,下面就调哪个环的参数。
+ *
+ * 现在边框与背景只在 .loop-card 上出现一次,
+ * 内部两段之间用一条虚线分隔(不再套第二个框,避免"卡片里还有卡片"的错觉)。
+ */
+.loop-card {
+  position: relative; /* 供内部需要定位的元素作基准 */
+  flex: 1 1 100%;     /* 独占一行:电机下拉在上,本卡片在下 */
+  padding: 8px 10px 10px;
+  background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: var(--panel-2);
 }
 
-.pid-panel[data-collapsed="1"] .pid-grid,
-.pid-panel[data-collapsed="1"] .pid-actions {
-  display: none;
+/*
+ * PID 整定段:**不再是独立卡片**。
+ * 去掉原来 margin-top 撑出的"两张卡片之间的缝",改为卡片内的分区分隔线。
+ */
+.pid-panel {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
 }
 
 .pid-head {
@@ -592,18 +619,15 @@ button:disabled {
  */
 .loop-fishbone {
   /*
-   * @attention 必须设 position: relative —— PID 浮空卡片是相对它定位的。
-   *   没有这条,卡片的 absolute 会往上找到更远的祖先,飘到页面别处。
+   * @note 边框/背景/内边距**不在这里**,由 .loop-card 统一提供 ——
+   *   鱼骨图与下面的 PID 整定段同属一张卡片(2026-10-14 合并)。
+   *   这里再画一道框就会重新变成"卡片套卡片"。
+   *   曾经这里的 position: relative 是为已废弃的 PID 浮空卡片服务的,一并移除。
    */
-  position: relative;
   display: flex;
   align-items: center;
   flex-wrap: wrap; /* 允许 fb-meta 掉到下一行 */
   gap: 6px;
-  padding: 7px 10px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
   font-size: 12px;
 }
 
@@ -733,20 +757,16 @@ button:disabled {
 }
 
 /*
- * PID 面板:**内嵌常驻**,就放在鱼骨图下方。
+ * PID 面板的标题。
  *
- * @attention 曾改成浮空(absolute 跟随节点),实测飘到通道卡片底部 ——
- *   浮空需要可靠的定位基准与堆叠上下文,而通道卡片有多层嵌套
- *   (channel > bind-row > loop-fishbone),父级 overflow/transform
- *   都会让 absolute 定位失控。内嵌常驻没有这类问题。
+ * @attention 这里曾**重复定义过一份 `.pid-panel`**(margin/padding/背景/边框/圆角)。
+ *   两份同名规则里后写的生效,于是"改了一份却被另一份悄悄覆盖"是必然的坑。
+ *   2026-10-14 合并卡片时已把那份删掉,.pid-panel 的样式只在文件上方
+ *   「闭环卡片」一节定义一处。新增样式请也写在那里。
+ *
+ * @note 面板本身已不是独立卡片(与鱼骨图同属 .loop-card),
+ *   边框与背景一律由 .loop-card 提供。
  */
-.pid-panel {
-  margin-top: 8px;
-  padding: 8px 10px 10px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-}
 
 .pid-panel .panel-title {
   font-size: 12px;

@@ -58,6 +58,22 @@ function check(name, cond, detail = '') {
   }
 }
 
+/*
+ * 抽出某条 CSS 规则的声明体(不含注释)。
+ *
+ * @attention 必须先剥注释再抽 —— "这条规则里有没有某属性"的判断
+ *   会被注释里偶然出现的属性名骗到;而"花括号后 N 字符内必须出现某属性"
+ *   这种字符窗口写法,又会被规则体内较长的注释把属性顶出窗口
+ *   (实测在 .loop-fishbone 的说明注释上发生过一次)。
+ *   `[^}]*` 在第一个右花括号处截断,CSS 注释里不写 `}` 即可。
+ */
+const cssBody = (src, sel) => {
+  const esc = sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '');
+  const m = new RegExp(esc + '\\s*\\{([^}]*)\\}').exec(code);
+  return m ? m[1] : null;
+};
+
 console.log('== 1. frame structure ==');
 const bind = buildBind(0, { kind: MotorKind.M3508, canBus: 1, motorId: 5, outerLoop: LoopType.SPEED_LOOP });
 const setref = buildSetRef(0, 1234.5);
@@ -2626,13 +2642,13 @@ console.log('\n== 33. PID card stays inline; picking a loop switches it ==');
       !/\.pid-float/.test(css),
       'leftover absolute positioning would break layout again');
     check('.pid-panel is in normal flow (no absolute)',
-      !/\.pid-panel\s*\{[\s\S]{0,200}?position:\s*absolute/.test(css));
+      !/position:\s*absolute/.test(cssBody(css, '.pid-panel') || ''));
     /*
      * 鱼骨图仍保留 flex-wrap —— 之前 fb-meta 不换行的排版问题,
      * 修了就不能再退回去。
      */
     check('the fishbone still wraps so the meta row drops down',
-      /\.loop-fishbone\s*\{[\s\S]{0,220}?flex-wrap:\s*wrap/.test(css),
+      /flex-wrap:\s*wrap/.test(cssBody(css, '.loop-fishbone') || ''),
       'the meta row used to squeeze next to the nodes');
   }
 
@@ -2733,7 +2749,21 @@ console.log('\n== 34. 通道操作按钮归位;急停单击即停 ==');
   }
 
   if (css) {
-    check('both header actions share one compact style (.ch-act)', /\.ch-act\s*\{/.test(css));
+    /*
+     * 标题行按钮**不得再被缩小**(2026-10-14 用户要求「和使能的按键一样大」)。
+     * 此前 .ch-act 把它们缩到 11px,而全局 button 是 14px ——
+     * 同一类动作在页面上出现两种尺寸,不一致感就是这么来的。
+     */
+    check('header action buttons are NOT size-shrunk',
+      !/\.ch-act\s*\{[^}]*(font-size|padding)/.test(css),
+      'they must inherit the global 14px / 8px 14px like the enable button');
+    check('the header title font was enlarged',
+      /\.ch-title\s*\{[^}]*font-size:\s*1[7-9]px/.test(css),
+      '15px could not hold its own next to full-size buttons');
+    /* 防的是本轮真实发生过的一次误删:改字号时把相邻两行一起替掉了 */
+    check('the badge keeps its pill padding and radius',
+      /\.badge\s*\{[^}]*padding:\s*3px 9px[^}]*border-radius:\s*999px/.test(css),
+      'losing either makes the status badge a square hugging its text');
     check('the one-sided .unbind-btn rule is gone', !/\.unbind-btn\s*\{/.test(css),
       'it styled only unbind, which is how the asymmetry got hidden');
     check('no unbind-btn class name remains anywhere', !/unbind-btn/.test(css) && !/unbind-btn/.test(html || ''));
@@ -2759,6 +2789,82 @@ console.log('\n== 34. 通道操作按钮归位;急停单击即停 ==');
       `found ${(code.match(/confirm\(/g) || []).length}`);
     check('the enable interlock is still there',
       /该通道当前设定值不为 0/.test(ui), 'must warn before a motor jumps to speed');
+  }
+}
+
+console.log('\n== 35. 鱼骨图与 PID 整定同属一张卡片 ==');
+{
+  /*
+   * 用户裁定(2026-10-14):「pid 不应该是单独的一个子卡片,
+   * 应当和之前的环在同一个子卡片」。
+   *
+   * 【为什么这条值得单独锁】此前鱼骨图和 PID 面板各自带 border + background,
+   *   上下两个框在视觉上就是两张卡片、两件不相干的事;
+   *   而它们的语义恰恰是同一件事的两面 —— 上面选哪个环,下面就调哪个环的参数。
+   *   合并后卡片的边框/背景**只允许出现在 .loop-card 上**;
+   *   内部分区用虚线,不允许再套第二个框(那会退回"卡片套卡片")。
+   *
+   * 【CSS 层面必须防的坑】同名规则写两处时,后写的覆盖先写的。
+   *   原文件里 `.pid-panel` 就定义了两份(前面一份卡片样式 + 后面又一份),
+   *   改前面那份完全无效,极难排查。现在规定只许一份。
+   */
+  let html, css;
+  try {
+    const b = new URL('./', import.meta.url);
+    html = readFileSync(new URL('index.html', b), 'utf8');
+    css = readFileSync(new URL('style.css', b), 'utf8');
+  } catch { console.log('  SKIP  sources not reachable'); }
+
+  /* 注释会干扰"这条规则里有没有某个属性"的判断,先去掉再抽规则体 */
+  const cssCode = (css || '').replace(/\/\*[\s\S]*?\*\//g, '');
+  const body = (sel) => cssBody(cssCode, sel);
+
+  if (html) {
+    check('there is one .loop-card wrapper', /class="loop-card"/.test(html));
+    /* 切片到图表之前:loop-card 必然整体落在这一段里 */
+    const lc = html.slice(html.indexOf('class="loop-card"'), html.indexOf('class="chart-box"'));
+    check('the fishbone sits inside the loop card', /data-role="loopPicker"/.test(lc));
+    check('the PID panel sits inside the SAME card', /data-role="pidPanel"/.test(lc),
+      'it used to be a sibling of the fishbone row — a separate card');
+    check('within the card, PID comes after the fishbone',
+      lc.indexOf('data-role="loopPicker"') < lc.indexOf('data-role="pidPanel"'));
+    check('the PID panel is declared exactly once',
+      (html.match(/data-role="pidPanel"/g) || []).length === 1,
+      'a leftover copy would render a second, detached panel');
+    check('there is exactly one pid-panel element',
+      (html.match(/class="pid-panel"/g) || []).length === 1);
+    check('the motor select stays outside the card',
+      html.indexOf('data-role="motor"') < html.indexOf('class="loop-card"'));
+  }
+
+  if (cssCode) {
+    check('.loop-card carries the box (border + background)',
+      /border:\s*1px solid/.test(body('.loop-card') || '') &&
+      /background/.test(body('.loop-card') || ''));
+    check('.loop-card takes its own row', /flex:\s*1 1 100%/.test(body('.loop-card') || ''),
+      'otherwise it squeezes beside the motor select and the PID grid collapses');
+
+    const fbBody = body('.loop-fishbone') || '';
+    check('.loop-fishbone draws NO box of its own',
+      !/border|background|border-radius/.test(fbBody),
+      'a second frame inside the card is exactly the "card within a card" look');
+    check('.loop-fishbone keeps its flex row and wrapping',
+      /display:\s*flex/.test(fbBody) && /flex-wrap:\s*wrap/.test(fbBody));
+
+    const pBody = body('.pid-panel');
+    check('.pid-panel is defined exactly once in the CSS',
+      (cssCode.match(/^\.pid-panel\s*\{/gm) || []).length === 1,
+      'duplicate rules silently override each other — the later one wins');
+    check('.pid-panel draws no box',
+      pBody !== null && !/background/.test(pBody) && !/border:\s*1px/.test(pBody));
+    check('.pid-panel separates itself with a dashed rule instead',
+      /border-top:\s*1px dashed/.test(pBody || ''),
+      'the two sections must still read as two sections');
+
+    check('the dead data-collapsed rules are gone',
+      !/data-collapsed/.test(cssCode), 'that feature was dropped with the float panel');
+    check('no absolute positioning crept back into the panel',
+      !/\.pid-panel[^{]*\{[^}]*position:\s*absolute/.test(cssCode));
   }
 }
 
