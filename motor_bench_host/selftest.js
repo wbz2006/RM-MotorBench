@@ -33,6 +33,7 @@ import {
   PidLoop,
   PID_DEFAULTS,
   MBResult,
+  MBResultText,
   MotorKindLabel,
   MAX_PAYLOAD,
   buildFrame,
@@ -2766,7 +2767,14 @@ console.log('\n== 34. 通道操作按钮归位;急停单击即停 ==');
       'losing either makes the status badge a square hugging its text');
     check('the one-sided .unbind-btn rule is gone', !/\.unbind-btn\s*\{/.test(css),
       'it styled only unbind, which is how the asymmetry got hidden');
-    check('no unbind-btn class name remains anywhere', !/unbind-btn/.test(css) && !/unbind-btn/.test(html || ''));
+    /*
+     * "类名已不存在"必须在剥离注释后的文本上判:
+     * 否则将来任何一句提到 unbind-btn 的说明注释都会让这条误报
+     * (组 36 第一版就是这么栽的)。
+     */
+    check('no unbind-btn class name remains anywhere',
+      !/unbind-btn/.test(css.replace(/\/\*[\s\S]*?\*\//g, '')) &&
+      !/unbind-btn/.test((html || '').replace(/<!--[\s\S]*?-->/g, '')));
     check('header does not use space-between',
       !/\.channel header\s*\{[\s\S]{0,200}?justify-content:\s*space-between/.test(css),
       'four children would be spread apart with gaps between the buttons');
@@ -2866,6 +2874,79 @@ console.log('\n== 35. 鱼骨图与 PID 整定同属一张卡片 ==');
     check('no absolute positioning crept back into the panel',
       !/\.pid-panel[^{]*\{[^}]*position:\s*absolute/.test(cssCode));
   }
+}
+
+console.log('\n== 36. 静态 ID 冲突面板已移除;动态提示不得被牵连 ==');
+{
+  /*
+   * 用户裁定(2026-10-14):首页那条静态「ID 冲突提示」不要了 ——
+   * 「等出现 ID 冲突时,会自动提示」。
+   *
+   * 【删了为什么不丢信息】面板讲的两件事都已由动态提示覆盖:
+   *   1. 本地预检 describeConflict():点"添加"之前就给出
+   *      "和谁撞、该改谁、当前可用哪些 ID";
+   *   2. 板端回执 MBResultText:失败时给具体原因
+   *      (DUPLICATE 带 0x204/0x200 区间重叠说明;NO_RESOURCE 带"每条总线最多 14 颗")。
+   * 静态版只是把"出错时才知道"的话提前摊在首页,占版面且真出错时没人回头读。
+   *
+   * 【本组真正要防的错误】把"删掉 ID 冲突提示"执行成"删掉冲突检测"。
+   *   检测在三处:protocol.js 的 findConflict/describeConflict、
+   *   ui.js 添加前的预检、板端 MotorBenchCheckRxIdFree。
+   *   前两层由本组钉住,任何一层被顺手删掉都会红。
+   */
+  let html, css, ui;
+  try {
+    const b = new URL('./', import.meta.url);
+    html = readFileSync(new URL('index.html', b), 'utf8');
+    css = readFileSync(new URL('style.css', b), 'utf8');
+    ui = readFileSync(new URL('ui.js', b), 'utf8');
+  } catch { console.log('  SKIP  sources not reachable'); }
+
+  /*
+   * @attention "某某已删除"这类断言**必须先在剥离注释后的文本上判**。
+   *   本组第一版就直接在原文上搜 `ID 冲突提示` 与 `hint-panel`,
+   *   结果被自己新写的说明注释命中而误报失败 ——
+   *   同一个坑本轮是第二次踩(上一次是全文件 `confirm(` 计数)。
+   *   删除型断言判的是"标记/规则"还在不在,注释是给人读的,不算标记。
+   */
+  const htmlCode = (html || '').replace(/<!--[\s\S]*?-->/g, '');
+  const cssCode = (css || '').replace(/\/\*[\s\S]*?\*\//g, '');
+
+  if (html) {
+    check('the static hint panel markup is gone', !/hint-panel/.test(htmlCode));
+    check('the static "ID 冲突提示" paragraph is gone', !/ID 冲突提示/.test(htmlCode));
+    check('the removal leaves a comment so it is not re-added',
+      /静态「ID 冲突提示」面板已于 2026-10-14 按用户要求移除/.test(html),
+      'without a note the next reader just restores the paragraph');
+    check('the add-motor panel and its live message are untouched',
+      /id="addMotor"/.test(htmlCode) && /id="addMsg"/.test(htmlCode),
+      'addMsg is where the dynamic conflict text appears');
+  }
+  if (css) {
+    check('the .hint-panel rules died with the panel', !/hint-panel/.test(cssCode));
+  }
+
+  /* --- 动态层必须完好 --- */
+  check('findConflict is still exported', typeof findConflict === 'function');
+  check('describeConflict is still exported', typeof describeConflict === 'function');
+  {
+    const inv = [[MotorKind.M3508, 1, 5]];
+    const msg = describeConflict(1, inv.map(([kind, canBus, motorId]) => ({ kind, canBus, motorId })),
+      MotorKind.GM6020, 1);
+    check('the dynamic conflict prompt still fires', /ID 冲突/.test(msg), msg);
+    check('it still names the occupier', /M3508/.test(msg), msg);
+    check('it still offers available IDs', /可用 ID/.test(msg), msg);
+  }
+  if (ui) {
+    const code = ui.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    check('ui still pre-checks before adding', /describeConflict\(/.test(code));
+    check('ui still surfaces the conflict text', /showAddMsg\(conflictMsg, true\)/.test(code));
+  }
+  check('board DUPLICATE still explains the 0x200 / 0x204 overlap',
+    /0x204\+ID/.test(MBResultText[MBResult.DUPLICATE]) &&
+    /0x200\+ID/.test(MBResultText[MBResult.DUPLICATE]));
+  check('board NO_RESOURCE still names the 14-per-bus limit',
+    /14 颗/.test(MBResultText[MBResult.NO_RESOURCE]));
 }
 
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);

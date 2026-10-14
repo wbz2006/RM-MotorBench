@@ -155,27 +155,11 @@ body {
   color: var(--err, #f85149);
 }
 
-/* ---- ID 冲突提示 ---- */
-.panel.hint-panel {
-  padding: 10px 18px;
-  font-size: 12.5px;
-  line-height: 1.7;
-  color: var(--muted);
-  background: var(--panel-2);
-  border-bottom: 1px solid var(--line);
-}
-
-.panel.hint-panel strong {
-  color: var(--text);
-}
-
-.panel.hint-panel code {
-  font-family: ui-monospace, Consolas, monospace;
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: rgba(110, 118, 129, 0.25);
-  color: var(--text);
-}
+/* ---- 静态「ID 冲突提示」面板的样式已随该面板一起移除(2026-10-14) ----
+ * .panel.hint-panel / strong / code 三条规则只服务于首页那条静态说明,
+ * 面板删除后即为死样式,已清掉。冲突相关信息改由动态提示承载
+ * (protocol.js 的 describeConflict() 与 MBResult 文案)。
+ */
 
 select,
 input[type='number'],

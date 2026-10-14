@@ -62,13 +62,20 @@
       <span id="addMsg" class="hint"></span>
     </section>
 
-    <section class="panel hint-panel">
-      <strong>ID 冲突提示:</strong>6020 的反馈 ID 是 <code>0x204+ID</code>(0x205~0x20C),
-      3508/2006 是 <code>0x200+ID</code>(0x201~0x208),<strong>两段区间重叠</strong>。
-      所以 6020 不能与 3508/2006 挂在<strong>同一条总线</strong>上 —— 例如 6020 用 ID1 会和
-      3508 用 ID5 撞车。建议:<strong>CAN1 只接 6020,CAN2 接 3508/2006</strong>。
-      每条总线最多挂 14 颗(受 CAN 过滤器数量限制)。
-    </section>
+    <!--
+      静态「ID 冲突提示」面板已于 2026-10-14 按用户要求移除。
+
+      理由:静态说明要求用户在出错**之前**先读一遍,而 ID 冲突是偶发事件 ——
+      用户明确表示"等出现 ID 冲突时会自动提示"。而这两层提示本来就有:
+
+        1. 本地预检:protocol.js 的 describeConflict() 在点"添加"之前就给出
+           "和谁撞、该改谁、当前可用哪些 ID";
+        2. 板端回执:添加失败时把 MBResult 映射成具体原因
+           (ID 冲突 / 0x200 与 0x204 段重叠 / 滤波器耗尽,每条总线最多 14 颗)。
+
+      也就是说面板承载的信息在真正需要时都会自动出现,静态版只是重复一遍。
+      **不要因为"首页看不到冲突说明"而把静态面板加回来** —— 要改就改动态文案。
+    -->
 
     <main id="channels" class="channels"></main>
 
