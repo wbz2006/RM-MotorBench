@@ -3103,5 +3103,91 @@ console.log('\n== 37. 串口与添加电机并成一行;鱼骨图底部信息行
   }
 }
 
+console.log('\n== 38. PID 状态消息与「应用到电机」同行;.hint 的段落留白归页脚 ==');
+{
+  /*
+   * 用户裁定(2026-10-14):「pid 子卡片的『先绑定电机后可用』调整到和应用到电机同行」。
+   *
+   * 【根因不是 markup,是 CSS 归属】pidMsg 一直就在 .pid-actions 那一行里
+   * (DOM:应用到电机 → 恢复默认值 → 消息),掉到下一行是因为通用 `.hint`
+   * 带着**段落**内边距(左右 18px、底部 24px,line-height 1.7)——
+   * 那是给页脚整段说明写的,套在行内消息上凭空多出 36px 宽。
+   * 所以修法是"把段落留白挪到 footer.hint",不是把消息搬出这一行。
+   *
+   * 【本组要防的两类错误】
+   *   A. 有人"重新组织" markup,把 pidMsg 移到 .pid-head 或面板末尾当说明段;
+   *   B. 有人把段落留白又加回通用 `.hint` —— 消息会再一次掉到按钮下面,
+   *      而且 #addMsg(添加电机结果)会一起被撑开。
+   */
+  let html, css;
+  try {
+    const b = new URL('./', import.meta.url);
+    html = readFileSync(new URL('index.html', b), 'utf8');
+    css = readFileSync(new URL('style.css', b), 'utf8');
+  } catch { console.log('  SKIP  sources not reachable'); }
+
+  const htmlCode = (html || '').replace(/<!--[\s\S]*?-->/g, '');
+  const cssCode = (css || '').replace(/\/\*[\s\S]*?\*\//g, '');
+
+  if (html) {
+    /* --- 三个控件必须在同一个 .pid-actions 里 --- */
+    const m = /<div class="pid-actions">([\s\S]*?)<\/div>/.exec(htmlCode);
+    check('the pid action row exists', !!m);
+    const row = m ? m[1] : '';
+    check('应用到电机 / 恢复默认值 / 状态消息 三个都在同一行',
+      /data-role="pidApply"/.test(row) && /data-role="pidReset"/.test(row)
+      && /data-role="pidMsg"/.test(row));
+    check('the message is not a block element',
+      /<span data-role="pidMsg"/.test(row),
+      'a <p>/<div> here would force its own line');
+    check('the "先绑定电机后可用" wording is kept',
+      /先绑定电机后可用/.test(row) || /先绑定电机后可用/.test(htmlCode));
+    check('消息排在两个按钮之后(状态贴行尾的阅读顺序)',
+      row.indexOf('pidApply') < row.indexOf('pidMsg')
+      && row.indexOf('pidReset') < row.indexOf('pidMsg'));
+
+    /*
+     * .hint 的使用者就这三处:两个行内状态消息 + 页脚段落。
+     * 数量变了说明有人加了第四处 —— 那就得先想清楚它是行内还是段落。
+     */
+    check('.hint has exactly three users (2 inline messages + footer paragraph)',
+      (htmlCode.match(/class="hint"/g) || []).length === 3,
+      'inline vs paragraph styling differs — re-check before adding another');
+  }
+
+  if (css) {
+    /*
+     * 通用 .hint 的规则体:用"行首或 } 之后紧跟 .hint{" 精确定位,
+     * 不能用 cssBody(css,'.hint') —— 它会被 `footer.hint {` 抢先命中。
+     */
+    const g = /(?:^|\})\s*\.hint\s*\{([^}]*)\}/.exec(cssCode);
+    check('the generic .hint rule exists', !!g);
+    const body = g ? g[1] : '';
+    check('段落留白(左右 18px / 底部 24px)已从通用 .hint 移除',
+      !/padding\s*:/.test(body),
+      'this is what pushed the inline message onto its own line');
+    check('通用 .hint 只保留字号与颜色',
+      /font-size\s*:/.test(body) && /color\s*:/.test(body));
+
+    const foot = cssBody(css, 'footer.hint');
+    check('页脚段落仍保留原留白与行高',
+      /padding\s*:\s*6px 18px 24px/.test(foot || '')
+      && /line-height\s*:\s*1\.7/.test(foot || ''),
+      'the footer paragraph must not lose its spacing');
+
+    const act = cssBody(css, '.pid-actions .hint');
+    check('PID 状态消息在同一行内右对齐',
+      /margin-left\s*:\s*auto/.test(act || ''),
+      'without it the message hugs the buttons instead of the row end');
+    check('.pid-actions 仍是可换行 flex 行(窄卡片时优雅降级)',
+      /display\s*:\s*flex/.test(cssBody(css, '.pid-actions') || '')
+      && /flex-wrap\s*:\s*wrap/.test(cssBody(css, '.pid-actions') || ''),
+      'nowrap would overflow instead of wrapping');
+    check('没有用 ellipsis 截断动态消息',
+      !/text-overflow\s*:\s*ellipsis/.test(act || ''),
+      'truncating an error message is worse than wrapping');
+  }
+}
+
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

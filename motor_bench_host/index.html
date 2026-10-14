@@ -181,6 +181,13 @@
                 <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
                 <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
               </div>
+              <!--
+                动作行:**状态消息与「应用到电机」同一行**(2026-10-14 用户要求)。
+                消息(pidMsg)一直在本行内(DOM 顺序:应用到电机 → 恢复默认值 → 消息),
+                之前看着像单独占一行,是被通用 `.hint` 的段落内边距撑出了这一行 ——
+                修的是 style.css 里 `.hint` 的归属,不是把消息挪出这一行。
+                @attention 不要把 pidMsg 移到 .pid-head 或 panel 末尾当"说明段"。
+              -->
               <div class="pid-actions">
                 <button data-role="pidApply" disabled>应用到电机</button>
                 <button data-role="pidReset" class="ghost" disabled>恢复默认值</button>
