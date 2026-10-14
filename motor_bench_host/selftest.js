@@ -2495,6 +2495,13 @@ console.log('\n== 32. loop fishbone: topology must enforce the cascade constrain
   if (fb) {
     const code = fb.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
 
+    /*
+     * 每个环节点一条 note。底部说明行删除后,note 改由节点 title 承载 ——
+     * 数一数条数,防止"删说明行"被顺手执行成"把 note 也删了"
+     * (那样悬停提示就只剩"点击启用/关闭",流向信息彻底消失)。
+     */
+    const NODE_NOTE_COUNT = (code.match(/note:\s*'/g) || []).length;
+
     check('fishbone.js exports LoopFishbone', /export class LoopFishbone/.test(code));
     check('angle node bit is 0b0100', /bit:\s*0b0100/.test(code));
     check('speed node bit is 0b0010', /bit:\s*0b0010/.test(code));
@@ -2534,15 +2541,39 @@ console.log('\n== 32. loop fishbone: topology must enforce the cascade constrain
       /if \(bit === 0b0010\)[\s\S]{0,160}?this\.mask &= ~0b0100/.test(code),
       'otherwise angle loses its downstream and dumps expected-speed into the current stage');
 
-    /* --- 外层由拓扑得出 --- */
-    check('the outer loop is derived as the highest lit bit',
-      /bit > outerBit/.test(code),
-      'no separate outer control needed — the spine gives it for free');
+    /*
+     * --- 外层环不在页面里推 ---
+     * 2026-10-14 底部信息行删除后,fishbone 不再算 outerBit:它只维护掩码,
+     * 由 ui.js 把整个掩码作为 bind 的 `outerLoop` 字段下发,固件按
+     * close_loop_type 的最高位环执行串级(DJIMotorControl)。
+     * "掩码最高位 = 外层环"由**二进制编码本身**保证
+     * (电流 0b0001 < 速度 0b0010 < 位置 0b0100,上面三条已钉住),
+     * 页面再推一遍属于重复实现。
+     * @attention 别把它"恢复"成页面也算一次 outerBit —— 两处各算迟早不一致。
+     */
+    check('the page no longer re-derives the outer loop',
+      !/outerBit|outerName/.test(code),
+      'the mask is the single truth; the firmware decides the outer loop from it');
 
     /* --- 暗/亮态 --- */
     check('nodes toggle an is-on class', /classList\.toggle\('is-on'/.test(code));
     check('locked nodes are not clickable', /node\.disabled = true/.test(code));
-    check('the composed mask is echoed to the UI', /data-role="fbMask"/.test(fb));
+    /*
+     * ---- 底部信息行(外层/说明/0bXXXX 掩码)已整行删除(2026-10-14 用户裁定) ----
+     * 断言"删干净"必须在**剥注释后**的 code 上判(注释里必然提到这些类名)。
+     */
+    check('the bottom meta row is gone (outer / note / mask)',
+      !/fb-meta|fb-outer|fb-note|fb-mask/.test(code),
+      'removed on 2026-10-14 — do not re-add without asking the user');
+    check('getMask() is still the single source of the composed mask',
+      /getMask\(\)\s*\{[\s\S]{0,80}?return this\.mask/.test(code),
+      'the bind payload still comes from here even though the page shows nothing');
+    check('the flow direction moved into the node tooltip',
+      /el\.title = [\s\S]{0,160}?n\.note/.test(code),
+      'after the meta row went, title is the only place stating what feeds what');
+    check('every node keeps a note naming its output target',
+      NODE_NOTE_COUNT === 3,
+      '电流环→电调 / 速度环→电流环 / 位置环→速度环,一条都不能少');
   }
 
   /* --- ui.js 接线 --- */
@@ -2661,18 +2692,20 @@ console.log('\n== 33. PID card stays inline; picking a loop switches it ==');
   }
 
   if (css) {
+    /* 判"某规则已不存在"必须剥注释 —— 说明注释里正是会写出 `.pid-float` 的地方 */
+    const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
     check('no .pid-float rules remain',
-      !/\.pid-float/.test(css),
+      !/\.pid-float/.test(cssNoComments),
       'leftover absolute positioning would break layout again');
     check('.pid-panel is in normal flow (no absolute)',
       !/position:\s*absolute/.test(cssBody(css, '.pid-panel') || ''));
     /*
-     * 鱼骨图仍保留 flex-wrap —— 之前 fb-meta 不换行的排版问题,
-     * 修了就不能再退回去。
+     * 鱼骨图仍保留 flex-wrap:窄卡片下"设定 + 三个节点 + 电调"会挤,
+     * 必须能换行。底部信息行虽然删了,这条排版保护不能跟着退回去。
      */
-    check('the fishbone still wraps so the meta row drops down',
+    check('the fishbone still wraps under a narrow card',
       /flex-wrap:\s*wrap/.test(cssBody(css, '.loop-fishbone') || ''),
-      'the meta row used to squeeze next to the nodes');
+      'without it the spine squeezes instead of wrapping');
   }
 
   if (fb) {
@@ -2969,6 +3002,105 @@ console.log('\n== 36. 静态 ID 冲突面板已移除;动态提示不得被牵�
     /0x200\+ID/.test(MBResultText[MBResult.DUPLICATE]));
   check('board NO_RESOURCE still names the 14-per-bus limit',
     /14 颗/.test(MBResultText[MBResult.NO_RESOURCE]));
+}
+
+console.log('\n== 37. 串口与添加电机并成一行;鱼骨图底部信息行整行删除 ==');
+{
+  /*
+   * 用户裁定(2026-10-14)两件事:
+   *   ① 「添加电机和串口连接放到同一行」—— 原先两条整宽横条并成一条
+   *      .panel.setup,内部左右两组、中间一条竖分隔线;
+   *   ② 「删除外层位置环…」—— 鱼骨图底部那行常驻文字(外层环 / 流向说明 /
+   *      合成掩码 0bXXXX)**整行删除**。三层信息各归其处:
+   *        外层环 → 节点亮暗直接可见;
+   *        流向说明 → 移进节点 title(悬停可见,常驻文字才是要删的);
+   *        掩码 → getMask() 照旧算出并随 bind 下发,只是不再显示。
+   *
+   * 【本组真正要防的两类错误】
+   *   A. 合并布局时**弄丢控件或改掉 id** —— ui.js 全按 id 取元素,
+   *      丢一个就是运行时 null 崩溃,而页面看上去只是"少了个按钮",极易漏检;
+   *   B. 删显示时**连带删掉逻辑** —— 掩码只是不再显示,getMask()/outerLoop
+   *      必须原样保留,否则绑定就退化成默认闭环。
+   */
+  let html, css, fb, ui;
+  try {
+    const b = new URL('./', import.meta.url);
+    html = readFileSync(new URL('index.html', b), 'utf8');
+    css = readFileSync(new URL('style.css', b), 'utf8');
+    fb = readFileSync(new URL('fishbone.js', b), 'utf8');
+    ui = readFileSync(new URL('ui.js', b), 'utf8');
+  } catch { console.log('  SKIP  sources not reachable'); }
+
+  const htmlCode = (html || '').replace(/<!--[\s\S]*?-->/g, '');
+  const cssCode = (css || '').replace(/\/\*[\s\S]*?\*\//g, '');
+  const fbCode = (fb || '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const uiCode = (ui || '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  if (html) {
+    /* ---- ① 同一行 ---- */
+    check('there is exactly one merged setup panel',
+      (htmlCode.match(/class="panel setup"/g) || []).length === 1);
+    check('the two old full-width bars are gone',
+      !/class="panel serial"/.test(htmlCode) && !/class="panel addmotor"/.test(htmlCode),
+      'both used to be separate <section>s stacked one per row');
+    check('it holds two groups with one divider between them',
+      (htmlCode.match(/class="setup-group"/g) || []).length === 2
+      && /class="setup-sep"/.test(htmlCode));
+
+    /*
+     * 十个控件 id 一个都不能少、一个字都不能改。
+     * @attention 这是本组的核心断言:布局随便改,id 改了就是崩溃。
+     */
+    const ids = ['portSelect', 'refreshPorts', 'openPort', 'closePort', 'rescan',
+      'addKind', 'addBus', 'addId', 'addMotor', 'addMsg'];
+    const missing = ids.filter((id) => !htmlCode.includes(`id="${id}"`));
+    check('all ten control ids survived the merge',
+      missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : '');
+
+    check('the serial group comes first, 添加电机 second',
+      htmlCode.indexOf('id="portSelect"') < htmlCode.indexOf('添加电机')
+      && htmlCode.indexOf('添加电机') < htmlCode.indexOf('id="addMotor"'));
+    check('the live add-result message stays inside the add group',
+      /id="addMotor"[\s\S]{0,120}?id="addMsg"/.test(htmlCode),
+      'addMsg is where conflicts/ack text shows up — it must stay next to 添加');
+
+    /* ---- ② 底部信息行 ---- */
+    check('no fishbone meta markup remains anywhere',
+      !/fb-meta|fb-outer|fb-note|fb-mask|fbOuter|fbNote|fbMask/.test(htmlCode + fbCode),
+      '判"已删除"必须在剥注释后的文本上判(说明注释里必然提到这些名字)');
+  }
+
+  if (css) {
+    check('no dead .fb-meta family rules remain',
+      !/\.fb-(meta|outer|note|mask)\b/.test(cssCode),
+      'a rule whose class no longer exists is a silently dead selector');
+    check('the merged panel is a wrapping flex row',
+      /display:\s*flex/.test(cssBody(css, '.panel.setup') || '')
+      && /flex-wrap:\s*wrap/.test(cssBody(css, '.panel.setup') || ''));
+    check('each group is itself a flex row so a group is never split mid-way',
+      /display:\s*flex/.test(cssBody(css, '.setup-group') || ''));
+    check('the divider is a 1px decorative rule',
+      /width:\s*1px/.test(cssBody(css, '.setup-sep') || ''));
+    check('the old .panel.serial / .panel.addmotor rules are gone',
+      !/\.panel\.(serial|addmotor)\b/.test(cssCode));
+  }
+
+  /* ---- 删的是显示,不是逻辑 ---- */
+  if (fb) {
+    check('getMask() still returns the composed mask',
+      /getMask\(\)\s*\{[\s\S]{0,80}?return this\.mask/.test(fbCode),
+      'the bind payload depends on it');
+    check('no writes to the removed meta elements',
+      !/this\._(outer|note|mask)El/.test(fbCode));
+    check('the loop state machine is untouched by the removal',
+      /if \(bit === 0b0100\)[\s\S]{0,140}?this\.mask \|= 0b0010/.test(fbCode)
+      && /if \(bit === 0b0010\)[\s\S]{0,160}?this\.mask &= ~0b0100/.test(fbCode));
+  }
+  if (ui) {
+    check('bind still carries the mask as outerLoop',
+      /outerLoop:\s*mask/.test(uiCode) && /const mask = readLoopMask\(i\)/.test(uiCode),
+      'the page stopped showing it, the protocol must not stop sending it');
+  }
 }
 
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);

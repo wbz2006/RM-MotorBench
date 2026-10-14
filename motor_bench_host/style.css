@@ -94,9 +94,20 @@ body {
   transform: scale(0.97);
 }
 
-/* ---------- 串口面板 ---------- */
+/*
+ * ---------- 串口连接 + 添加电机:同一行(2026-10-14 用户要求) ----------
+ *
+ * 原先 .panel.serial 与 .panel.addmotor 是两条独立整宽横条(各带 border-bottom),
+ * 上下叠着各占一行。合并成一条 .panel.setup,内部用 .setup-group 分两组:
+ * 左半"连接"(选串口/刷新/打开/关闭/重取清单)、右半"登记"(型号/总线/ID/添加)。
+ *
+ * 换行策略:容器与组**都**允许 wrap ——
+ *   - 窗宽不够时整组换到下一行(组是 flex 子项,不会被拆散);
+ *   - 组内自己太挤时,组内再换行。
+ * 所以不会出现"串口"标签和它的按钮被分到两行的情况。
+ */
 
-.panel.serial {
+.panel.setup {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -106,7 +117,23 @@ body {
   flex-wrap: wrap;
 }
 
-.panel.serial label {
+.setup-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* 两组之间的竖分隔线(纯装饰) */
+.setup-sep {
+  flex: none;
+  width: 1px;
+  align-self: stretch;
+  min-height: 22px;
+  background: var(--line);
+}
+
+.panel.setup label {
   font-size: 13px;
   color: var(--muted);
   display: flex;
@@ -114,33 +141,14 @@ body {
   gap: 8px;
 }
 
-/* ---- 动态添加电机 ---- */
-.panel.addmotor {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 18px;
-  background: var(--panel-2);
-  border-bottom: 1px solid var(--line);
-  flex-wrap: wrap;
-}
-
-.panel.addmotor .panel-title {
+.panel.setup .panel-title {
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
   letter-spacing: 0.5px;
 }
 
-.panel.addmotor label {
-  font-size: 13px;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.panel.addmotor input[type='number'] {
+.panel.setup input[type='number'] {
   width: 68px;
   padding: 6px 8px;
 }
@@ -610,7 +618,7 @@ button:disabled {
    */
   display: flex;
   align-items: center;
-  flex-wrap: wrap; /* 允许 fb-meta 掉到下一行 */
+  flex-wrap: wrap; /* 窄卡片下"设定 + 三个节点 + 电调"要能换行 */
   gap: 6px;
   font-size: 12px;
 }
@@ -707,38 +715,18 @@ button:disabled {
   opacity: 0.75;
 }
 
-/* 底部信息行:外层环 + 说明 + 合成掩码 */
-.fb-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1 1 100%;
-  margin-top: 2px;
-  padding-top: 5px;
-  border-top: 1px dashed var(--line);
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.fb-outer b {
-  color: var(--text);
-}
-
-.fb-note {
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fb-mask {
-  flex: none;
-  padding: 1px 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-}
+/*
+ * 鱼骨图底部信息行(外层环 + 流向说明 + 合成掩码 0bXXXX)已于 2026-10-14
+ * 按用户要求**整行删除**,对应的 .fb-meta / .fb-outer / .fb-note / .fb-mask
+ * 四条规则一并清除(留着的类名没有任何 DOM 会命中,是死样式)。
+ *
+ * 三层信息的归处:
+ *   - 外层环 → 亮到第几级图上直接看得见,不需要文字重复一遍
+ *   - 流向说明 → 写进每个节点的 title,悬停即见(常驻文字才是要删的东西)
+ *   - 合成掩码 → 仍由 getMask() 算出并随 bind 下发,只是不再显示
+ *
+ * @attention 别因为"页面上看不到掩码了"就把这行加回来。
+ */
 
 /*
  * PID 面板的标题。

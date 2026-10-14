@@ -19,47 +19,62 @@
       <button id="estop" class="estop" title="立即停止全部电机">急停 ALL STOP</button>
     </header>
 
-    <section class="panel serial">
-      <label>
-        串口
-        <select id="portSelect">
-          <option value="">点击刷新…</option>
-        </select>
-      </label>
-      <button id="refreshPorts">刷新</button>
-      <button id="openPort">打开</button>
-      <button id="closePort" class="ghost">关闭</button>
-      <button id="rescan" class="ghost">重新获取电机清单</button>
-    </section>
-
     <!--
-      动态添加电机:板端启动后清单为空,需在此按"实际电调拨码 ID"现场添加。
-      这是"换电机不用重烧固件"的入口。
+      串口连接与添加电机**合到同一行**(2026-10-14 用户要求)。
+
+      原先两块各占一条整宽横条(各带一条 border-bottom)、上下叠着,但它们其实
+      只服务于同一件事:把一颗电机接上并让板子认它 ——
+      "连上板子" → "告诉板子挂了什么电机"。所以并成一行,中间用一条竖线分隔:
+      左半是连接,右半是登记。
+
+      添加电机是**运行期热插拔**入口:板端启动后清单为空,
+      需在此按"实际电调拨码 ID"现场添加 —— 这是"换电机不用重烧固件"的入口。
+
+      @attention 控件 id 一个都不能改(#portSelect / #refreshPorts / #openPort /
+        #closePort / #rescan / #addKind / #addBus / #addId / #addMotor / #addMsg),
+        ui.js 直接按 id 取元素;这里只改布局,不改接线。
     -->
-    <section class="panel addmotor">
-      <span class="panel-title">添加电机</span>
-      <label>
-        型号
-        <select id="addKind">
-          <option value="1">大疆 GM6020</option>
-          <option value="2">大疆 M3508</option>
-          <option value="3">大疆 M2006</option>
-          <option value="4">达妙 DM 系列</option>
-        </select>
-      </label>
-      <label>
-        总线
-        <select id="addBus">
-          <option value="1">CAN1</option>
-          <option value="2">CAN2</option>
-        </select>
-      </label>
-      <label>
-        电调 ID
-        <input id="addId" type="number" min="1" max="8" value="1" />
-      </label>
-      <button id="addMotor">添加</button>
-      <span id="addMsg" class="hint"></span>
+    <section class="panel setup">
+      <div class="setup-group">
+        <label>
+          串口
+          <select id="portSelect">
+            <option value="">点击刷新…</option>
+          </select>
+        </label>
+        <button id="refreshPorts">刷新</button>
+        <button id="openPort">打开</button>
+        <button id="closePort" class="ghost">关闭</button>
+        <button id="rescan" class="ghost">重新获取电机清单</button>
+      </div>
+
+      <span class="setup-sep" aria-hidden="true"></span>
+
+      <div class="setup-group">
+        <span class="panel-title">添加电机</span>
+        <label>
+          型号
+          <select id="addKind">
+            <option value="1">大疆 GM6020</option>
+            <option value="2">大疆 M3508</option>
+            <option value="3">大疆 M2006</option>
+            <option value="4">达妙 DM 系列</option>
+          </select>
+        </label>
+        <label>
+          总线
+          <select id="addBus">
+            <option value="1">CAN1</option>
+            <option value="2">CAN2</option>
+          </select>
+        </label>
+        <label>
+          电调 ID
+          <input id="addId" type="number" min="1" max="8" value="1" />
+        </label>
+        <button id="addMotor">添加</button>
+        <span id="addMsg" class="hint"></span>
+      </div>
     </section>
 
     <!--
@@ -115,8 +130,10 @@
                 设定 → 位置环 → 速度环 → 电流环 → 电调
               (位置环输出"期望速度",速度环输出"期望电流",只有电流环的
                输出直接作为 CAN 电流值下发电调)—— 即数据沿主脊**从右往左**走。
-              箭头只表示"由内到外的层级展开";节点下的动态说明(fbNote)
-              会把当前真正流到哪一级、输出交给谁写出来。
+              箭头只表示"由内到外的层级展开";方向写在**悬停提示**里
+              (每个节点的 title、以及 设定/电调 两端的 title)。
+              底部那行常驻文字(外层环 / 说明 / 0bXXXX 掩码)已于 2026-10-14
+              按用户要求整行删除,不要再加回来。
 
             【为什么用鱼骨图】多环的本质是 pid_ref 顺次穿过各环的串级结构,
               勾选框是平的,表达不了"层级"和"必须经过"这两件事。

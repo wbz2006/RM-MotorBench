@@ -28,8 +28,14 @@
  *   实际串级始终是:
  *     设定 → 位置环(输出"期望速度") → 速度环(输出"期望电流") → 电流环 → 电调
  *   所以箭头只代表"由内到外的层级展开",不代表命令传递方向。
- *   数据此刻真正流到哪一级,由 fb-meta 的动态说明写出
- *   (取外层环的 note,见 NODES 的 note 字段) —— 不靠主脊方向暗示。
+ *   数据此刻真正流到哪一级、输出交给谁,写在**节点的悬停提示**里
+ *   (title 里的 note 字段,见 NODES) —— 不靠主脊方向暗示。
+ *
+ * @attention 底部那行常驻文字(外层环 / 流向说明 / 合成掩码 0bXXXX)
+ *   已于 2026-10-14 按用户要求**整行删除**,不要加回来。
+ *   - 外层环:看哪个节点亮着就行,不必再用文字重复;
+ *   - 掩码:getMask() 照旧算出并随 bind 下发,只是不再显示;
+ *   - 说明:常驻文字才是用户要删的东西,改成悬停可见。
  *
  * 【约束】
  *   - 电流环常亮(不可关闭):它是串级的**最后一级**,关掉就没有任何闭环;
@@ -144,10 +150,13 @@ export class LoopFishbone {
       if (n.locked) {
         node.classList.add('is-locked');
         node.disabled = true; /* 常亮节点不接受点击 */
-        node.title = `${n.name} — 常亮,不可关闭`;
-      } else {
-        node.title = `${n.name} — 点击${this.mask & n.bit ? '关闭' : '启用'}`;
       }
+      /*
+       * title(悬停提示)**统一由 _apply() 写**,这里不写。
+       *   底部说明行删掉后,悬停提示是唯一讲清"输出交给谁"的地方,
+       *   而它必须跟着点亮/关闭状态变文案 —— 放在 _apply 里一次到位,
+       *   两处各写一份迟早会互相覆盖(与 .pid-panel 重复定义同类的坑)。
+       */
       node.innerHTML =
         `<span class="fb-node-name">${n.name}</span>` +
         `<span class="fb-node-bit">0b${n.bit.toString(2).padStart(3, '0')}</span>`;
@@ -183,18 +192,17 @@ export class LoopFishbone {
     dst.innerHTML = '<span class="fb-dst-label">电调</span>';
     h.appendChild(dst);
 
-    /* ---- 外层标记 + 说明 ---- */
-    const meta = document.createElement('div');
-    meta.className = 'fb-meta';
-    meta.innerHTML =
-      '<span class="fb-outer">外层:<b data-role="fbOuter">--</b></span>' +
-      '<span class="fb-note" data-role="fbNote"></span>' +
-      '<span class="fb-mask" data-role="fbMask" title="合成后的 close_loop_type,可与固件 RTT 日志对照">0b0011</span>';
-    h.appendChild(meta);
-
-    this._outerEl = meta.querySelector('[data-role="fbOuter"]');
-    this._noteEl = meta.querySelector('[data-role="fbNote"]');
-    this._maskEl = meta.querySelector('[data-role="fbMask"]');
+    /*
+     * ---- 底部信息行(外层环 / 流向说明 / 合成掩码)已删除 ----
+     *
+     * 2026-10-14 用户裁定整行不要了。三层信息各有归处,不需要常驻文字:
+     *   - 外层环 → 图上亮到第几级直接看得见(且外层环 = 掩码最高位,
+     *     由 ui.js 随 bind 下发给板端,页面显示与否不影响协议);
+     *   - 流向说明 → 改写进**每个节点的 title**,悬停即见;
+     *   - 合成掩码 → getMask() 照旧算出,只是不再显示。
+     *
+     * @attention 别因为"页面上看不到当前掩码/外层环"就把这行加回来。
+     */
   }
 
   /**
@@ -234,48 +242,40 @@ export class LoopFishbone {
     this.onChange?.(this.mask);
   }
 
-  /** 把 mask 同步到 DOM(亮/暗、外层标记、说明) */
+  /**
+   * 把 mask 同步到 DOM(亮/暗 + 悬停提示)
+   *
+   * @attention 这里**不再**推外层环、也不再显示合成掩码 ——
+   *   底部信息行已于 2026-10-14 整行删除。
+   *   外层环这个概念仍然存在,但它归另外两处:
+   *     - ui.js 把 `outerLoop` 字段(值就是本掩码)随 bind 下发板端;
+   *     - 固件按"掩码里最高位的那个环"判定外层环。
+   *   页面上显示与否都不影响这条链路 —— 别为了"想看见"就在这儿加回来。
+   */
   _apply() {
     const nodes = this.host.querySelectorAll('.fb-node');
-    let outerName = '--';
-    let outerBit = 0;
 
     for (const el of nodes) {
       const bit = Number(el.dataset.bit);
       const on = (this.mask & bit) !== 0;
       el.classList.toggle('is-on', on);
       el.setAttribute('aria-pressed', on ? 'true' : 'false');
-      /*
-       * 外层环 = 掩码中**最高位**的亮节点。
-       * @attention 按 **位值**比较,不按 DOM 顺序 ——
-       *   所以 2026-10-14 把位置环与电流环对调后,这里依然算得对
-       *   (位置 0b0100 最高,速度 0b0010 次之,电流 0b0001 最低)。
-       *   不要改成"取最后一个亮节点"之类的按位置写法。
-       */
-      if (on && bit > outerBit) {
-        outerBit = bit;
-        outerName = el.querySelector('.fb-node-name').textContent;
-      }
     }
 
-    this._outerEl.textContent = outerName;
-
     /*
-     * 说明:取外层环的 note,讲清数据此刻真正流到哪一级。
-     * @attention 主脊箭头已不代表信号方向,这句话是**唯一**说明真实流向的地方,
-     *   所以每条 note 都必须写明输出交给谁。
+     * 悬停提示 = 状态文案 + 该环的 note。
+     *
+     * @attention 主脊箭头已不代表信号方向,note 是**唯一**讲清
+     *   "这一级输出交给谁"的地方,所以每条 note 都必须写明去向。
+     *   常亮节点也写:它 disabled 不接受点击,但悬停仍能看到 title。
      */
-    const top = NODES.find((n) => n.bit === outerBit);
-    this._noteEl.textContent = top ? top.note : '';
-
-    this._maskEl.textContent = `0b${this.mask.toString(2).padStart(4, '0')}`;
-
-    /* 更新可点击节点的 title(启用/关闭文案) */
     for (const el of nodes) {
-      if (el.classList.contains('is-locked')) continue;
       const bit = Number(el.dataset.bit);
       const n = NODES.find((x) => x.bit === bit);
-      el.title = `${n.name} — 点击${this.mask & bit ? '关闭' : '启用'}`;
+      const state = el.classList.contains('is-locked')
+        ? '常亮,不可关闭'
+        : `点击${this.mask & bit ? '关闭' : '启用'}`;
+      el.title = `${n.name} — ${state}。${n.note}`;
     }
   }
 
