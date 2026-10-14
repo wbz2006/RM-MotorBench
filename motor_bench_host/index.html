@@ -77,16 +77,19 @@
         <header>
           <span class="ch-title">通道</span>
           <!--
-            解绑放在标题行、状态徽章之前(2026-10-13 用户要求)。
+            绑定 / 解绑 **都在标题行**(2026-10-14 用户指出不对称)。
 
-            原先在 bind-row 里和「绑定」并排,混在"选电机 + 选闭环"那组里,
-            语义上属于"通道级操作"而不是"配置操作" —— 提到标题行更合理,
-            且始终可见(不会因 bind-row 换行被挤到看不见)。
+            此前只把解绑提上来、绑定仍留在 bind-row 里,结果标题行有解绑、
+            下面一行有绑定 —— 同一类操作被拆在两个地方,看着像漏改。
+            现在两个动作都在标题行,顺序按使用频次排:绑定在前、解绑在后。
 
-            放在徽章**之前**是刻意的:徽章(未绑定/已绑定/运行中)是状态显示,
-            操作按钮应在状态之前,符合"操作 → 状态"的阅读顺序。
+            徽章(未绑定/已绑定/运行中)仍贴最右:操作按钮在状态之前,
+            符合"操作 → 状态"的阅读顺序。
+
+            bind-row 于是只剩**配置项**(选电机 + 选闭环),职责更单纯。
           -->
-          <button data-role="unbind" class="ghost unbind-btn">解绑</button>
+          <button data-role="bind" class="ch-act">绑定</button>
+          <button data-role="unbind" class="ghost ch-act">解绑</button>
           <span class="badge" data-role="status">未绑定</span>
         </header>
 
@@ -109,7 +112,6 @@
               关掉就只剩"位置/速度环输出直接当电流值下发"的危险组合。
           -->
           <div class="loop-fishbone" data-role="loopPicker"></div>
-          <button data-role="bind">绑定</button>
         </div>
 
         <!--

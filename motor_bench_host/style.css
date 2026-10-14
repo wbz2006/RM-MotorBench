@@ -235,18 +235,18 @@ button:disabled {
 
 .channel header {
   /*
-   * @attention 原本是 space-between,现在标题行有三个元素
-   *   (通道名 / 解绑 / 状态徽章),space-between 会把它们均匀撑开。
-   *   改用 gap + 徽章 margin-left:auto:
-   *     通道名靠左、解绑紧随其后、徽章贴右 —— 层次更清楚。
+   * @attention 不能用 space-between:标题行有四个元素
+   *   (通道名 / 绑定 / 解绑 / 状态徽章),space-between 会把它们均匀撑开,
+   *   按钮之间出现大片空隙。改用 gap + 徽章 margin-left:auto:
+   *     通道名与两个按钮紧凑靠左、徽章贴右。
    */
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-/* 解绑按钮:比常规按钮小一号,避免抢标题的视觉重量 */
-.unbind-btn {
+/* 标题行的操作按钮(绑定/解绑):比正文按钮小一号,不抢标题的视觉重量 */
+.ch-act {
   padding: 2px 8px;
   font-size: 11px;
 }
@@ -257,7 +257,7 @@ button:disabled {
 }
 
 .badge {
-  /* 贴右:标题行是「通道名 / 解绑 / 徽章」,徽章推到最右 */
+  /* 贴右:标题行是「通道名 / 绑定 / 解绑 / 徽章」,徽章推到最右 */
   margin-left: auto;
   font-size: 12px;
   padding: 3px 9px;

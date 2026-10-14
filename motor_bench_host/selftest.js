@@ -2679,5 +2679,88 @@ console.log('\n== 33. PID card stays inline; picking a loop switches it ==');
   }
 }
 
+console.log('\n== 34. 通道操作按钮归位;急停单击即停 ==');
+{
+  /*
+   * 两条用户裁定(2026-10-14),都要锁死:
+   *
+   * 【一】绑定与解绑**必须同在标题行**。
+   *   此前只把解绑提上来,绑定仍留在 bind-row,于是同一类操作被拆在两处:
+   *   标题行有"解绑",下面一行有"绑定",看起来就像漏改。
+   *   归位后 bind-row 只剩**配置项**(选电机 + 选闭环),职责单一。
+   *
+   * 【二】急停**不得有二次确认**。
+   *   原实现是 `if (confirm('确定要立即停止全部电机吗?'))`。这与急停语义直接冲突:
+   *     1. 急停是时间敏感动作,多一步点击就多一份危险;
+   *     2. 原生 confirm **阻塞主线程**,弹窗期间页面卡死,
+   *        遥测渲染与状态刷新全停 —— 恰恰在最需要看状态的时候瞎掉。
+   *   误触急停的代价只是"电机停了,重新使能即可";
+   *   急停迟钝的代价可能是设备或人身伤害。两者不对等,所以不给急停加确认。
+   *
+   *   @note 解绑、使能两处确认**是刻意保留的**,数量固定为 2:
+   *     - 解绑:破坏性且不可逆(要重新绑定才能用),值得确认;
+   *     - 使能:设定值非 0 时电机立即转动,属于"预告危险"的互锁。
+   *   它们都不是时间敏感动作,与急停不同类。
+   */
+  let html, ui, css;
+  try {
+    const b = new URL('./', import.meta.url);
+    html = readFileSync(new URL('index.html', b), 'utf8');
+    ui = readFileSync(new URL('ui.js', b), 'utf8');
+    css = readFileSync(new URL('style.css', b), 'utf8');
+  } catch { console.log('  SKIP  sources not reachable'); }
+
+  if (html) {
+    /* 只截通道模板内部的 header,避免和页面顶栏 <header class="topbar"> 混淆 */
+    const tpl = html.slice(html.indexOf('id="channelTpl"'));
+    const hdr = tpl.slice(tpl.indexOf('<header>'), tpl.indexOf('</header>'));
+    const br = tpl.slice(tpl.indexOf('<div class="bind-row">'), tpl.indexOf('class="pid-panel"'));
+
+    check('the channel header holds the bind button', /data-role="bind"/.test(hdr),
+      'it used to sit down in bind-row while unbind was up here');
+    check('the channel header holds the unbind button', /data-role="unbind"/.test(hdr));
+    check('bind comes before unbind', hdr.indexOf('data-role="bind"') < hdr.indexOf('data-role="unbind"'),
+      'bind is the more frequent action, so it goes first');
+    check('the status badge stays last', hdr.indexOf('data-role="status"') > hdr.indexOf('data-role="unbind"'),
+      'reading order must be actions → state');
+
+    check('bind-row no longer carries the bind button', !/data-role="bind"/.test(br),
+      'splitting the two actions across rows is what the user flagged');
+    check('bind-row keeps the motor select', /data-role="motor"/.test(br));
+    check('bind-row keeps the fishbone picker', /loopPicker/.test(br));
+
+    check('the top-bar estop button is present', /id="estop"/.test(html));
+  }
+
+  if (css) {
+    check('both header actions share one compact style (.ch-act)', /\.ch-act\s*\{/.test(css));
+    check('the one-sided .unbind-btn rule is gone', !/\.unbind-btn\s*\{/.test(css),
+      'it styled only unbind, which is how the asymmetry got hidden');
+    check('no unbind-btn class name remains anywhere', !/unbind-btn/.test(css) && !/unbind-btn/.test(html || ''));
+    check('header does not use space-between',
+      !/\.channel header\s*\{[\s\S]{0,200}?justify-content:\s*space-between/.test(css),
+      'four children would be spread apart with gaps between the buttons');
+  }
+
+  if (ui) {
+    const code = ui.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const estopFn = code.match(/\$\('#estop'\)\.onclick[\s\S]{0,300}?;/);
+
+    check('an estop handler is wired', !!estopFn);
+    if (estopFn) {
+      check('ESTOP HAS NO CONFIRMATION DIALOG', !/confirm/.test(estopFn[0]),
+        'a modal blocks the main thread and delays the stop — unfit for an emergency stop');
+      check('the estop sends stopAll directly',
+        /send\(\{ type: 'stopAll' \}\)/.test(estopFn[0]));
+    }
+    /* 刻意保留的确认只有解绑 + 使能两处;多一处说明又有人给急停之类加了门槛 */
+    check('exactly 2 deliberate confirms remain (unbind + enable)',
+      (code.match(/confirm\(/g) || []).length === 2,
+      `found ${(code.match(/confirm\(/g) || []).length}`);
+    check('the enable interlock is still there',
+      /该通道当前设定值不为 0/.test(ui), 'must warn before a motor jumps to speed');
+  }
+}
+
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);
