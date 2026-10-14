@@ -2479,10 +2479,13 @@ console.log('\n== 32. loop fishbone: topology must enforce the cascade constrain
    *   2. 外层是位置环时必须同时开速度环 —— 位置环输出的"期望速度"
    *      若没有速度环接住,会直接当作电流参考下发,电机疯转。
    *
-   * 鱼骨图把这两条变成**拓扑事实**:
-   *   主脊 = 设定 → 位置 → 速度 → 电流 → 电调,
-   *   位置环在速度环上游,想启用位置必然先经过速度;
-   *   最上游的亮节点就是外层环,不必再单选。
+   * 鱼骨图把这两条交给**联动代码**保证:
+   *   主脊(2026-10-14 位置环与电流环对调后)= 设定 → 电流 → 速度 → 位置 → 电调,
+   *   这是"由内到外"的**展示顺序,不是信号流向** ——
+   *   真实串级仍是 设定 → 位置 → 速度 → 电流 → 电调,
+   *   数据沿主脊**从右往左**走,由节点下的动态说明写出来。
+   *   约束靠 _toggle 显式联动(点亮位置必带速度、关速度必连带关位置),
+   *   不再由节点位置保证 —— 所以本组要同时钉住"顺序"和"联动"两件事。
    */
   let fb;
   try {
@@ -2497,6 +2500,25 @@ console.log('\n== 32. loop fishbone: topology must enforce the cascade constrain
     check('speed node bit is 0b0010', /bit:\s*0b0010/.test(code));
     check('current node bit is 0b0001', /bit:\s*0b0001/.test(code));
 
+    /*
+     * ---- 节点排列:2026-10-14 用户裁定"位置环和电流环位置对调" ----
+     * NODES 的先后就是主脊从左到右的渲染顺序,即**由内环到外环**:
+     *   电流环(0b0001) → 速度环(0b0010) → 位置环(0b0100)
+     * 这里按源码下标断言,防止后续编辑把顺序悄悄改回去 ——
+     * 顺序本身不参与任何判定(全部按位值),所以它只能靠断言守住。
+     */
+    {
+      const iCur = code.indexOf('bit: 0b0001');
+      const iSpd = code.indexOf('bit: 0b0010');
+      const iAng = code.indexOf('bit: 0b0100');
+      check('node order is current → speed → angle (inner to outer, user ruling)',
+        iCur > 0 && iCur < iSpd && iSpd < iAng,
+        `source order — current@${iCur} speed@${iSpd} angle@${iAng}`);
+      check('the 设定 endpoint tooltip states the real flow direction',
+        /从右往左/.test(fb),
+        'the spine is inner→outer, so the endpoints must not be read as a signal path');
+    }
+
     check('the current loop is locked (always on)',
       /bit:\s*0b0001[\s\S]{0,220}?locked:\s*true/.test(code),
       'it is the last stage; disabling it leaves raw loop output as the current command');
@@ -2507,7 +2529,7 @@ console.log('\n== 32. loop fishbone: topology must enforce the cascade constrain
     /* --- 拓扑约束 --- */
     check('enabling the angle loop also enables the speed loop',
       /if \(bit === 0b0100\)[\s\S]{0,140}?this\.mask \|= 0b0010/.test(code),
-      'angle sits upstream of speed in the spine — that is the whole point');
+      'this code is now the ONLY thing enforcing it — the spine no longer encodes direction');
     check('disabling the speed loop also disables the angle loop',
       /if \(bit === 0b0010\)[\s\S]{0,160}?this\.mask &= ~0b0100/.test(code),
       'otherwise angle loses its downstream and dumps expected-speed into the current stage');
