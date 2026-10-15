@@ -2,7 +2,7 @@
 
 > 机械组自己就能测电机——不用再找电控组烧程序。
 
-一套面向 RoboMaster 实验室的电机测试台：通过**浏览器页面**设定电机种类与转速，指令经 **USB 虚拟串口**下发到永久烧录固件的**大疆 A 型开发板**，由 A 板驱动 CAN 总线上的大疆/达妙电机，并**实时回传**转速、电流、温度。
+一套面向 RoboMaster 实验室的电机测试台：通过**浏览器页面**设定电机种类与转速，指令经 **USB 虚拟串口**下发到**大疆 A 板或 C 板**，驱动 CAN 总线上的大疆/达妙电机，并**实时回传**转速、电流、温度。网页支持切换 **网页控制 / DT7、DR16 遥控器控制**。
 
 **核心特性：换电机不需要改配置表、不需要重新烧固件。** 按电调拨码开关上的实际 ID，在网页上现场添加即可。
 
@@ -17,7 +17,7 @@
 ## 系统架构
 
 ```
-浏览器 ──WebSocket──> Node 服务 ──USB 虚拟串口──> A 板 ──CAN──> 电机
+浏览器 ──WebSocket──> Node 服务 ──USB 虚拟串口──> A/C 板 ──CAN──> 电机
                                                     │
                                               遥测实时回传
 ```
@@ -27,7 +27,7 @@
 | 前端 | 原生 Web UI（无框架依赖） |
 | 桥接 | Node + WebSocket + serialport |
 | 传输 | USB OTG FS（CDC 虚拟串口，VID:PID = `0483:00CA`） |
-| 控制 | A 板 STM32F427IIH6 + FreeRTOS |
+| 控制 | A 板 STM32F427IIH6 / C 板 STM32F407IGH6 + FreeRTOS |
 | 驱动 | CAN 总线，支持 DJI M3508/M2006/GM6020、达妙 DM-4310 |
 
 ---
@@ -37,16 +37,34 @@
 | 目录 | 说明 |
 |---|---|
 | [`basic_framework_atype_usb-master`](basic_framework_atype_usb-master) | **固件工程**（主工程）。基于跃鹿 `basic_framework` 的 A 板适配版，新增 USB CDC 与动态建电机 |
+| [`basic_framework_ctype_usb-master`](basic_framework_ctype_usb-master) | **C 板固件**。基于指定参考工程的 F407 板级配置，配套相同网页和遥控器控制 |
 | [`motor_bench_host`](motor_bench_host) | **上位机**。Node 服务（WebSocket 桥接串口）+ 原生 Web UI |
 | `电机测试台方案.md` | 完整方案文档（设计推导、协议定义、排查记录） |
-| [`basic_framework_atype_usb-master/USB排障指南.md`](basic_framework_atype_usb-master/USB排障指南.md) | USB 枚举失败（电脑报"无法识别的USB设备"）的 RTT 诊断步骤 |
-| [`basic_framework_atype_usb-master/CAN_ID冲突说明.md`](basic_framework_atype_usb-master/CAN_ID冲突说明.md) | CAN ID 冲突规则、推荐接法、实测触发与排障 |
 
 ---
 
 ## 快速开始
 
 ### 1. 编译并烧录固件
+
+#### 在 VS Code 中烧录（本机已配置）
+
+1. 在 VS Code 中直接打开要使用的板型工程目录：A 板为 `basic_framework_atype_usb-master`，C 板为 `basic_framework_ctype_usb-master`。要同时使用两个工程，打开上一级目录的 `RM-MotorBench.code-workspace`，其中已包含总工程、A 板和 C 板三个根目录。
+2. 开发板正常供电，使用 CMSIS-DAP 或 J-Link 通过 SWD 接口连接开发板和电脑。
+3. 按 `Ctrl+Shift+P`，运行 `Tasks: Run Task`（任务：运行任务），选择下载器对应的烧录任务。单独打开板型目录时只显示本板的三个任务；打开工作区时可选择两板的任务：
+   - `MotorBench: 烧录 A 板（CMSIS-DAP）`
+   - `MotorBench: 烧录 C 板（CMSIS-DAP）`
+   - `MotorBench: 烧录 A 板（J-Link）`
+   - `MotorBench: 烧录 C 板（J-Link）`
+4. 任务先编译所选板的固件，编译成功后自动写入、校验、复位运行；编译失败则停止烧录。终端出现 `Verified OK` 且任务退出码为 `0` 表示成功。
+
+仅编译时按 `Ctrl+Shift+B`，选择 `MotorBench: 编译 A 板` 或 `MotorBench: 编译 C 板`。这些任务使用 VS Code 内置功能，无需额外扩展；F5 调试不在此配置中。
+
+配置分别位于 `basic_framework_atype_usb-master/.vscode/tasks.json` 和 `basic_framework_ctype_usb-master/.vscode/tasks.json`，由各板目录独立维护，不需要额外烧录脚本。仅打开包含两个板目录的总工程文件夹时，VS Code 不会自动读取子目录的任务，请打开板型目录或上述工作区。
+
+已使用本机路径：Make 为 `D:/mingw/mingw64/bin/mingw32-make.exe`，ARM GCC 为 `D:/Arm_GNU_Toolchain/13.3 rel1/bin`，OpenOCD 为 `D:/hanako/xpack-openocd-0.12.0-7/bin/openocd.exe`，脚本目录为 `D:/hanako/xpack-openocd-0.12.0-7/openocd/scripts`。更换电脑或移动这些工具时，修改对应板任务的 `command`、编译任务的 `options.env.PATH` 和烧录任务的 `-s` 参数。
+
+#### 命令行编译
 
 ```powershell
 cd basic_framework_atype_usb-master
@@ -56,6 +74,8 @@ mingw32-make -j4
 ```
 
 产物：`build/basic_framework_ATYPE.hex`，烧录到 A 板。
+
+C 板进入 `basic_framework_ctype_usb-master` 执行相同构建命令，烧录 `build/basic_framework_CTYPE.hex`。C 板引脚、时钟和接收机说明见该目录 README。
 
 ### 2. 启动上位机
 
@@ -74,6 +94,8 @@ npm start
 3. 网页选择串口 → 打开
 4. 「添加电机」填：型号 / 总线 / 电调 ID
 5. 通道卡片里选电机 → 绑定 → 使能 → 拖动滑块设转速
+
+网页模式也可先输入目标转速，再使能；运行中输入框和滑块均可修改转速。遥控模式在「控制方式」面板选择通道和最大转速，点「应用控制方式」，右拨杆上档、右摇杆回中后使能。A 板 DR16 使用 USART1，C 板使用 USART3。切换来源、遥控器掉线和急停都会停止输出，恢复后须重新使能；两种模式均须保持 USB 心跳。
 
 ---
 
@@ -131,6 +153,8 @@ npm start
 | INVENTORY_QUERY | `0x07` | 下行 | 查询电机清单 |
 | **MOTOR_ADD** | `0x08` | 下行 | **动态创建电机** |
 | MOTOR_REMOVE | `0x09` | 下行 | 移除电机 |
+| CONTROL_SOURCE | `0x0D` | 下行 | 选择网页/遥控器来源、通道和最大转速 |
+| CONTROL_REPORT | `0x8E` | 上行 | 来源、遥控器在线、摇杆、回中门闩与转速限幅 |
 | TELEMETRY | `0x81` | 上行 | 遥测上报 |
 | INVENTORY_REPORT | `0x82` | 上行 | 清单应答 |
 | MOTOR_ADD_ACK | `0x8A` | 上行 | 建电机结果 |
@@ -152,7 +176,8 @@ npm run test:integration  # 与固件 CRC 表逐字节交叉校验
 ## 已知限制
 
 - 电机清单在断电后不保留，重新上电需在网页重新添加（CAN 过滤器为启动期硬件资源）
-- PID 当前为实验室通用经验值，实际电机需按型号整定
+- PID 默认值沿用现有参数，实际电机需按型号和负载整定
+- 电机清单和控制通道均最多 8 个；DM 默认反馈 Master ID 为 0，每条 CAN 总线最多一台 DM，DM 暂不支持网页 PID 设置/查询
 - 同总线 6020 与 3508/2006 不能共存（见上文 ID 规则）
 
 ---

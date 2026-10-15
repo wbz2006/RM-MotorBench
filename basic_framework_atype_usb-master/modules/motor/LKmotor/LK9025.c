@@ -29,17 +29,11 @@ static void LKMotorDecode(CANInstance *_instance)
 
     measure->angle_single_round = ECD_ANGLE_COEF_LK * measure->ecd;
 
-    /*
-     * @attention 【2026-10-13】仅把宏名加上 LK_ 前缀(消除与其他电机库的命名冲突),
-     *   **公式与取值一律保持原样** —— LK 电机未参与本次整定,
-     *   不在验证范围内的行为不应该被顺手改掉。
-     *   注意这里的系数语义与 DJImotor 修正后的一致:系数 = 新值权重。
-     */
-    measure->speed_rads = (1 - LK_SPEED_SMOOTH_COEF) * measure->speed_rads +
-                          DEGREE_2_RAD * LK_SPEED_SMOOTH_COEF * (float)((int16_t)(rx_buff[5] << 8 | rx_buff[4]));
+    measure->speed_rads = (1 - SPEED_SMOOTH_COEF) * measure->speed_rads +
+                          DEGREE_2_RAD * SPEED_SMOOTH_COEF * (float)((int16_t)(rx_buff[5] << 8 | rx_buff[4]));
 
-    measure->real_current = (1 - LK_CURRENT_SMOOTH_COEF) * measure->real_current +
-                            LK_CURRENT_SMOOTH_COEF * (float)((int16_t)(rx_buff[3] << 8 | rx_buff[2]));
+    measure->real_current = (1 - CURRENT_SMOOTH_COEF) * measure->real_current +
+                            CURRENT_SMOOTH_COEF * (float)((int16_t)(rx_buff[3] << 8 | rx_buff[2]));
 
     measure->temperature = rx_buff[1];
 

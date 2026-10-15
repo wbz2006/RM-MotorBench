@@ -27,6 +27,7 @@
  * 注意与下面的板型定义互斥使用:测电机时无需关心 ONE_BOARD 等宏。
  */
 #define MOTOR_BENCH_APP
+#define MOTOR_BENCH_RC_UART (&huart1)
 /* 电机测试台使用的电机清单配置;可换用其他配置表 */
 #define MOTOR_BENCH_DEFAULT_CONFIG
 

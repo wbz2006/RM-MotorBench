@@ -54,7 +54,7 @@ void RobotTask()
 {
 #if defined(MOTOR_BENCH_APP)
 
-    MotorBenchAppTask();
+    /* The bench is serviced exclusively by the motor task. */
 
 #else
 

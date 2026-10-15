@@ -88,6 +88,7 @@ bsp/usart/bsp_usart.c \
 bsp/usb/bsp_usb.c \
 bsp/log/bsp_log.c \
 bsp/bsp_init.c \
+bsp/bsp_memory.c \
 modules/algorithm/controller.c \
 modules/algorithm/kalman_filter.c \
 modules/algorithm/QuaternionEKF.c \
@@ -106,6 +107,7 @@ modules/motor/servo_motor/servo_motor.c \
 modules/motor/motor_task.c \
 modules/motor/power_control.c \
 modules/motor_bench/motor_bench.c \
+modules/motor_bench/bench_control.c \
 modules/motor_bench/usb_probe.c \
 modules/oled/oled.c \
 modules/remote/remote_control.c \

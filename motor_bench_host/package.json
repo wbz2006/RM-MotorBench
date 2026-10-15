@@ -7,7 +7,13 @@
   "scripts": {
     "start": "node server.js",
     "test": "node selftest.js",
-    "test:integration": "node integration_test.js"
+    "test:integration": "node integration_test.js",
+    "test:control": "node ../tests/control_protocol_test.mjs",
+    "test:chassis": "node ../tests/chassis_policy_test.mjs",
+    "test:waveform": "node --test ../tests/waveform_history_test.mjs ../tests/channel_bindings_test.mjs",
+    "test:waveform:server": "node ../tests/server_waveform_regression.mjs",
+    "test:firmware": "node ../tests/firmware_behavior_test.mjs",
+    "test:ctype": "node ../tests/ctype_firmware_test.mjs"
   },
   "dependencies": {
     "serialport": "^12.0.0",

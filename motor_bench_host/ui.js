@@ -11,25 +11,11 @@ import {
   MBResult,
   MBResultText,
   PID_DEFAULTS,
-  availableIds,
-  describeConflict,
-  findConflict,
-  usesDjiIdSegment,
-  MOTOR_ID_MIN,
-  MOTOR_ID_MAX,
-  LoopType,
 } from './protocol.js';
-import { ensureChart, getChartIfExists, dropChart } from './chart.js';
-import { LoopFishbone } from './fishbone.js';
+import { SpeedWaveform } from './waveform.js';
 
-/**
- * 当前渲染的通道卡片数
- *
- * @note 早期是常量 4,导致板上只有 1 颗电机时页面上仍有 3 张空卡片
- *       (未绑定、读数全是 --),既占地方又容易被误认为功能异常。
- *       现在改为跟随板端清单动态调整,由 buildChannels(count) 赋值。
- */
-let CHANNEL_COUNT = 1;
+/** 固件通道上限。卡片删除后保留其他卡片原有的通道号。 */
+const CHANNEL_MAX = 8;
 
 /** 各电机种类的参考值限幅与单位(与固件 MB_REF_LIMIT_* 及驱动量程对应) */
 const MOTOR_SPEC = {
@@ -42,15 +28,89 @@ const MOTOR_SPEC = {
 };
 
 /** PID 面板每通道的当前环(用于收到 PID 报表时知道该往哪个输入框填) */
-const pidStateByChannel = new Map(); // ch -> {loop, kind}
+const pidStateByChannel = new Map(); // ch -> {loop, kind, storageKey}
+const PID_FORM_FIELDS = { Kp: 'pKp', Ki: 'pKi', Kd: 'pKd', MaxOut: 'pMaxOut', IntegralLimit: 'pIntLim' };
 
 const $ = (sel) => document.querySelector(sel);
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
 const ws = new WebSocket(wsUrl);
+const waveform = new SpeedWaveform($('#waveformPanel'));
 
 /** 板端上报的电机清单(来自心跳应答的 inventoryCount,随后由遥测确认) */
 let inventory = [];
+// 独立保留上次清单的身份,避免重新拉取清单时补回已解绑的卡片。
+let channelInventoryKeys = null;
+let inventoryReceived = false;
+let serialOpen = false;
+let lastBoardReplyAt = 0;
+let boardUnresponsive = false;
 const telemetryByChannel = new Map();
+const channelBindings = new Map();
+let controlState = { source: 0, channelId: 0xff, online: false, ready: false };
+let sourceEditing = false;
+let sourcePending = null;
+let sourceTimer = null;
+let controlError = '';
+
+function updateRemoteSpec() {
+  const id = Number($('#remoteChannel').value);
+  const el = ch(id);
+  const index = el ? Number(el.querySelector('[data-role="motor"]').value) : -1;
+  const kind = inventory[index]?.kind ?? MotorKind.M3508;
+  const spec = MOTOR_SPEC[MotorKindLabel[kind]];
+  $('#remoteUnit').textContent = spec.unit;
+  $('#remoteMaxRef').max = spec.range;
+  if (Number($('#remoteMaxRef').value) > spec.range) $('#remoteMaxRef').value = spec.range;
+}
+
+function refreshRemoteChannels() {
+  const select = $('#remoteChannel');
+  const value = select.value;
+  select.replaceChildren();
+  for (const i of channelIds()) {
+    const option = document.createElement('option');
+    option.value = i;
+    option.textContent = `通道 ${i}`;
+    select.appendChild(option);
+  }
+  select.value = value || '0';
+  if (!select.value) select.value = select.options[0]?.value ?? '';
+  $('#addChannel').disabled = channelIds().length >= CHANNEL_MAX;
+  waveform.setChannels(channelIds());
+  const ids = channelIds();
+  document.querySelectorAll('[data-wheel]').forEach((select, position) => {
+    const previous = select.value;
+    select.innerHTML = '<option value="">选择通道</option>';
+    for (const id of ids) {
+      const option = document.createElement('option'); option.value = String(id); option.textContent = `通道 ${id}`;
+      select.appendChild(option);
+    }
+    select.value = previous && ids.includes(Number(previous)) ? previous : previous ? '' : String(ids[position] ?? '');
+  });
+  updateControlFields();
+  updateRemoteSpec();
+}
+
+function chassisChannels() {
+  return [...document.querySelectorAll('[data-wheel]')].map(select => select.value === '' ? -1 : Number(select.value));
+}
+
+function updateControlFields() {
+  const chassis = Number($('#controlSource').value) >= 2;
+  $('#chassisFields').hidden = !chassis;
+  document.querySelectorAll('[data-single-remote]').forEach(el => { el.hidden = chassis; });
+  $('#chassisMaxRef').max = currentChannelKind(chassisChannels()[0]) === MotorKind.M2006 ? 7000 : 6000;
+  const active = controlState.source >= 2;
+  const running = controlState.channels?.some(id => telemetryByChannel.get(id)?.enabled);
+  const online = controlState.channels?.every(id => telemetryByChannel.get(id)?.online);
+  $('#chassisEnable').disabled = !active || !controlState.ready || !online || running || !!sourcePending || sourceEditing;
+  $('#chassisStop').disabled = !active;
+}
+
+function refreshControlLocks() {
+  updateControlFields();
+  for (const id of channelIds()) renderChannel(id);
+}
 
 /** 在"添加电机"面板上显示一行结果提示 */
 function showAddMsg(text, isError) {
@@ -59,114 +119,109 @@ function showAddMsg(text, isError) {
   el.classList.toggle('error', !!isError);
 }
 
-/**
- * 添加电机面板的实时预检 —— 在"添加"面板上给出冲突说明与可用 ID
- *
- * 放在模块作用域(bindEvents 之外)是为了让 ws.onmessage 里的清单刷新
- * 也能调它:清单一变,"可用 ID"就要重算,否则提示会停留在一个过期列表上,
- * 用户照着填反而必撞。
- *
- * @note 三个输入项与清单变化都会调它,所以函数体必须**幂等且无副作用** ——
- *   它只读当前 DOM 值 + inventory,然后写一行提示。
- */
-function refreshAddHint() {
-  const kindEl = $('#addKind');
-  const busEl = $('#addBus');
-  const idEl = $('#addId');
-  if (!kindEl || !busEl || !idEl) return;
-
-  const kind = Number(kindEl.value);
-  const canBus = Number(busEl.value);
-  const motorId = Number(idEl.value);
-
-  if (!Number.isInteger(motorId) || motorId < MOTOR_ID_MIN || motorId > MOTOR_ID_MAX) {
-    showAddMsg(`ID 需填 ${MOTOR_ID_MIN}~${MOTOR_ID_MAX} 的整数`, true);
-    return;
-  }
-
-  /* 冲突优先:直接给出"和谁撞、该改谁、能用哪些" */
-  const conflictMsg = describeConflict(canBus, inventory, kind, motorId);
-  if (conflictMsg) {
-    showAddMsg(conflictMsg, true);
-    return;
-  }
-
-  /*
-   * 无冲突时,若该总线上已有占用 ID 的电机,顺带列出可用 ID ——
-   * 用户接下来多半要接着加第二、第三颗,提前给候选省得反复试错。
-   * 该总线还是空的就不显示,避免多余的噪音。
-   */
-  if (usesDjiIdSegment(kind) && inventory.some((m) => m && m.canBus === canBus)) {
-    const free = availableIds(canBus, inventory, kind);
-    showAddMsg(`CAN${canBus} 当前可用 ID:${free.length ? free.join('、') : '(无)'}`, false);
-  } else {
-    showAddMsg('', false);
-  }
-}
-
 /** 添加/移除的待应答计时器:超时则提示"没收到板子应答",避免永久卡住 */
 let addPendingTimer = null;
 let addPendingLabel = '添加电机';
 
 /* ---------------- 建卡片 ---------------- */
 
-/**
- * 按板上实际电机数量生成通道卡片
- *
- * @note 早期固定生成 4 张卡片,导致板上只有 1 颗电机时,
- *   另外 3 张全是空卡片(未绑定、全是 --),既占地方又让人误以为功能异常。
- *
- * @attention 【重要·2026-10-12 修复】卡片数曾跟随"电机数"变化,
- *   导致三个实测故障:
- *     1. 添加第二颗电机后,通道 0 的电机下拉选择被清空(要重新选),
- *        但通道 0 控制的其实还是原来那颗;
- *     2. 设好的 rpm 值自动归零;
- *     3. 先 6020 后 3508 时,两个通道被一起清空,且之后无法二次绑定。
- *   根因是 buildChannels() 里那行 `host.innerHTML = ''` ——
- *   它把**所有**卡片连同已选下拉值、rpm 滑块值一起销毁。
- *   而触发重建的条件 `CHANNEL_COUNT !== inventory.length`
- *   本身就建立在错误假设上:"电机数 == 通道数"。
- *   实际上通道是独立的控制位(最多 MB_CHANNEL_MAX = 8),
- *   一颗电机绑到哪个通道都行,与电机总数无关。
- *
- *   正确做法:卡片数**只增不减**,且只在"用户明显需要更多通道"时增长
- *   (即电机数超过当前卡片数),增长时**保留既有卡片的全部状态**。
- *   这样加电机不会碰已有通道的任何界面状态。
- */
-function buildChannels(count = null) {
+/** 补足卡片,复用空闲通道号,不重建已有卡片。返回新增的通道号。 */
+function buildChannels(count = 1) {
   const host = $('#channels');
-  const tpl = $('#channelTpl');
 
-  /*
-   * 只增不减:目标数量取"当前已有"与"新请求"的较大者。
-   * @note 传 null 表示"按现有电机数补足",但绝不缩回 ——
-   *       删掉一张用户正在用的卡片,等于凭空丢失该通道的绑定与参数。
-   */
   const want = Number.isInteger(count) && count > 0 ? count : 0;
   const have = host.querySelectorAll('.channel').length;
-  const n = Math.max(have, want, 1);
+  const n = Math.min(CHANNEL_MAX, Math.max(have, want));
 
   if (have === n) {
-    CHANNEL_COUNT = n;
-    return; /* 数量没变,不要碰 DOM —— 碰了就会丢用户已填的状态 */
+    return []; // 数量没变时保留全部卡片和输入状态。
   }
 
-  for (let i = have; i < n; i++) {
-    const node = tpl.content.firstElementChild.cloneNode(true);
-    node.dataset.ch = String(i);
-    node.querySelector('.ch-title').textContent = `通道 ${i}`;
-    host.appendChild(node);
+  const added = [];
+  for (let i = 0; i < CHANNEL_MAX && have + added.length < n; i++) {
+    if (ch(i)) continue;
+    createChannel(i);
+    added.push(i);
   }
-  CHANNEL_COUNT = n;
-
-  /*
-   * @attention 只给**新增**的卡片绑事件,不要重新绑定全部。
-   *   bindEvents() 内部是 `for (let i = 0; i < CHANNEL_COUNT; i++)`,
-   *   会把已有卡片的 onclick 也重写一遍。
-   *   用 onclick 赋值(而非 addEventListener)所以不会叠加,
-   *   但重写时闭包捕获的 i 若与实际通道不一致,就会出现"点通道1发的是通道0"。
-   */
+  refreshRemoteChannels();
   bindEvents();
+  return added;
+}
+
+function createChannel(i) {
+  const host = $('#channels');
+  const node = $('#channelTpl').content.firstElementChild.cloneNode(true);
+  node.dataset.ch = String(i);
+  node.querySelector('.ch-title').textContent = `通道 ${i}`;
+  const next = [...host.children].find(el => Number(el.dataset.ch) > i);
+  host.insertBefore(node, next ?? null);
+}
+
+/** Restore identities observed by the host, including sparse channel numbers. */
+function restoreChannelBindings() {
+  if (!inventoryReceived) return;
+  let added = false;
+  for (const id of channelBindings.keys()) {
+    if (!ch(id) && Number.isInteger(id) && id >= 0 && id < CHANNEL_MAX) {
+      createChannel(id);
+      added = true;
+    }
+  }
+  if (added) {
+    refreshRemoteChannels();
+    bindEvents();
+    fillMotorOptions();
+  }
+  for (const [id, binding] of channelBindings) {
+    const el = ch(id);
+    const index = inventory.findIndex(m => m.kind === binding.kind && m.canBus === binding.canBus && m.motorId === binding.motorId);
+    if (!el || index < 0) continue;
+    const r = role => el.querySelector(`[data-role="${role}"]`);
+    const changed = r('motor').value !== String(index);
+    r('motor').value = String(index);
+    r('loop').value = String(binding.outerLoop);
+    const spec = MOTOR_SPEC[MotorKindLabel[binding.kind]];
+    r('unit').textContent = spec.unit;
+    r('slider').min = String(-spec.range);
+    r('slider').max = String(spec.range);
+    waveform.configureChannel(id, {
+      unit: spec.unit, speedLoop: binding.outerLoop === 2,
+      motorKey: `${binding.kind}:${binding.canBus}:${binding.motorId}`,
+      identified: !!binding.identified,
+    });
+    if (changed) initPidPanel(id);
+  }
+  updateRemoteSpec();
+}
+
+/** Older board bindings have no identity query; the user can identify them locally. */
+function identifyExistingChannel(i) {
+  const el = ch(i);
+  if (!telemetryByChannel.has(i) || (channelBindings.has(i) && !channelBindings.get(i).identified) || el?.dataset.bindPending === '1') return;
+  const select = el.querySelector('[data-role="motor"]');
+  const motor = select.value === '' ? null : inventory[Number(select.value)];
+  if (!motor) {
+    waveform.forgetChannel(i);
+    send({ type: 'identifyChannel', channelId: i, kind: 0 });
+    return;
+  }
+  // Editing a bound channel's selectors must not relabel its existing plot.
+  // An unknown identity can be explicitly reset by choosing the empty option first.
+  if (waveform.configs.has(i) && !waveform.configs.get(i).identified && !channelBindings.get(i)?.identified) return;
+  waveform.configureChannel(i, {
+    unit: MOTOR_SPEC[motor.label].unit,
+    speedLoop: Number(el.querySelector('[data-role="loop"]').value) === 2,
+    motorKey: `${motor.kind}:${motor.canBus}:${motor.motorId}`,
+    identified: true,
+  });
+  send({
+    type: 'identifyChannel', channelId: i, kind: motor.kind, canBus: motor.canBus, motorId: motor.motorId,
+    outerLoop: Number(el.querySelector('[data-role="loop"]').value),
+  });
+}
+
+function channelIds() {
+  return [...document.querySelectorAll('#channels .channel')].map(el => Number(el.dataset.ch));
 }
 
 function ch(i) {
@@ -175,9 +230,23 @@ function ch(i) {
 
 /* ---------------- 指令发送 ---------------- */
 
+function showConnectionNotice(message) {
+  $('#connectionMessage').textContent = message;
+  $('#connectionNotice').hidden = false;
+}
+
 function send(obj) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
-  else alert('与服务端未建立连接');
+  if (ws.readyState !== 1) {
+    showConnectionNotice('上位机服务未连接,请确认服务正在运行并刷新网页');
+    return false;
+  }
+  // 急停始终尝试发送,包括当前页面尚未收到串口状态的时候。
+  if (!serialOpen && !['listPorts', 'openSerial', 'closeSerial', 'stopAll'].includes(obj.type)) {
+    showConnectionNotice('串口未连接,请先选择开发板串口并点击「打开」');
+    return false;
+  }
+  ws.send(JSON.stringify(obj));
+  return true;
 }
 
 /* ---------------- 渲染 ---------------- */
@@ -208,160 +277,21 @@ function renderChannel(i) {
   }
 
   const r = (role) => el.querySelector(`[data-role="${role}"]`);
-
-  /*
-   * 数字读数行已于 2026-10-13 移除 —— 曲线已呈现这些量的走势,
-   * 数字在波动大的场合反而干扰判读(用户明确要求)。
-   * 温度是慢变量,不具备"看趋势"的必要,仍以数字显示。
-   *
-   * @attention 其余读数(设定/转速/电流/角度)的元素**已从模板删除**,
-   *   这里绝不能再 querySelector 后直接赋值 —— 会拿到 null 而抛异常,
-   *   把整个渲染打断(表现为整张卡片不再更新)。温度是唯一保留项。
-   */
-  const tempEl = r('temp');
-  if (tempEl) {
-    tempEl.textContent = t && t.temperature !== -128 ? `${t.temperature} °C` : '--';
-  }
+  r('ref').textContent = t ? fmt(t.ref, 0) : '--';
+  r('speed').textContent = t ? fmt(t.speed, 1) : '--';
+  r('torque').textContent = t ? fmt(t.torque, 2) : '--';
+  r('angle').textContent = t ? fmt(t.angle, 1) : '--';
+  r('temp').textContent = t && t.temperature !== -128 ? `${t.temperature} °C` : '--';
 
   const enableBtn = r('enable');
   enableBtn.classList.toggle('on', !!(t && t.enabled));
   enableBtn.textContent = t && t.enabled ? '停机' : '使能';
-
-  /*
-   * 把本次遥测喂给曲线(2026-10-12 新增)。
-   *
-   * 为什么在 renderChannel 里 push 而不是单独开定时器:
-   *   采样频率天然与遥测到达一致(固件约 10Hz),不需要额外轮询,
-   *   也不会画出板端根本没上报的假点。
-   *
-   * 曲线放在 renderChannel 末尾而非仅在 telemetry 事件里,
-   *   是因为 renderChannel 还会在解绑、断连时以 t=null 被调用,
-   *   此时不喂点、只重绘,曲线会自然停住而不是被 0 值拉一条直线到底。
-   */
-  if (t) {
-    const canvas = el.querySelector('[data-role="chart"]');
-    if (canvas) {
-      const c = ensureChart(i, canvas);
-      /*
-       * 把界面上的滤波设置同步到实例。
-       *
-       * @attention 必须在这里同步,不能只在 onchange 里设:
-       *   曲线实例是**懒创建**的 —— 用户在通道还没收到遥测时改了滤波档位,
-       *   那一刻 getChartIfExists 返回 null,设置被静默丢弃;
-       *   等实例真正建出来时就会用默认值,与界面显示不一致。
-       *   每次 push 前对齐一次,代价可忽略(几个比较),却消除了这类漂移。
-       */
-      const fOn = r('filterOn');
-      const fAlpha = r('filterAlpha');
-      if (fOn) c.setFilter(fOn.checked);
-      if (fAlpha) c.setFilterAlpha(fAlpha.value);
-
-      c.push(t.speed, t.torque, t.ref);
-    }
-  }
-}
-
-/* ---------------- 闭环鱼骨图 ---------------- */
-
-/**
- * 鱼骨图实例表:通道号 → LoopFishbone
- *
- * @note 懒创建:只有真正渲染过的通道才建实例。
- *   鱼骨图只在 bind 时需要它的掩码,建了不用会白占 DOM 与事件。
- */
-const fishbones = new Map();
-
-/**
- * 取出(必要时创建)某通道的鱼骨图
- *
- * @param {number} i 通道号
- * @returns {LoopFishbone|null}
- */
-function ensureFishbone(i) {
-  if (fishbones.has(i)) return fishbones.get(i);
-  const host = ch(i)?.querySelector('[data-role="loopPicker"]');
-  if (!host) return null;
-
-  const fb = new LoopFishbone(host);
-
-  /*
-   * 悬停/聚焦/点击某个环 → 把下方 PID 卡片切到该环。
-   *
-   * @note 只切环,不管开合 —— 卡片是内嵌常驻的,不需要显示/隐藏逻辑。
-   *   曾经做成浮空(延时开合),在多层嵌套的卡片里定位失控,已回退。
-   */
-  fb.onFocusLoop = (bit) => focusPidLoop(i, bit);
-
-  fishbones.set(i, fb);
-  return fb;
-}
-
-/** 移除某通道的鱼骨图(卡片被销毁时调用) */
-function dropFishbone(i) {
-  fishbones.delete(i);
-}
-
-/**
- * 读取某通道当前的闭环掩码
- *
- * @attention 两条约束由 fishbone.js 的 _toggle **联动代码**保证,这里不需要再补齐:
- *   1. 点亮位置环必然同时点亮速度环(关速度会连带关位置);
- *   2. 外层环 = 掩码中最高位的亮节点(按**位值**得出,与节点排列无关)。
- *   2026-10-14 位置环与电流环对调后,主脊只表示"由内到外"的层级、
- *   不再表示信号方向,所以约束**只剩代码这一道保障** ——
- *   不要以为"图上已经保证了"就把 _toggle 的联动删掉。
- *
- * @param {number} i 通道号
- * @returns {number} 位掩码,与固件 Closeloop_Type_e 一致
- */
-function readLoopMask(i) {
-  const fb = fishbones.get(i);
-  if (fb) return fb.getMask();
-  /* 鱼骨图还没建(通道未渲染过)时,退回默认值 —— 与固件建电机配置一致 */
-  return LoopType.SPEED_AND_CURRENT_LOOP;
-}
-
-/*
- * 闭环位 → PID 环选择器下标的映射。
- *
- * @attention 位掩码与 pidLoop 的 <option value> 是两套编号,必须显式对应:
- *   <option value="0">速度环 / "1">电流环 / "2">位置环
- *   而位掩码里 电流=0b0001、速度=0b0010、位置=0b0100。
- *   不映射的话,"点亮位置环"会打开速度环的参数 —— 调错环且毫无提示。
- */
-const BIT_TO_PID_LOOP = {
-  0b0010: '0', // 速度环
-  0b0001: '1', // 电流环
-  0b0100: '2', // 位置环
-};
-
-/**
- * 把 PID 卡片切到指定环(不负责显示/隐藏 —— 卡片是内嵌常驻的)
- *
- * @param {number} i 通道号
- * @param {number} bit 关注的闭环位
- *
- * @note 之前这里还要管浮空卡片的开合与延时关闭,现在卡片常驻,
- *   只剩"切环 + 填默认值"这一件事,逻辑干净很多。
- */
-function focusPidLoop(i, bit) {
-  const el = ch(i);
-  if (!el) return;
-
-  const loopVal = BIT_TO_PID_LOOP[bit];
-  const sel = el.querySelector('[data-role="pidLoop"]');
-  if (loopVal === undefined || !sel) return;
-
-  sel.value = loopVal;
-  /* 切环后把该环的默认值填进输入框 */
-  fillPidForm(i, loopVal);
-
-  /* 标题写明当前是哪个环,避免"调了半天不知道在调哪个" */
-  const title = el.querySelector('[data-role="pidTitle"]');
-  if (title) {
-    const name = { 0b0100: '位置环', 0b0010: '速度环', 0b0001: '电流环' }[bit];
-    title.textContent = name ? `${name} PID` : 'PID 整定';
-  }
+  const remote = controlState.source !== 0;
+  r('slider').disabled = remote;
+  r('num').disabled = remote;
+  r('zero').disabled = remote;
+  const selected = controlState.source >= 2 ? controlState.channels?.includes(i) : controlState.channelId === i;
+  enableBtn.disabled = !t?.enabled && (sourceEditing || !!sourcePending || (remote && (!selected || !controlState.ready)));
 }
 
 /* ---------------- 电机下拉(固件清单) ---------------- */
@@ -372,7 +302,7 @@ function focusPidLoop(i, bit) {
  *       避免上位机下发固件里根本不存在的电机配置。
  */
 function fillMotorOptions() {
-  for (let i = 0; i < CHANNEL_COUNT; i++) {
+  for (const i of channelIds()) {
     const el = ch(i);
     if (!el) continue; // 卡片数量可能刚被重建过,跳过已不存在的卡片
     const sel = el.querySelector('[data-role="motor"]');
@@ -386,15 +316,10 @@ function fillMotorOptions() {
      *     可通道 0 控制的其实还是原来那颗电机(用户以为绑定丢了);
      *   - 两个通道会一起被清空,且之后无法二次绑定。
      *
-     * 用 (kind, canBus, motorId) 三元组而非下标记忆:
-     * 下标会随电机增删而漂移,不可靠。
+     * 从已选 option 读取 (kind, canBus, motorId) 三元组:
+     * 此时 inventory 可能已被清空或替换,不能再用旧索引到其中查身份。
      */
-    let prevKey = null;
-    const prevIdx = Number(sel.value);
-    if (sel.value !== '' && Number.isInteger(prevIdx) && inventory[prevIdx]) {
-      const p = inventory[prevIdx];
-      prevKey = `${p.kind}:${p.canBus}:${p.motorId}`;
-    }
+    const prevKey = sel.selectedOptions[0]?.dataset.motorKey ?? null;
 
     sel.innerHTML = '<option value="">选择电机…</option>';
     let restoredIdx = '';
@@ -402,9 +327,10 @@ function fillMotorOptions() {
       const label = `${m.label} · CAN${m.canBus}·ID${m.motorId}`;
       const opt = document.createElement('option');
       opt.value = String(idx);
+      opt.dataset.motorKey = `${m.kind}:${m.canBus}:${m.motorId}`;
       opt.textContent = label;
       sel.appendChild(opt);
-      if (prevKey && `${m.kind}:${m.canBus}:${m.motorId}` === prevKey) {
+      if (prevKey && opt.dataset.motorKey === prevKey) {
         restoredIdx = String(idx);
       }
     });
@@ -422,11 +348,39 @@ function fillMotorOptions() {
         el.querySelector('[data-role="slider"]').min = String(-spec.range);
         el.querySelector('[data-role="slider"]').max = String(spec.range);
       }
+      initPidPanel(i);
+      updateRemoteSpec();
+      identifyExistingChannel(i);
     };
   }
 }
 
 /* ---------------- PID 整定辅助 ---------------- */
+
+/** 保存完整有效的编辑值;清空/输入负数时保留上一次记录。 */
+function rememberPidForm(i) {
+  const el = ch(i);
+  const key = pidStateByChannel.get(i)?.storageKey;
+  if (!el || !key) return;
+  const values = {};
+  for (const [name, role] of Object.entries(PID_FORM_FIELDS)) {
+    const raw = el.querySelector(`[data-role="${role}"]`).value;
+    const value = Number(raw);
+    if (raw === '' || !Number.isFinite(value) || value < 0) return;
+    values[name] = value;
+  }
+  try { localStorage.setItem(key, JSON.stringify(values)); } catch { /* 浏览器禁用存储时仍可调参。 */ }
+}
+
+function recalledPid(key) {
+  if (!key) return null;
+  try {
+    const values = JSON.parse(localStorage.getItem(key));
+    return values && Object.keys(PID_FORM_FIELDS).every(name =>
+      typeof values[name] === 'number' && Number.isFinite(values[name]) && values[name] >= 0)
+      ? values : null;
+  } catch { return null; }
+}
 
 /**
  * 取某通道当前绑定电机的 kind(未绑定返回 0)
@@ -434,7 +388,9 @@ function fillMotorOptions() {
 function currentChannelKind(i) {
   const el = ch(i);
   if (!el) return 0;
-  const idx = Number(el.querySelector('[data-role="motor"]').value);
+  const selection = el.querySelector('[data-role="motor"]').value;
+  if (selection === '') return 0;
+  const idx = Number(selection);
   const m = inventory[idx];
   return m ? m.kind : 0;
 }
@@ -444,8 +400,9 @@ function currentChannelKind(i) {
  * @param i           通道号
  * @param loopStr     环选择器的值('0'速度 '1'电流 '2'位置)
  * @param kindOverride 可选,指定 kind(默认取该通道绑定的电机)
+ * @param useSaved 优先恢复上次参数;恢复型号默认值时传 false
  */
-function fillPidForm(i, loopStr, kindOverride) {
+function fillPidForm(i, loopStr, kindOverride, useSaved = true) {
   const el = ch(i);
   if (!el) return;
   const kind = kindOverride || currentChannelKind(i);
@@ -453,7 +410,9 @@ function fillPidForm(i, loopStr, kindOverride) {
 
   const preset = PID_DEFAULTS[kind];
   const loopName = ['speed', 'current', 'angle'][Number(loopStr)] || 'speed';
-  const p = preset ? preset[loopName] : null;
+  const motorKey = r('motor').selectedOptions[0]?.dataset.motorKey;
+  const storageKey = motorKey ? `motor-bench:pid:v1:${motorKey}:${Number(loopStr)}` : null;
+  const p = (useSaved && recalledPid(storageKey)) || preset?.[loopName];
 
   r('pKp').value = p ? p.Kp : 0;
   r('pKi').value = p ? p.Ki : 0;
@@ -462,7 +421,7 @@ function fillPidForm(i, loopStr, kindOverride) {
   r('pIntLim').value = p ? p.IntegralLimit : 0;
 
   // 记录当前环,便于收到 PID 报表时知道该往哪个输入框填
-  pidStateByChannel.set(i, { loop: Number(loopStr), kind });
+  pidStateByChannel.set(i, { loop: Number(loopStr), kind, storageKey });
 }
 
 /**
@@ -496,7 +455,7 @@ function initPidPanel(i) {
   }
 
   if (kind) {
-    /* 绑定后:填入该型号默认值,并清掉"先绑定"提示。
+    /* 绑定后:优先恢复该电机和当前环的上次参数,首次使用才填型号默认值。
        improve 不从页面暴露(属于协议细节),沿用默认表里的值。 */
     fillPidForm(i, el.querySelector('[data-role="pidLoop"]').value, kind);
     if (msg && !msg.textContent.trim()) msg.textContent = '';
@@ -512,15 +471,73 @@ function initPidPanel(i) {
 /* ---------------- 事件绑定 ---------------- */
 
 function bindEvents() {
+  $('#addChannel').onclick = () => {
+    const added = buildChannels(channelIds().length + 1);
+    fillMotorOptions();
+    for (const i of added) initPidPanel(i);
+  };
+  $('#dismissNotice').onclick = () => { $('#connectionNotice').hidden = true; };
+  $('#controlSource').onchange = () => { sourceEditing = true; refreshControlLocks(); };
+  document.querySelectorAll('[data-wheel], [data-reverse]').forEach(el => {
+    el.onchange = () => { sourceEditing = true; refreshControlLocks(); };
+  });
+  $('#chassisMaxRef').oninput = () => { sourceEditing = true; refreshControlLocks(); };
+  $('#chassisEnable').onclick = () => send({ type: 'chassisEnable', enable: true });
+  $('#chassisStop').onclick = () => send({ type: 'chassisEnable', enable: false });
+  $('#remoteChannel').onchange = () => { sourceEditing = true; updateRemoteSpec(); refreshControlLocks(); };
+  $('#remoteMaxRef').oninput = () => { sourceEditing = true; refreshControlLocks(); };
+  $('#applySource').onclick = () => {
+    controlError = '';
+    const source = Number($('#controlSource').value);
+    const channelId = Number($('#remoteChannel').value);
+    const maxRef = source >= 2 ? Number($('#chassisMaxRef').value) : source ? Number($('#remoteMaxRef').value) : 0;
+    const el = ch(channelId);
+    if (source === 1 && (!el || !telemetryByChannel.has(channelId) || Number(el.querySelector('[data-role="loop"]').value) !== 2)) {
+      $('#remoteStatus').textContent = '请先把遥控通道绑定为速度环';
+      return;
+    }
+    if (source && (!Number.isFinite(maxRef) || maxRef <= 0 || maxRef > Number($(source >= 2 ? '#chassisMaxRef' : '#remoteMaxRef').max))) {
+      $('#remoteStatus').textContent = '遥控最大转速超出该型号范围';
+      return;
+    }
+    let pending = { source, channelId, maxRef };
+    if (source >= 2) {
+      const channels = chassisChannels();
+      const kinds = channels.map(currentChannelKind);
+      if (channels.some(id => id < 0 || !telemetryByChannel.has(id)) || new Set(channels).size !== 4 ||
+          channels.some(id => Number(ch(id)?.querySelector('[data-role="loop"]').value) !== 2) ||
+          ![1,2,3].includes(kinds[0]) || kinds.some(kind => kind !== kinds[0])) {
+        $('#remoteStatus').textContent = '请选择四个不重复、已绑定速度环的同型号 DJI 电机通道';
+        return;
+      }
+      const reverseMask = [...document.querySelectorAll('[data-reverse]')].reduce((mask, input, i) => mask | (input.checked ? 1 << i : 0), 0);
+      pending = { source, channels, reverseMask, maxRef };
+    }
+    if (!send({ type: 'controlSource', ...pending })) {
+      $('#remoteStatus').textContent = $('#connectionMessage').textContent;
+      return;
+    }
+    sourcePending = pending;
+    refreshControlLocks();
+    $('#remoteStatus').textContent = '正在切换,等待板端确认…';
+    clearTimeout(sourceTimer);
+    sourceTimer = setTimeout(() => {
+      sourcePending = null;
+      sourceTimer = null;
+      $('#remoteStatus').textContent = '未收到板端切换确认,控制方式尚未确认。请检查开发板通信后重试';
+    }, 3000);
+  };
   $('#refreshPorts').onclick = () => send({ type: 'listPorts' });
   $('#openPort').onclick = () => {
     const path = $('#portSelect').value;
-    if (!path) return alert('请先选择串口');
+    if (!path) return showConnectionNotice('请先选择开发板串口');
     send({ type: 'openSerial', path, baud: 115200 });
   };
   $('#closePort').onclick = () => send({ type: 'closeSerial' });
   $('#rescan').onclick = () => {
-    inventory.length = 0; // 清掉旧清单,强制重新拉取
+    if (!serialOpen) return showConnectionNotice('串口未连接,请先选择开发板串口并点击「打开」');
+    // 等新清单到达后再替换,避免等待期间补卡清空已有电机选择。
+    inventoryReceived = false;
     startInventoryFetch();
   };
   $('#addMotor').onclick = () => {
@@ -528,32 +545,16 @@ function bindEvents() {
     const canBus = Number($('#addBus').value);
     const motorId = Number($('#addId').value);
 
-    if (!Number.isInteger(motorId) || motorId < MOTOR_ID_MIN || motorId > MOTOR_ID_MAX) {
-      showAddMsg(`ID 需填 ${MOTOR_ID_MIN}~${MOTOR_ID_MAX} 的整数(对应电调拨码开关)`, true);
+    if (!Number.isInteger(motorId) || motorId < 1 || motorId > 8) {
+      showAddMsg('ID 需填 1~8 的整数(对应电调拨码开关)', true);
       return;
     }
-
-    /*
-     * 本地预检(2026-10-13 新增)。
-     *
-     * @attention 为什么要在界面再挡一道:
-     *   固件已经有 MotorBenchCheckRxIdFree(),会拒绝冲突配置 —— 但那要
-     *   一个来回到板子才知道结果,而且提示只出现在 RTT 里(网页上只有一句
-     *   错误码文案)。用户真正需要的是**当场知道该把拨码改成几**。
-     *   所以这里用同一套公式先算一遍,直接给出可用 ID 列表。
-     *
-     *   固件那道检查仍然保留 —— 界面可能因为清单还没刷新而与板端不一致,
-     *   固件才是最终权威。
-     */
-    const conflictMsg = describeConflict(canBus, inventory, kind, motorId);
-    if (conflictMsg) {
-      showAddMsg(conflictMsg, true);
-      return; /* 不发给板子 —— 明知会失败,不必浪费一次往返 */
+    if (!send({ type: 'addMotor', kind, canBus, motorId })) {
+      showAddMsg($('#connectionMessage').textContent, true);
+      return;
     }
-
     showAddMsg('正在添加…', false);
     addPendingLabel = '添加电机';
-    send({ type: 'addMotor', kind, canBus, motorId });
 
     /*
      * 超时兜底:若板子没回应答帧,不能一直卡在"正在添加…"。
@@ -563,83 +564,50 @@ function bindEvents() {
      */
     if (addPendingTimer) clearTimeout(addPendingTimer);
     addPendingTimer = setTimeout(() => {
+      addPendingTimer = null;
       showAddMsg(
         `${addPendingLabel} 3 秒内没有收到板子应答。` +
-          '可能原因:固件版本较旧不支持动态添加 / USB 帧未送达。' +
-          '请查看 RTT 是否有 [add] 日志。',
+          '添加结果尚未确认,请检查开发板通信并重新获取电机清单。',
         true,
       );
     }, 3000);
   };
-  /*
-   * 急停:**单击立即下发,不得有二次确认**(2026-10-14 用户要求)。
-   *
-   * @attention 这里原本是 `if (confirm('确定要立即停止全部电机吗?'))` ——
-   *   弹窗式确认与急停语义直接冲突:
-   *     1. 急停是**时间敏感**动作,弹窗多一步点击就是多一份危险;
-   *     2. 浏览器原生 confirm 会**阻塞主线程**,期间页面卡死、
-   *        后面的遥测渲染与状态刷新全部停摆,恰恰在最需要看状态的时候瞎掉。
-   *
-   *   反向思考:误触急停的代价只是"电机停了",再使能即可;
-   *   而急停迟钝的代价是设备或人身伤害。两者不对等,所以不该给急停加确认。
-   *
-   * @note 这里不需要额外兜底:若 WebSocket 未连通,本函数静默不发,
-   *   而此时 A 板已因约 1 秒收不到心跳**自行全停**了 ——
-   *   链路断了电机本来就是停的,不存在"点了没反应所以电机还在转"的情况。
-   */
-  $('#estop').onclick = () => send({ type: 'stopAll' });
+  $('#estop').onclick = () => {
+    send({ type: 'stopAll' });
+  };
 
-  /*
-   * 添加电机三个输入项的实时预检(2026-10-13 新增)。
-   *
-   * 不等用户点「添加」再报错 —— 选完型号/总线/ID 的当下就把结果摆出来:
-   *   - 冲突 → 红字说明和谁撞、该改谁、以及当前可用 ID
-   *   - 无冲突 → 列出该总线当前可用 ID,方便接着加下一颗
-   *
-   * @attention 用 `oninput` / `onchange` 赋值,**不能用 addEventListener**。
-   *   bindEvents() 会在卡片增补时被反复调用,addEventListener 会把同一个
-   *   处理函数叠加多次 —— 拖一次数字框就触发 N 次预检,将来若有副作用
-   *   就是难查的重复执行。onXxx 赋值天然幂等(覆盖旧的)。
-   *
-   * @note 同时监听 input 与 change:数字框键盘输入触发 input,
-   *   上下箭头/失焦提交在某些浏览器只触发 change。
-   */
-  for (const id of ['#addKind', '#addBus', '#addId']) {
-    $(id).oninput = refreshAddHint;
-    $(id).onchange = refreshAddHint;
-  }
+  // 页面退出时只尝试发送全停,不再显示连接错误。
+  window.addEventListener('beforeunload', () => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'stopAll' }));
+  });
 
-  // 页面关闭前尽量通知服务端全停(beforeunload + sendBeacon 兜底)
-  window.addEventListener('beforeunload', () => send({ type: 'stopAll' }));
-
-  for (let i = 0; i < CHANNEL_COUNT; i++) {
+  for (const i of channelIds()) {
     const el = ch(i);
     const r = (role) => el.querySelector(`[data-role="${role}"]`);
 
     r('bind').onclick = () => {
+      // 固件会拒绝重复绑定,不能仅凭请求发出就把波形改成另一种量纲。
+      if (telemetryByChannel.has(i) || el.dataset.bindPending === '1') {
+        return showConnectionNotice('该通道已绑定或正在绑定。更换电机或控制环前,请先解绑,再添加通道。');
+      }
       const idx = Number(r('motor').value);
       const m = inventory[idx];
-      if (!m) return alert('请先选择电机');
-
-      /*
-       * 从鱼骨图读取闭环掩码。
-       *
-       * @attention 两条约束由 fishbone.js 的 _toggle 联动代码保证,无需额外补齐:
-       *   1. 点亮位置环必然同时点亮速度环(关速度会连带关位置);
-       *   2. 外层环 = 掩码中最高位的亮节点(按位值,与节点排列无关)。
-       *   (2026-10-14 位置环与电流环对调后,主脊不再表示信号方向,
-       *    约束不再由节点位置保证 —— 见 fishbone.js 的 _toggle 注释。)
-       */
-      const mask = readLoopMask(i);
-      send({
+      if (r('motor').value === '' || !m) return showConnectionNotice('请先选择电机');
+      if (!send({
         type: 'bind',
         channelId: i,
         kind: m.kind,
         canBus: m.canBus,
         motorId: m.motorId,
-        outerLoop: mask,
+        outerLoop: Number(r('loop').value),
+      })) return;
+      el.dataset.bindPending = '1';
+      waveform.configureChannel(i, {
+        unit: MOTOR_SPEC[MotorKindLabel[m.kind]].unit,
+        speedLoop: Number(r('loop').value) === 2,
+        motorKey: `${m.kind}:${m.canBus}:${m.motorId}`,
       });
-      // 绑定的同时把该型号的默认 PID 填进面板,用户点"应用"即可生效
+      // 绑定时恢复上次 PID(首次使用填默认值),用户点"应用"后生效
       initPidPanel(i);
     };
 
@@ -649,10 +617,8 @@ function bindEvents() {
      *   (M3508 Kp=20 / M2006 Kp=10 / 6020 Kp=50)。不跟着换,
      *   会出现"下拉框选了 M2006,面板里却还摆着 M3508 的参数"。
      */
-    r('motor').onchange = () => initPidPanel(i);
-
-    /* 建鱼骨图(懒创建,只在通道真正渲染时才建实例) */
-    ensureFishbone(i);
+    r('motor').onchange = () => { initPidPanel(i); updateRemoteSpec(); identifyExistingChannel(i); };
+    r('loop').onchange = () => identifyExistingChannel(i);
 
     /*
      * 【重要·2026-10-12 修复】"解绑"必须下发真正的解绑帧,
@@ -683,19 +649,36 @@ function bindEvents() {
       num.value = slider.value;
     };
     // 松手时才下发,避免拖动时刷屏
-    slider.onchange = () => send({ type: 'setRef', channelId: i, ref: Number(slider.value) });
+    slider.onchange = () => {
+      if (controlState.source === 0 && telemetryByChannel.get(i)?.enabled)
+        send({ type: 'setRef', channelId: i, ref: Number(slider.value) });
+    };
     num.onchange = () => {
-      slider.value = num.value;
-      send({ type: 'setRef', channelId: i, ref: Number(num.value) });
+      const value = Number(num.value);
+      if (!Number.isFinite(value)) return;
+      const limited = Math.max(Number(slider.min), Math.min(Number(slider.max), value));
+      slider.value = String(limited);
+      num.value = String(limited);
+      if (controlState.source === 0 && telemetryByChannel.get(i)?.enabled)
+        send({ type: 'setRef', channelId: i, ref: limited });
     };
 
     r('enable').onclick = () => {
+      controlError = '';
+      if (controlState.source >= 2 && controlState.channels?.includes(i)) {
+        const enable = !controlState.channels.some(id => telemetryByChannel.get(id)?.enabled);
+        if (enable && (sourceEditing || sourcePending)) return showConnectionNotice('控制配置尚未确认,请先应用控制方式');
+        return send({ type: 'chassisEnable', enable });
+      }
       const t = telemetryByChannel.get(i);
       const enable = !(t && t.enabled);
-      if (enable && Number(num.value) !== 0) {
+      if (enable && (sourceEditing || sourcePending)) return showConnectionNotice('控制配置尚未确认,请先应用控制方式');
+      if (enable && controlState.source === 0 && Number(num.value) !== 0) {
         if (!confirm('该通道当前设定值不为 0,使能后电机会立即转动。确认继续?')) return;
       }
       send({ type: 'enable', channelId: i, enable });
+      if (enable && controlState.source === 0)
+        send({ type: 'setRef', channelId: i, ref: Number(num.value) });
     };
 
     r('zero').onclick = () => {
@@ -704,47 +687,13 @@ function bindEvents() {
       send({ type: 'setRef', channelId: i, ref: 0 });
     };
 
-    /* ---------------- 实时曲线 ---------------- */
-    /*
-     * 这里**不能**提前 new 曲线实例。
-     * 卡片是懒渲染的:某通道还没收到过遥测时 canvas 宽度为 0,
-     * 此时 ResizeObserver 量到 0 尺寸、后续不会自动纠正(只在真实 resize 时触发)。
-     * 所以实例交给 renderChannel 在首次有数据时创建,尺寸一定是对的。
-     */
-    r('chartWindow').onchange = () => {
-      const c = getChartIfExists(i);
-      if (c) c.setWindow(r('chartWindow').value);
-    };
-    r('chartClear').onclick = () => {
-      const c = getChartIfExists(i);
-      if (c) c.clear();
-    };
-
-    /*
-     * 滤波开关与强度(2026-10-13 用户要求:电流和转速波动太大)。
-     *
-     * @note 开关默认开启。台架上看的是趋势而非每个采样点的毛刺。
-     *   但**保留关闭选项**是有意为之:低通只能压传感器噪声,
-     *   压不住 PID 引起的低频震荡 —— 所以"开着还抖"就是控制问题,
-     *   "关掉才抖"才是噪声问题。这个开关因此也是诊断工具。
-     *
-     * @attention 与曲线实例一样用 getChartIfExists:
-     *   通道还没收到过遥测时,这两个控件操作应是静默无操作,
-     *   不能顺手创建一个尺寸为 0 的实例。
-     */
-    r('filterOn').onchange = () => {
-      const c = getChartIfExists(i);
-      if (c) c.setFilter(r('filterOn').checked);
-    };
-    r('filterAlpha').onchange = () => {
-      const c = getChartIfExists(i);
-      if (c) c.setFilterAlpha(r('filterAlpha').value);
-    };
-
     /* ---------------- PID 整定 ---------------- */
     const pidLoop = r('pidLoop');
     const pidPanel = r('pidPanel');
     const pidMsg = r('pidMsg');
+    for (const role of Object.values(PID_FORM_FIELDS)) {
+      r(role).oninput = () => rememberPidForm(i);
+    }
 
     // 切环时刷新输入框为上一环 / 该型号默认值
     pidLoop.onchange = () => {
@@ -752,20 +701,28 @@ function bindEvents() {
       pidMsg.textContent = '';
     };
 
-    /*
-     * 卡片已改为内嵌常驻,不再有"关闭"按钮 —— 显示即展开,无需折叠态。
-     * 切换要调的环:点鱼骨图节点,或用上面的 pidLoop 下拉。
-     */
+    r('pidCollapse').onclick = () => {
+      pidPanel.dataset.collapsed = pidPanel.dataset.collapsed === '1' ? '0' : '1';
+      r('pidCollapse').textContent = pidPanel.dataset.collapsed === '1' ? '展开' : '收起';
+    };
 
     r('pidReset').onclick = () => {
       const kind = currentChannelKind(i);
-      fillPidForm(i, pidLoop.value, kind);
+      fillPidForm(i, pidLoop.value, kind, false);
+      rememberPidForm(i);
       pidMsg.className = 'hint';
       pidMsg.textContent = kind ? '已填入该型号默认值,点"应用到电机"下发' : '请先绑定电机';
     };
 
     r('pidQuery').onclick = () => {
-      send({ type: 'pidQuery', channelId: i });
+      const motorKey = r('motor').selectedOptions[0]?.dataset.motorKey;
+      if (!motorKey) {
+        pidMsg.className = 'hint error';
+        pidMsg.textContent = '请先选择电机再读回参数';
+        return;
+      }
+      if (!send({ type: 'pidQuery', channelId: i })) return;
+      el.dataset.pidQueryMotorKey = motorKey;
       pidMsg.className = 'hint';
       pidMsg.textContent = '正在读取板端参数…';
     };
@@ -800,7 +757,15 @@ ws.onopen = () => {
 };
 
 ws.onclose = () => {
+  waveform.disconnect('服务已断开');
+  serialOpen = false;
+  lastBoardReplyAt = 0;
+  boardUnresponsive = false;
+  inventoryReceived = false;
+  stopInventoryFetch();
+  clearPendingRequests('连接已断开,请重新打开串口后再操作');
   setLink(false, '服务已断开');
+  showConnectionNotice('上位机服务已断开,请确认服务正在运行并刷新网页');
 };
 
 /**
@@ -815,12 +780,38 @@ ws.onclose = () => {
 let inventoryTimer = null;
 let inventoryTries = 0;
 
+function stopInventoryFetch() {
+  clearInterval(inventoryTimer);
+  inventoryTimer = null;
+}
+
+function clearPendingRequests(message) {
+  if (addPendingTimer) showAddMsg(message, true);
+  clearTimeout(addPendingTimer);
+  addPendingTimer = null;
+  if (sourcePending) $('#remoteStatus').textContent = message;
+  clearTimeout(sourceTimer);
+  sourceTimer = null;
+  sourcePending = null;
+}
+
+// 串口句柄仍打开时,板端也可能已经停止回复。
+setInterval(() => {
+  if (!serialOpen || boardUnresponsive || Date.now() - lastBoardReplyAt <= 3000) return;
+  boardUnresponsive = true;
+  waveform.disconnect('开发板无应答');
+  stopInventoryFetch();
+  clearPendingRequests('开发板无应答,操作结果尚未确认。请检查通信后重试');
+  setLink(false, '开发板无应答');
+  showConnectionNotice('开发板超过 3 秒未回复,请检查 USB 连接和供电,然后重新打开串口');
+}, 1000);
+
 function startInventoryFetch() {
   /*
    * 【2026-10-12 修复】原实现 `if (inventoryTimer) return` 有竞态:
-   *   motorAck 到达时会 `inventory.length = 0` 再调 startInventoryFetch(),
+   *   motorAck 到达时会重置 inventoryReceived 再调 startInventoryFetch(),
    *   而此时上一次 startInventoryFetch() 的定时器可能仍在跑
-   *   (它每 170ms 才检查一次 inventory.length,还没轮到就收到了 ack)。
+   *   (它每 170ms 才检查一次 inventoryReceived,还没轮到就收到了 ack)。
    *   于是新调用被 `if (inventoryTimer) return` 直接丢弃,
    *   而旧定时器随后可能因为 tries 超限自行退出 ——
    *   结果:清单永远不再刷新,用户表现为"两个通道被清空后无法二次绑定"。
@@ -832,31 +823,35 @@ function startInventoryFetch() {
     clearInterval(inventoryTimer);
     inventoryTimer = null;
   }
+  if (!serialOpen || ws.readyState !== 1) return;
   inventoryTries = 0;
   inventoryTimer = setInterval(() => {
-    if (inventory.length) {
-      clearInterval(inventoryTimer);
-      inventoryTimer = null;
+    if (inventoryReceived || !serialOpen || ws.readyState !== 1) {
+      stopInventoryFetch();
       return;
     }
-    send({ type: 'scanMotors' });
+    if (!send({ type: 'scanMotors' })) {
+      stopInventoryFetch();
+      return;
+    }
     if (++inventoryTries > 20) {
-      /*
-       * 约 3.4 秒仍未拿到清单。
-       * @attention 不要再报"未收到电机清单" —— 清空预置电机后,
-       *   清单为空本来就是正常状态(用户还没添加任何电机),
-       *   报成故障会让用户以为板子出了问题,徒增困惑。
-       *   此处只提示"可开始添加电机"这一正常引导。
-       */
-      clearInterval(inventoryTimer);
-      inventoryTimer = null;
-      showAddMsg('连接正常。当前板上还没有电机,请在下方「添加电机」里按实际电调 ID 添加。', false);
+      stopInventoryFetch();
+      showAddMsg('未收到开发板的电机清单,请检查所选串口和开发板供电。', true);
     }
   }, 170);
 }
 
 ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
+  if (['heartbeat', 'inventory', 'telemetry', 'controlReport'].includes(msg.type)) {
+    serialOpen = true;
+    lastBoardReplyAt = Date.now();
+    if (boardUnresponsive) {
+      boardUnresponsive = false;
+      $('#connectionNotice').hidden = true;
+    }
+    setLink(true, '开发板在线');
+  }
 
   switch (msg.type) {
     case 'ports': {
@@ -876,42 +871,116 @@ ws.onmessage = (ev) => {
     }
 
     case 'serial': {
+      serialOpen = !!msg.open;
+      lastBoardReplyAt = msg.open ? Date.now() : 0;
+      boardUnresponsive = false;
       setLink(msg.open, msg.open ? `串口 ${msg.path ?? ''}` : '串口已关闭');
-      if (msg.open) startInventoryFetch();
+      if (msg.open) {
+        // 新串口会话可能连接了另一块板,旧绑定的电机型号和量纲不再可信。
+        waveform.resetSession();
+        channelBindings.clear();
+        telemetryByChannel.clear();
+        for (const i of channelIds()) {
+          delete ch(i).dataset.bindPending;
+          delete ch(i).dataset.pidQueryMotorKey;
+          renderChannel(i);
+        }
+        $('#connectionNotice').hidden = true;
+        inventoryReceived = false;
+        startInventoryFetch();
+      } else {
+        waveform.disconnect('串口已关闭');
+        inventoryReceived = false;
+        stopInventoryFetch();
+        clearPendingRequests('串口已关闭,请重新打开串口后再操作');
+      }
+      break;
+    }
+
+    case 'controlReport': {
+      const d = msg.data;
+      if (d.result !== MBResult.OK) {
+        controlError = d.result === MBResult.NOT_ENABLED
+          ? '尚不能使能:请把右拨杆拨到上档并将右摇杆回中'
+          : '指令未生效:请检查通道绑定、速度环和最大转速;底盘模式需烧录支持四轮控制的新固件';
+        sourcePending = null;
+        clearTimeout(sourceTimer);
+      }
+      const changed = controlState.source !== d.source || controlState.channelId !== d.channelId ||
+        String(controlState.channels) !== String(d.channels) || controlState.reverseMask !== d.reverseMask;
+      controlState = d;
+      if (sourcePending && d.result === MBResult.OK && d.source === sourcePending.source &&
+          (!d.source || (Math.abs(d.maxRef - sourcePending.maxRef) < 0.01 && (d.source >= 2
+            ? String(d.channels) === String(sourcePending.channels) && d.reverseMask === sourcePending.reverseMask
+            : d.channelId === sourcePending.channelId)))) {
+        sourcePending = null;
+        sourceEditing = false;
+        clearTimeout(sourceTimer);
+      }
+      if (!sourceEditing && !sourcePending) {
+        $('#controlSource').value = String(d.source);
+        if (d.source === 1) {
+          $('#remoteChannel').value = String(d.channelId);
+          $('#remoteMaxRef').value = String(d.maxRef);
+          updateRemoteSpec();
+        } else if (d.source >= 2) {
+          document.querySelectorAll('[data-wheel]').forEach((select, i) => { select.value = String(d.channels[i]); });
+          document.querySelectorAll('[data-reverse]').forEach((input, i) => { input.checked = !!(d.reverseMask & (1 << i)); });
+          $('#chassisMaxRef').value = String(d.maxRef);
+        }
+      }
+      if (changed) {
+        for (const i of channelIds()) {
+          ch(i).querySelector('[data-role="slider"]').value = '0';
+          ch(i).querySelector('[data-role="num"]').value = '0';
+        }
+      }
+      if (!sourcePending)
+        $('#remoteStatus').textContent = controlError || (sourceEditing ? '控制配置已修改,请先应用控制方式' : d.source
+          ? `遥控器${d.online ? '在线' : '离线'} · ${d.source >= 2 ? '平移/旋转' : '右摇杆'} ${d.rocker}${d.source >= 2 ? ` / ${d.lateral} / ${d.yaw}` : ''} · ${d.ready ? '可使能' : '右拨杆上档、摇杆回中后可使能'}`
+          : `网页控制 · 遥控器${d.online ? '在线' : '离线'}`);
+      for (const i of channelIds()) renderChannel(i);
+      updateControlFields();
       break;
     }
 
     case 'heartbeat': {
       const d = msg.data;
-      setLink(true, 'A 板在线');
+      serialOpen = true;
+      setLink(true, '开发板在线');
       $('#fwText').textContent = `固件 ${d.fwVersion} · ${Math.round(d.uptimeS / 60)} 分钟`;
       // 收到心跳说明板子已在跑,若清单还没拿到就再要一次(见 startInventoryFetch 注释)
-      if (!inventory.length) startInventoryFetch();
+      if (!inventoryReceived && !inventoryTimer) startInventoryFetch();
+      break;
+    }
+
+    case 'bindings': {
+      const ids = new Set(msg.data.items.map(binding => binding.channelId));
+      for (const id of channelBindings.keys()) {
+        if (!ids.has(id) && serialOpen) waveform.forgetChannel(id);
+      }
+      channelBindings.clear();
+      for (const binding of msg.data.items) channelBindings.set(binding.channelId, binding);
+      restoreChannelBindings();
       break;
     }
 
     case 'inventory': {
+      serialOpen = true;
+      inventoryReceived = true;
       // 板端登记的电机清单:界面只能从中选择,不会虚报不存在的电机
       inventory = msg.data.items.map((m) => ({
         ...m,
         label: MotorKindLabel[m.kind] ?? `未知类型(${m.kind})`,
       }));
 
-      /*
-       * 通道卡片数量:**只增不减**,且只在"电机数超过当前卡片数"时才增长。
-       *
-       * @attention 【2026-10-12 修复】原判断是
-       *   `CHANNEL_COUNT !== inventory.length` —— 任何数量变化都重建卡片。
-       *   它建立在错误假设上:"电机数 == 通道数"。
-       *   实际通道是独立的控制位(固件 MB_CHANNEL_MAX = 8),
-       *   两颗电机完全可以只用一个通道,或者一颗电机换通道。
-       *   于是"加一颗电机"这种纯后台操作会摧毁用户正在用的界面状态:
-       *   已选电机、已设 rpm 全部归零,多通道时还会一起清空。
-       *
-       * 现在:数量够就不动 DOM,只在不够时补卡(buildChannels 内部只增不减)。
-       * 加电机不再触碰任何已有卡片。
-       */
-      buildChannels(inventory.length);
+      // 只有首次清单或新登记的电机需要补卡。重复清单不恢复已解绑的卡片。
+      const keys = inventory.map(m => `${m.kind}:${m.canBus}:${m.motorId}`);
+      const addedMotors = channelInventoryKeys === null
+        ? Math.max(0, inventory.length - channelIds().length)
+        : keys.filter(key => !channelInventoryKeys.has(key)).length;
+      channelInventoryKeys = new Set(keys);
+      if (addedMotors) buildChannels(channelIds().length + addedMotors);
 
       /*
        * 刷新各通道的电机下拉框。
@@ -920,32 +989,28 @@ ws.onmessage = (ev) => {
        *   所以刷新清单不会夺走用户已选的电机。
        */
       fillMotorOptions();
+      restoreChannelBindings();
 
       /*
-       * 拿到清单后初始化各通道的 PID 面板。
+       * 只初始化新卡片或型号已改变的 PID 面板,保留其他卡片的用户编辑。
        * @attention 必须在 fillMotorOptions() 之后 —— 该函数才把
        *   下拉框的 value 设成实际电机索引,currentChannelKind() 靠它取 kind。
        *   顺序反了会读不到 kind,PID 面板被隐藏。
        */
-      for (let i = 0; i < CHANNEL_COUNT; i++) initPidPanel(i);
+      for (const i of channelIds()) {
+        if (pidStateByChannel.get(i)?.kind !== currentChannelKind(i)) initPidPanel(i);
+      }
 
       /*
        * 拿到清单即视为握手完成。
        * 注意:清单为空是**正常状态**(预置电机已清空,等用户添加),
        * 所以这里不能用 items.length 判断"是否成功"。
        */
-      setLink(true, 'A 板在线');
+      setLink(true, '开发板在线');
       if (inventoryTimer) {
         clearInterval(inventoryTimer);
         inventoryTimer = null;
       }
-
-      /*
-       * 清单变了 → 重新算一遍"可用 ID"提示。
-       * 否则加完一颗电机后,添加面板上还挂着上一次算出来的可用 ID 列表,
-       * 用户照它填就会撞车 —— 提示必须跟着清单走。
-       */
-      if (typeof refreshAddHint === 'function') refreshAddHint();
       break;
     }
 
@@ -976,7 +1041,7 @@ ws.onmessage = (ev) => {
       } else {
         showAddMsg(MBResultText[d.result] ?? `失败(错误码 ${d.result})`, true);
       }
-      inventory.length = 0;
+      inventoryReceived = false;
       startInventoryFetch(); // 无论成败都重新拉一次清单
       break;
     }
@@ -991,17 +1056,15 @@ ws.onmessage = (ev) => {
        *   改成等应答再清,失败时把真实原因显示出来。
        */
       const d = msg.data;
-      if (d.result === MBResult.OK) {
+      // 固件对合法但未绑定的通道也回 BAD_PARAM,确认后同样删除空卡片。
+      const alreadyUnbound = d.result === MBResult.BAD_PARAM && d.boardConfirmed !== false && !!ch(d.channelId) &&
+        !telemetryByChannel.has(d.channelId);
+      if (d.result === MBResult.OK || alreadyUnbound) {
+        channelBindings.delete(d.channelId);
         telemetryByChannel.delete(d.channelId);
-        const el = ch(d.channelId);
-        if (el) {
-          /* 下拉回到"选择电机…",滑块归零 —— 此时清状态才是安全的 */
-          el.querySelector('[data-role="motor"]').value = '';
-          el.querySelector('[data-role="slider"]').value = '0';
-          el.querySelector('[data-role="num"]').value = '0';
-          renderChannel(d.channelId);
-          initPidPanel(d.channelId);
-        }
+        pidStateByChannel.delete(d.channelId);
+        ch(d.channelId)?.remove();
+        refreshRemoteChannels();
         setLink(true, `通道 ${d.channelId} 已解绑`);
       } else {
         /* 失败:界面保持原样,并说明原因,避免"看起来解绑了其实没解" */
@@ -1011,10 +1074,28 @@ ws.onmessage = (ev) => {
     }
 
     case 'telemetry': {
-      for (const it of msg.data.items) {
-        telemetryByChannel.set(it.channelId, it);
+      let added = false;
+      for (const { channelId } of msg.data.items) {
+        if (!ch(channelId) && Number.isInteger(channelId) && channelId >= 0 && channelId < CHANNEL_MAX) {
+          createChannel(channelId);
+          added = true;
+        }
       }
-      for (let i = 0; i < CHANNEL_COUNT; i++) renderChannel(i);
+      if (added) {
+        refreshRemoteChannels();
+        bindEvents();
+        fillMotorOptions();
+        restoreChannelBindings();
+      }
+      for (const it of msg.data.items) {
+        // Telemetry proves occupancy, even when the old protocol cannot prove identity.
+        const el = ch(it.channelId);
+        if (el) delete el.dataset.bindPending;
+        telemetryByChannel.set(it.channelId, it);
+        waveform.append(it);
+      }
+      for (const i of channelIds()) renderChannel(i);
+      updateControlFields();
       break;
     }
 
@@ -1030,6 +1111,9 @@ ws.onmessage = (ev) => {
       const el = ch(d.channelId);
       if (!el) break;
       const r = (role) => el.querySelector(`[data-role="${role}"]`);
+      const queryMotorKey = el.dataset.pidQueryMotorKey;
+      delete el.dataset.pidQueryMotorKey;
+      if (!queryMotorKey || queryMotorKey !== r('motor').selectedOptions[0]?.dataset.motorKey) break;
       const cur = ['speed', 'current', 'angle'][st.loop];
       const p = d[cur];
       const msg2 = r('pidMsg');
@@ -1039,6 +1123,7 @@ ws.onmessage = (ev) => {
         r('pKd').value = p.Kd;
         r('pMaxOut').value = p.MaxOut;
         r('pIntLim').value = p.IntegralLimit;
+        // 读回值只用于查看,避免板端通道身份未知时覆盖另一颗电机的调试记录。
         msg2.className = 'hint';
         msg2.textContent = '已读回板端当前生效值';
       } else {
@@ -1064,8 +1149,10 @@ ws.onmessage = (ev) => {
     }
 
     case 'error': {
+      stopInventoryFetch();
+      clearPendingRequests(msg.message);
       setLink(false, '出错');
-      alert(msg.message);
+      showConnectionNotice(msg.message);
       break;
     }
 

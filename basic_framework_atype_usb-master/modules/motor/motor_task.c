@@ -21,6 +21,9 @@
 
 void MotorControlTask()
 {
+#if defined(MOTOR_BENCH_APP)
+    MotorBenchAppTask();
+#endif
     // static uint8_t cnt = 0; 设定不同电机的任务频率
     // if(cnt%5==0) //200hz
     // if(cnt%10==0) //100hz
@@ -38,10 +41,6 @@ void MotorControlTask()
 
     // StepMotorControl();
 
-#if defined(MOTOR_BENCH_APP)
-    /* 电机测试台模式:上报遥测(内部已节流至约 50Hz) */
-    MotorBenchAppTask();
-#endif
 
 /*
  * 【运行期心跳】每约 20 秒从 500Hz 任务打一个点。

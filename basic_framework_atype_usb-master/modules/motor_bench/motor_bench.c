@@ -15,6 +15,10 @@
 #include "string.h"
 #include "stdlib.h"
 #include "main.h"
+#include "bench_control.h"
+#include "usb_device.h"
+#include <math.h>
+extern USBD_HandleTypeDef hUsbDeviceFS;
 
 #define MB_CHANNEL_MAX 8
 
@@ -38,34 +42,6 @@
 
 /* 遥测上报周期:500Hz 任务下节流到约 50Hz */
 #define MB_TELEMETRY_DIVIDER 10
-
-/*
- * 遥测**采样累加器** —— 用于抑制混叠(aliasing)。
- *
- * @attention 【2026-10-13 修复】电流曲线的剧烈抖动不是噪声,是混叠造成的假象。
- *
- * 现象:用户把界面滤波开到"强",转速曲线平直,电流仍在 ±25 之间疯狂抖动。
- *
- * 根因:电机控制任务跑 500Hz,遥测每 MB_TELEMETRY_DIVIDER(10) 拍才取一次样,
- *   即 50Hz。而电流是电流环在 **500Hz** 下高频调节的量 ——
- *   每 10 拍抽一个快照属于**欠采样**:
- *     采样率 50Hz < 信号中 500Hz 成分的 2 倍
- *   高频成分被折叠到低频,看起来就像"随机大幅抖动"。
- *
- *   关键点:混叠发生在**采样那一刻**,之后任何显示端滤波都救不回来 ——
- *   因为滤的已经是一个不真实的信号。这正是"开到强也没用"的原因。
- *
- * 正确做法:在采样源头先把这一段时间内的值**累加平均**,
- *   相当于一个滑动平均抗混叠滤波器(等效于 decimation 前先 low-pass)。
- *   500Hz 的电流在 10 拍内平均,高频成分被真实地平滑掉,
- *   而不是被折叠成假低频。
- *
- * 实现代价:每个通道多两个 double(float 精度不够,10 拍累加会丢低位),
- *   以及每拍一次加法 —— 都在 500Hz 任务里做,开销可忽略。
- */
-static float mb_tele_acc_current[MB_CHANNEL_MAX];
-static float mb_tele_acc_voltage[MB_CHANNEL_MAX];
-static uint8_t mb_tele_acc_count[MB_CHANNEL_MAX];
 
 /** 传输层类型 */
 typedef enum
@@ -106,6 +82,10 @@ static uint16_t mb_tx_seq = 0; /* 上报序号 */
 static DaemonInstance *mb_link_daemon = NULL; /* 上位机链路守护 */
 static uint8_t mb_telemetry_div = 0;          /* 遥测节流计数 */
 static uint8_t mb_link_online = 0;            /* 上位机心跳是否在线(安全门闩) */
+static BenchControl mb_control = {.channel = 0xff};
+static MB_RemoteReader_t mb_remote_reader;
+static uint8_t mb_remote_online, mb_remote_switch;
+static int16_t mb_remote_axes[3];
 static uint32_t mb_hb_count = 0;               /* 【诊断】累计收到的心跳帧数 */
 
 /* ============================================================
@@ -129,6 +109,9 @@ static uint32_t mb_hb_count = 0;               /* 【诊断】累计收到的心
 static uint8_t mb_usb_tx_ring[MB_USB_TX_RING_SIZE];
 static volatile uint16_t mb_usb_tx_head = 0; /* 生产者写位置 */
 static volatile uint16_t mb_usb_tx_tail = 0; /* 消费者读位置 */
+static volatile uint16_t mb_usb_tx_inflight;
+static uint8_t mb_rx_stream[MB_RX_BUFF_SIZE];
+static uint16_t mb_rx_used;
 #if defined(MOTOR_BENCH_TX_DIAG)
 static uint8_t mb_tx_diag_cnt = 0;     /* [tx] 诊断打印次数上限,避免刷屏 */
 static uint8_t mb_txcmpl_diag_cnt = 0; /* 发送完成回调的诊断计数 */
@@ -156,7 +139,7 @@ static uint8_t MotorBenchUsbEnqueue(const uint8_t *buf, uint16_t len)
     uint16_t tail = mb_usb_tx_tail;
 
     /* 队列剩余空间不足则丢弃本次上报(宁可丢一帧,也不能阻塞控制任务) */
-    if ((uint16_t)(MB_USB_TX_RING_SIZE - (uint16_t)((head - tail + MB_USB_TX_RING_SIZE) % MB_USB_TX_RING_SIZE)) < len)
+    if ((uint16_t)(MB_USB_TX_RING_SIZE - 1u - (uint16_t)((head - tail + MB_USB_TX_RING_SIZE) % MB_USB_TX_RING_SIZE)) < len)
         return 0;
 
     for (uint16_t i = 0; i < len; i++)
@@ -186,91 +169,38 @@ static uint8_t MotorBenchUsbEnqueue(const uint8_t *buf, uint16_t len)
  */
 static uint8_t MotorBenchUsbPump(void)
 {
-    uint16_t tail = mb_usb_tx_tail;
-    uint16_t head = mb_usb_tx_head;
-
-    if (tail == head)
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED || !hUsbDeviceFS.pClassData) {
+        mb_usb_tx_tail = mb_usb_tx_head;
+        mb_usb_tx_inflight = 0;
+        __set_PRIMASK(mask);
         return 0;
-
-    uint16_t avail = (uint16_t)((head - tail + MB_USB_TX_RING_SIZE) % MB_USB_TX_RING_SIZE);
-
-    /*
-     * 本次只取"连续且不超过 64 字节"的那一段。
-     * @note USB 是字节流,短包完全合法 —— 队尾到数组末尾的连续空间不足 64 字节时,
-     *       先发这一小段、下一拍再从数组开头继续即可,于是不需要任何数据拷贝。
-     *       这样每次发送的数据源都是环形队列里一段**连续内存**,
-     *       根本不存在"共享缓冲区被复用"的问题(见函数上方说明)。
-     */
-    uint16_t contiguous = (uint16_t)(MB_USB_TX_RING_SIZE - tail);
-    uint16_t chunk = avail;
-    if (chunk > 64)
-        chunk = 64;
-    if (chunk > contiguous)
-        chunk = contiguous; /* 连续空间不足,先发这一小段 */
-
-    /*
-     * @attention contiguous 可能为 0:当 tail 正好落在数组末尾时
-     *   (MB_USB_TX_RING_SIZE - tail == 0)。此时 chunk 会算成 0,
-     *   若直接进 CDC_Transmit_FS 就是发一个 0 长度的包,
-     *   而且 tail 不会前进 —— Pump 每次都返回 1 却什么都没发,
-     *   形成静默死锁:队列非空但永远发不出去。
-     *   必须先把 tail 归零(未发送的数据仍然完整地排在数组里)。
-     */
-    if (chunk == 0)
-    {
-        mb_usb_tx_tail = 0;
-        return 1; /* 下一次调用(或发送完成回调)会从数组开头取 */
     }
-
-    uint8_t tx_ret = CDC_Transmit_FS((uint8_t *)&mb_usb_tx_ring[tail], chunk);
-
-    /*
-     * 【诊断】确认 HAL 层的真实返回码,避免"以为发出去了"。
-     * 同时打印 USB 外设的端点 0 状态寄存器,用来区分两种完全不同的故障:
-     *   - DIEPTS0(发送端点0)bit0 TX.0 恒为 1,bit1 TX.1 表示还有数据在发
-     *   - 若 ret=0 且 TX.1=0 却迟迟等不到发送完成回调 → 数据没真正出芯片
-     *   - 若端点状态正常但主机侧无数据 → 问题在主机/线缆
-     */
-    /*
-     * 【诊断已关闭】
-     * @attention 曾经在这里逐条打印 [tx] pump/COMPLETE,现在**不要恢复**。
-     *   每次发送、每次发送完成都打一行,而遥测 50Hz + 心跳应答让发送非常频繁,
-     *   几秒就把 RTT 上行缓冲(仅 1024 字节)写满,
-     *   结果是更重要的日志([add] / [link] / motor task alive)被挤掉,
-     *   表现为"日志突然消失",极易被误判成程序卡死。
-     *   排查 USB 时需要这些信息,临时打开即可。
-     */
-#if defined(MOTOR_BENCH_TX_DIAG)
-    if (mb_tx_diag_cnt < 12)
-    {
-        mb_tx_diag_cnt++;
-        /*
-         * IN 端点 0(CDC 通信端)的寄存器基址是 0x900(见 stm32f427xx.h
-         * 的 USB_OTG_INEndpointTypeDef:900h + ep_num*20h)。
-         * 注意别写成 0x808 —— 那是 DSTS(设备状态),不是端点寄存器。
-         */
-        volatile uint32_t *diepts0 = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x900);
-        volatile uint32_t *dieptsiz0 = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x910);
-        volatile uint32_t *dtxfsts = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x918);
-
-        LOGINFO("[tx] pump chunk=%u ret=%u head=%u tail=%u DIEPTS0=0x%08X DIEPTSIZ0=0x%08X DTXFSTS=0x%08X",
-                chunk, tx_ret, mb_usb_tx_head, tail,
-                (unsigned)*diepts0, (unsigned)*dieptsiz0, (unsigned)*dtxfsts);
+    USBD_CDC_HandleTypeDef *cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+    if (mb_usb_tx_inflight) {
+        if (cdc->TxState) {
+            __set_PRIMASK(mask);
+            return 0;
+        }
+        /* A reset discarded an outstanding transfer without its completion. */
+        mb_usb_tx_tail = mb_usb_tx_head;
+        mb_usb_tx_inflight = 0;
     }
-#else
-    (void)tx_ret;
-#endif
-
-    if (tx_ret != USBD_OK)
-        return 0; /* 总线忙,等下一次发送完成回调再试 */
-
-    /*
-     * 只有确认发送成功后才能前移队尾。
-     * @attention 若在此之前前移,而 CDC_Transmit_FS 返回 BUSY,
-     *   这段数据就被跳过了 —— 下次 Pump 从新 tail 开始,中间的数据永久丢失。
-     */
-    mb_usb_tx_tail = (uint16_t)((tail + chunk) % MB_USB_TX_RING_SIZE);
-    return 1;
+    uint16_t tail = mb_usb_tx_tail;
+    uint16_t avail = (uint16_t)((mb_usb_tx_head - tail + MB_USB_TX_RING_SIZE) % MB_USB_TX_RING_SIZE);
+    if (!avail) {
+        __set_PRIMASK(mask);
+        return 0;
+    }
+    uint16_t chunk = avail > 64 ? 64 : avail;
+    uint16_t contiguous = MB_USB_TX_RING_SIZE - tail;
+    if (chunk > contiguous) chunk = contiguous;
+    mb_usb_tx_inflight = chunk;
+    uint8_t result = CDC_Transmit_FS(mb_usb_tx_ring + tail, chunk);
+    if (result != USBD_OK) mb_usb_tx_inflight = 0;
+    __set_PRIMASK(mask);
+    return result == USBD_OK;
 }
 
 /**
@@ -286,21 +216,11 @@ static uint8_t MotorBenchUsbPump(void)
 static void MotorBenchUsbTxCallback(uint16_t len)
 {
     (void)len;
-
-    /*
-     * 发送完成回调的诊断默认关闭。
-     * @attention 与 [tx] pump 同理:每次发送完成都打会迅速写满 RTT 上行缓冲
-     *   (1024 字节),把 [add]/[link]/motor task alive 等关键日志挤掉。
-     *   需要时定义 MOTOR_BENCH_TX_DIAG 打开。
-     */
-#if defined(MOTOR_BENCH_TX_DIAG)
-    if (mb_txcmpl_diag_cnt < 8)
-    {
-        mb_txcmpl_diag_cnt++;
-        LOGINFO("[tx] COMPLETE len=%u (data actually left the chip)", len);
-    }
-#endif
-
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    mb_usb_tx_tail = (uint16_t)((mb_usb_tx_tail + mb_usb_tx_inflight) % MB_USB_TX_RING_SIZE);
+    mb_usb_tx_inflight = 0;
+    __set_PRIMASK(mask);
     MotorBenchUsbPump();
 }
 
@@ -366,13 +286,9 @@ static void MotorBenchHandleSetPid(uint8_t *buf, uint16_t len);
 static void MotorBenchHandleQueryPid(uint8_t *buf, uint16_t len);
 static void MotorBenchHandleUnbind(uint8_t *buf, uint16_t len);
 static void MotorBenchSendAddAck(const MB_MotorAddAck_s *ack);
-/*
- * 这两个函数定义在文件后半部分,但 MotorBenchBind / MotorBenchUnbind
- * 需要提前调用它们来清残留参考值,故在此前置声明。
- */
-void MotorBenchForceStopInstance(MB_MotorKind_e kind, void *instance);
-static uint8_t MotorBenchSetRefInstance(MB_MotorKind_e kind, void *instance, float ref);
 static uint8_t MotorBenchSetLoopInstance(MB_MotorKind_e kind, void *instance, Closeloop_Type_e loop);
+static void MotorBenchSendControlReport(uint8_t result);
+static void MotorBenchHandleControlSource(uint8_t *buf, uint16_t len);
 
 /* ---------------- 初始化 ---------------- */
 
@@ -592,7 +508,7 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
         *out_ch = 0xFF;
 
     /* 1. 基本参数 */
-    if ((can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_HT || motor_id == 0)
+    if ((can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_HT || motor_id == 0 || motor_id > 8)
     {
         LOGERROR("[motor_bench] add rejected: bad param kind=%d bus=%d id=%d", (int)kind, can_bus, motor_id);
         return MB_ERR_BAD_PARAM;
@@ -611,6 +527,9 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
     /* 2. 重复:同一总线上已有相同 (kind, bus, id) */
     for (uint8_t i = 0; i < mb_inventory_used; i++)
     {
+        if (kind == MB_MOTOR_DM && mb_inventory[i].is_used &&
+            mb_inventory[i].kind == MB_MOTOR_DM && mb_inventory[i].can_bus == can_bus)
+            return MB_ERR_DUPLICATE; /* Default DM Master ID 0: one per bus. */
         if (mb_inventory[i].is_used && mb_inventory[i].kind == kind &&
             mb_inventory[i].can_bus == can_bus && mb_inventory[i].motor_id == motor_id)
         {
@@ -624,6 +543,12 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
     if (r != MB_OK)
         return r;
 
+    /* Stop and flush outputs before the DM startup waits. */
+    if (kind == MB_MOTOR_DM) {
+        MotorBenchStopAll();
+        DJIMotorControl();
+        DMMotorControl();
+    }
     /* 4. 交给 app 层工厂真正创建实例 */
     void *instance = NULL;
     uint8_t fr = mb_motor_factory(kind, can_bus, motor_id, &instance);
@@ -660,6 +585,13 @@ uint8_t MotorBenchRemoveMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t moto
             mb_inventory[i].can_bus == can_bus && mb_inventory[i].motor_id == motor_id)
         {
             /* 先停输出,再释放资源 */
+            for (uint8_t ch = 0; ch < MB_CHANNEL_MAX; ++ch) {
+                if (!mb_channels[ch].is_used) continue;
+                if (mb_channels[ch].motor_ptr == mb_inventory[i].motor_ptr)
+                    MotorBenchUnbind(ch);
+                else if (mb_channels[ch].inv_index > i)
+                    mb_channels[ch].inv_index--;
+            }
             MotorBenchForceStopInstance(kind, mb_inventory[i].motor_ptr);
 
             if (mb_motor_destroy && mb_inventory[i].motor_ptr)
@@ -735,6 +667,9 @@ uint8_t MotorBenchBind(uint8_t channel_id, MB_MotorKind_e kind, uint8_t can_bus,
         return MB_ERR_NOT_PROVISIONED;
     }
 
+    for (uint8_t i = 0; i < MB_CHANNEL_MAX; ++i)
+        if (mb_channels[i].is_used && mb_channels[i].motor_ptr == mb_inventory[found].motor_ptr)
+            return MB_ERR_DUPLICATE;
     mb_channels[channel_id].is_used = 1;
     mb_channels[channel_id].channel_id = channel_id;
     mb_channels[channel_id].inv_index = found;
@@ -745,30 +680,6 @@ uint8_t MotorBenchBind(uint8_t channel_id, MB_MotorKind_e kind, uint8_t can_bus,
     mb_channels[channel_id].motor_ptr = mb_inventory[found].motor_ptr;
     mb_channels[channel_id].status_bit_enable = 0;
     mb_channels[channel_id].ref_cmd = 0.0f;
-
-    /*
-     * @attention 【2026-10-13 修复】必须同时清空**电机实例内部**的 pid_ref。
-     *
-     * 实测现象:解绑前速度不为 0,重新绑定后一使能,虽界面显示 0,
-     *   电机却立刻转动 —— 残留参考值在作怪。
-     *
-     * 根因:通道结构与电机实例是**两个独立对象**。
-     *   - 通道结构体由 MotorBenchUnbind 的 memset 清零;
-     *   - 电机实例却在 MotorBenchAddMotor 时创建,此后一直留在
-     *     dji_motor_instance[] 里,不会被解绑销毁。
-     *   于是 instance->motor_controller.pid_ref 还留着旧值。
-     *
-     *   只清 ref_cmd 没用:那只是"上位机最近一次下发值的记账",
-     *   DJIMotorControl() 真正读的是实例里的 pid_ref。
-     *
-     * @note 这里**只清零、不使能、不停机**:
-     *   MotorBenchUnbind 已经停过机了,重复停机反而会干扰
-     *   "绑定后保持停机"的语义。清零是幂等的安全动作。
-     */
-    if (!MotorBenchSetRefInstance(kind, mb_channels[channel_id].motor_ptr, 0.0f))
-    {
-        LOGWARNING("[motor_bench] bind ch%d: failed to zero residual ref", channel_id);
-    }
 
     /*
      * 把外层闭环类型真正下发到电机驱动实例。
@@ -806,31 +717,13 @@ uint8_t MotorBenchUnbind(uint8_t channel_id)
 {
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
         return MB_ERR_BAD_PARAM;
-
-    /*
-     * @attention 【2026-10-13 修复】顺序不能颠倒,且必须清到电机实例里。
-     *
-     * 实测现象:解绑前速度不为 0,重新绑定后一使能,虽界面显示 0,
-     *   电机却立刻转动 —— 残留参考值在作怪。
-     *
-     * 根因:通道结构与电机实例是**两个独立对象**。
-     *   - 通道结构体由下面的 memset 清零;
-     *   - 电机实例却在 MotorBenchAddMotor 时创建,此后一直留在
-     *     dji_motor_instance[] 里,解绑不会销毁它。
-     *   于是 instance->motor_controller.pid_ref 还留着解绑前的值,
-     *   重新绑定后一使能就按旧值输出。
-     *
-     * 只清通道的 ref_cmd 没用 —— 那只是"上位机最近一次下发值的记账",
-     * DJIMotorControl() 真正读的是实例里的 pid_ref。
-     *
-     * 顺序:先停机(切断输出),再把参考值归零(清掉残留),
-     *   最后才 memset 通道结构体(它会清掉 motor_ptr,之后就找不到实例了)。
-     */
-    MotorBenchForceStopInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr);
-    MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, 0.0f);
-
+    if (BenchControlContains(&mb_control, channel_id)) {
+        MotorBenchStopAll();
+        BenchControlSelect(&mb_control, 0, 0, 0);
+    }
+    MotorBenchSetEnable(channel_id, 0);
     memset(&mb_channels[channel_id], 0, sizeof(MB_MotorChannel_s));
-    LOGINFO("[motor_bench] channel %d unbound (ref cleared)", channel_id);
+    LOGINFO("[motor_bench] channel %d unbound", channel_id);
     return MB_OK;
 }
 
@@ -884,7 +777,8 @@ static uint8_t MotorBenchSetRefInstance(MB_MotorKind_e kind, void *instance, flo
     case MB_MOTOR_GM6020:
     case MB_MOTOR_M3508:
     case MB_MOTOR_M2006:
-        DJIMotorSetRef((DJIMotorInstance *)instance, ref);
+        DJIMotorInstance *motor = (DJIMotorInstance *)instance;
+        DJIMotorSetRef(motor, motor->motor_settings.outer_loop_type == SPEED_LOOP ? ref * 6.0f : ref);
         return 1;
     case MB_MOTOR_DM:
         DMMotorSetRef((DMMotorInstance *)instance, ref);
@@ -931,6 +825,12 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
         return MB_ERR_BAD_PARAM;
 
+    if (enable && (!mb_link_online || !BenchControlCanEnable(&mb_control, channel_id)))
+        return MB_ERR_NOT_ENABLED;
+    if (!enable) {
+        MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, 0);
+        mb_channels[channel_id].ref_cmd = 0;
+    }
     mb_channels[channel_id].status_bit_enable = enable ? 1 : 0;
     MotorBenchEnableInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, enable);
 
@@ -949,20 +849,63 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
         DJIMotorInstance *m = (DJIMotorInstance *)mb_channels[channel_id].motor_ptr;
         if (m)
         {
-            LOGINFO("[en] ch=%d bus%u id%u kind=%d stop=%d group=%d num=%d ref=%.1f",
+            /* RTT's formatter does not consume floating-point arguments. */
+            LOGINFO("[en] ch=%d bus%u id%u kind=%d stop=%d group=%d num=%d",
                     channel_id,
                     mb_channels[channel_id].can_bus, mb_channels[channel_id].motor_id,
                     (int)mb_channels[channel_id].kind,
-                    (int)m->stop_flag, (int)m->sender_group, (int)m->message_num,
-                    (double)m->motor_controller.pid_ref);
+                    (int)m->stop_flag, (int)m->sender_group, (int)m->message_num);
         }
     }
 
     return MB_OK;
 }
 
+static int MotorBenchChassisValid(const BenchControl *control)
+{
+    if (control->source < 2) return 0;
+    uint8_t kind = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint8_t ch = control->channels[i];
+        if (ch >= MB_CHANNEL_MAX || !mb_channels[ch].is_used || mb_channels[ch].outer_loop != SPEED_LOOP)
+            return 0;
+        uint8_t current = mb_channels[ch].kind;
+        if (current < MB_MOTOR_GM6020 || current > MB_MOTOR_M2006 || (i && current != kind)) return 0;
+        kind = current;
+    }
+    return control->max_ref <= (kind == MB_MOTOR_M2006 ? 7000.0f : 6000.0f);
+}
+
+static uint8_t MotorBenchSetChassisEnable(uint8_t enable)
+{
+    if (!MotorBenchChassisValid(&mb_control)) return MB_ERR_BAD_PARAM;
+    if (!enable) { MotorBenchStopAll(); return MB_OK; }
+    /* Ready was computed in the previous task tick. Arm only with a fresh atomic RC snapshot. */
+    if (mb_remote_reader) mb_remote_reader(&mb_remote_online, mb_remote_axes, &mb_remote_switch);
+    if (!mb_remote_online || mb_remote_switch != 1 ||
+        mb_remote_axes[0] < -10 || mb_remote_axes[0] > 10 ||
+        mb_remote_axes[1] < -10 || mb_remote_axes[1] > 10 ||
+        mb_remote_axes[2] < -10 || mb_remote_axes[2] > 10) {
+        MotorBenchStopAll();
+        return MB_ERR_NOT_ENABLED;
+    }
+    if (!mb_link_online || !mb_control.ready) return MB_ERR_NOT_ENABLED;
+    for (int i = 0; i < 4; ++i) {
+        MB_TelemetryItem_s measure;
+        if (MotorBenchGetMeasure(mb_control.channels[i], &measure) != MB_OK || !(measure.status & 1))
+            return MB_ERR_NOT_ENABLED;
+    }
+    for (int i = 0; i < 4; ++i) {
+        uint8_t result = MotorBenchSetEnable(mb_control.channels[i], 1);
+        if (result != MB_OK) { MotorBenchStopAll(); return result; }
+    }
+    return MB_OK;
+}
+
 uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
 {
+    if (!isfinite(ref))
+        return MB_ERR_BAD_PARAM;
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
         return MB_ERR_BAD_PARAM;
     if (!mb_channels[channel_id].status_bit_enable)
@@ -975,63 +918,9 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
     float limited = ref;
     LIMIT_MIN_MAX(limited, MB_REF_LIMIT_NEG, MB_REF_LIMIT_POS);
 
-    /*
-     * @attention 【2026-10-13 修复】rpm → 驱动内部单位(deg/s)的换算。
-     *
-     * 实测症状:每次设定新速度都大幅过冲(尖峰 4280 → 回落 1050),
-     *   而速度环 Kp 只有 2 —— 这么小的增益不可能产生那种过冲。
-     *   用户判断"像 PID 问题但 PID 很小",这个矛盾正是线索。
-     *
-     * 根因是**读写量纲不对称**:
-     *   - 读回(MotorBenchGetMeasure)做了 `speed_aps / 6.0f` 转成 rpm 上报,对的;
-     *   - 下发(这里)却把界面送来的 rpm **原样**交给驱动,错的。
-     *
-     *   DJI 驱动的 speed_aps 单位是**度/秒**(general_def.h:
-     *   RPM_2_ANGLE_PER_SEC = 6.0f,即 1rpm = 6deg/s)。
-     *   界面设 3690rpm,驱动收到 3690 却理解成 3690deg/s ——
-     *   目标被放大 6 倍,输出瞬间饱和到 MaxOut,电机全速冲过目标。
-     *   这就是"增益很小却过冲严重"的原因,与 PID 参数无关。
-     *
-     * @note 只有**外层闭环是速度环**时才换算。
-     *   位置环(ANGLE)的 ref 是角度、电流环(CURRENT)的 ref 是电流值、
-     *   开环(OPEN)的 ref 直接是输出电流,三者都不是 rpm,原样下发。
-     *   判据用通道记录的外层闭环类型做精确匹配,不能用位运算
-     *   (详见下方 need_rpm_conv 处的说明)。
-     */
-    /*
-     * @attention 【2026-10-13】换算判据必须精确判断**外层是不是速度环**,
-     *   不能简单写 `!(outer_loop & ANGLE_LOOP)`。
-     *
-     *   位掩码下这个写法会误伤:
-     *     CURRENT_LOOP(0b0001) 不含 ANGLE 位 → 会被判为"需要换算",
-     *     但电流环的 ref 是**安培**,乘 6 之后完全错乱。
-     *
-     *   正确语义:只有"外层闭环 = 速度环"时 ref 才是 rpm。
-     *     外层是速度环的合法取值:
-     *       SPEED_LOOP(0b0010)              —— 纯速度环
-     *       SPEED_AND_CURRENT_LOOP(0b0011)  —— 速度外环 + 电流内环
-     *    其余(位置环、电流环、开环)的 ref 都不是 rpm。
-     *
-     *   用 `== ` 精确匹配而非位运算:外层只能是**一个**环,
-     *   "速度+电流"里的速度位表示它是外层,电流位表示内环被启用。
-     */
-    Closeloop_Type_e outer = mb_channels[channel_id].outer_loop;
-    uint8_t need_rpm_conv =
-        (mb_channels[channel_id].kind == MB_MOTOR_GM6020 ||
-         mb_channels[channel_id].kind == MB_MOTOR_M3508 ||
-         mb_channels[channel_id].kind == MB_MOTOR_M2006) &&
-        (outer == SPEED_LOOP || outer == SPEED_AND_CURRENT_LOOP);
-
-    float to_send = need_rpm_conv ? limited * RPM_2_ANGLE_PER_SEC : limited;
-
-    if (!MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, to_send))
+    if (!MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, limited))
         return MB_ERR_UNSUPPORTED;
 
-    /*
-     * @attention ref_cmd 存的是**界面量纲(rpm)**,不是发给驱动的值。
-     *   遥测上报 ref 时直接用它,保证"界面显示 = 用户输入"。
-     *   存换算后的值会让界面显示 22140 这种吓人的数字。
-     */
     mb_channels[channel_id].ref_cmd = limited;
     return MB_OK;
 }
@@ -1044,11 +933,14 @@ void MotorBenchEmergencyStop(void)
 
 static void MotorBenchStopAll(void)
 {
+    mb_control.ready = 0;
     for (uint8_t i = 0; i < MB_CHANNEL_MAX; i++)
     {
         if (mb_channels[i].is_used)
         {
             MotorBenchForceStopInstance(mb_channels[i].kind, mb_channels[i].motor_ptr);
+            MotorBenchSetRefInstance(mb_channels[i].kind, mb_channels[i].motor_ptr, 0);
+            mb_channels[i].ref_cmd = 0;
             mb_channels[i].status_bit_enable = 0;
         }
     }
@@ -1132,8 +1024,14 @@ static void MotorBenchRxCallback(void)
      *         1. 命令类帧要求上位机心跳在线(mb_link_online)才被接受;
      *         2. 解析结束后清空整个缓冲区,消除残留。
      */
-    DaemonReload(mb_link_daemon);
-    MotorBenchDispatch(mb_usart->recv_buff, mb_usart->recv_buff_size);
+    uint16_t length = mb_usart->recv_len;
+    if (length > MB_USB_RX_MAX) length = MB_USB_RX_MAX;
+    uint8_t next = (uint8_t)((mb_usb_rx_ready + 1u) % MB_USB_RX_SLOTS);
+    if (next != mb_usb_rx_taken) {
+        memcpy(mb_usb_rx_slots[mb_usb_rx_ready], mb_usart->recv_buff, length);
+        mb_usb_rx_len[mb_usb_rx_ready] = length;
+        mb_usb_rx_ready = next;
+    }
     memset(mb_usart->recv_buff, 0, mb_usart->recv_buff_size);
 }
 
@@ -1156,7 +1054,6 @@ static void MotorBenchUsbRxCallback(uint16_t len)
      * 正确做法:中断只做"把字节搬进环形缓冲 + 记住长度",协议解析与所有
      * 可能耗时的动作(MotorBenchTask)都在任务上下文里做。
      */
-    DaemonReload(mb_link_daemon);
 
     if (!mb_usb_rx_buffer || len == 0)
         return;
@@ -1191,6 +1088,13 @@ static void MotorBenchUsbRxCallback(uint16_t len)
  */
 static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
 {
+    if (len > sizeof(mb_rx_stream) - mb_rx_used)
+        mb_rx_used = 0;
+    if (len > sizeof(mb_rx_stream)) return;
+    memcpy(mb_rx_stream + mb_rx_used, buf, len);
+    mb_rx_used += len;
+    buf = mb_rx_stream;
+    len = mb_rx_used;
     uint16_t i = 0;
     while (i < len)
     {
@@ -1271,7 +1175,9 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
             type != MB_FRAME_INVENTORY_QUERY &&
             type != MB_FRAME_MOTOR_ADD &&
             type != MB_FRAME_MOTOR_REMOVE &&
-            type != MB_FRAME_MOTOR_UNBIND)
+            type != MB_FRAME_MOTOR_UNBIND &&
+            type != MB_FRAME_ALL_STOP &&
+            !(type == MB_FRAME_MOTOR_ENABLE && payload_len == 2 && payload[1] == 0))
         {
             /*
              * 【诊断】拒绝时把门闩的真实状态一并打出来。
@@ -1306,6 +1212,7 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
             break;
         case MB_FRAME_QUERY:
             MotorBenchSendTelemetry();
+            MotorBenchSendControlReport(MB_OK);
             break;
         case MB_FRAME_INVENTORY_QUERY:
             MotorBenchSendInventory();
@@ -1325,18 +1232,29 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
         case MB_FRAME_MOTOR_UNBIND:
             MotorBenchHandleUnbind(payload, payload_len);
             break;
+        case MB_FRAME_CONTROL_SOURCE:
+            MotorBenchHandleControlSource(payload, payload_len);
+            break;
+        case MB_FRAME_CHASSIS_ENABLE:
+            MotorBenchSendControlReport(payload_len == 1 && payload[0] <= 1
+                ? MotorBenchSetChassisEnable(payload[0]) : MB_ERR_BAD_PARAM);
+            break;
         default:
             LOGWARNING("[motor_bench] unknown frame type 0x%02X", type);
             break;
         }
         i += frame_len;
     }
+    mb_rx_used = len - i;
+    memmove(mb_rx_stream, mb_rx_stream + i, mb_rx_used);
 }
 
 /* ---------------- 各帧处理 ---------------- */
 
 static void MotorBenchHandleHeartbeat(uint8_t *buf, uint16_t len)
 {
+    if (len != 0) return;
+    DaemonReload(mb_link_daemon);
     (void)buf;
     (void)len;
     /* 心跳到达即置位门闩,后续命令帧才被接受 */
@@ -1376,6 +1294,10 @@ static void MotorBenchHandleBind(uint8_t *buf, uint16_t len)
 
 static void MotorBenchHandleSetRef(uint8_t *buf, uint16_t len)
 {
+    if (mb_control.source) {
+        MotorBenchSendControlReport(MB_ERR_UNSUPPORTED);
+        return;
+    }
     if (len < 5)
         return;
     float ref;
@@ -1387,7 +1309,9 @@ static void MotorBenchHandleEnable(uint8_t *buf, uint16_t len)
 {
     if (len < 2)
         return;
-    MotorBenchSetEnable(buf[0], buf[1]);
+    uint8_t result = mb_control.source >= 2 && BenchControlContains(&mb_control, buf[0])
+        ? MotorBenchSetChassisEnable(buf[1]) : MotorBenchSetEnable(buf[0], buf[1]);
+    MotorBenchSendControlReport(result);
 }
 
 /**
@@ -1412,6 +1336,55 @@ static void MotorBenchSendTypedFrame(uint8_t type, const uint8_t *body, uint8_t 
     buf[4 + body_len] = MB_FRAME_TAIL;
 
     MotorBenchSend(buf, (uint16_t)(5 + body_len));
+}
+
+void MotorBenchSetRemoteReader(MB_RemoteReader_t reader)
+{
+    mb_remote_reader = reader;
+}
+
+static void MotorBenchSendControlReport(uint8_t result)
+{
+    uint8_t body[21] = {result, mb_control.source, mb_control.channel,
+        mb_remote_online, mb_remote_switch, mb_control.ready};
+    memcpy(body + 6, &mb_remote_axes[0], 2);
+    memcpy(body + 8, &mb_control.max_ref, 4);
+    if (mb_control.source >= 2) {
+        memcpy(body + 12, mb_control.channels, 4);
+        body[16] = mb_control.reverse_mask;
+        memcpy(body + 17, &mb_remote_axes[1], 2);
+        memcpy(body + 19, &mb_remote_axes[2], 2);
+    }
+    MotorBenchSendTypedFrame(MB_FRAME_CONTROL_REPORT, body, mb_control.source >= 2 ? 21 : 12);
+}
+
+static void MotorBenchHandleControlSource(uint8_t *buf, uint16_t len)
+{
+    float limit = 0;
+    uint8_t result = MB_ERR_BAD_PARAM;
+    if (len == 6) {
+        memcpy(&limit, buf + 2, 4);
+        BenchControl next = mb_control;
+        if (BenchControlSelect(&next, buf[0], buf[1], limit)) {
+            uint8_t ch = buf[1];
+            if (!buf[0] || (mb_channels[ch].is_used && mb_channels[ch].outer_loop == SPEED_LOOP &&
+                limit <= (mb_channels[ch].kind == MB_MOTOR_DM ? 40.0f :
+                    mb_channels[ch].kind == MB_MOTOR_M2006 ? 7000.0f : 6000.0f))) {
+                MotorBenchStopAll();
+                mb_control = next;
+                result = MB_OK;
+            }
+        }
+    } else if (len == 10) {
+        memcpy(&limit, buf + 6, 4);
+        BenchControl next = mb_control;
+        if (BenchControlSelectChassis(&next, buf[0], buf + 1, buf[5], limit) && MotorBenchChassisValid(&next)) {
+            MotorBenchStopAll();
+            mb_control = next;
+            result = MB_OK;
+        }
+    }
+    MotorBenchSendControlReport(result);
 }
 
 /**
@@ -1519,9 +1492,10 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
 
     /*
      * 写入前停机:整定期间不应继续以旧参考值驱动。
-     * 注意只停该实例,不影响其它通道的电机。
+     * 底盘成员需整组停机,避免只有一轮停下而其余三轮继续驱动。
      */
-    MotorBenchForceStopInstance(ch->kind, inst);
+    if (mb_control.source >= 2 && BenchControlContains(&mb_control, channel_id)) MotorBenchStopAll();
+    else MotorBenchForceStopInstance(ch->kind, inst);
 
     /* 选出目标环的 PIDInstance */
     PIDInstance *target = NULL;
@@ -1584,9 +1558,7 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
     ack.detail = 0;
     MotorBenchSendTypedFrame(MB_FRAME_PID_SET_ACK, (const uint8_t *)&ack, sizeof(ack));
 
-    LOGINFO("[motor_bench] pid set: ch=%u loop=%u Kp=%.3f Ki=%.3f Kd=%.3f MaxOut=%.1f IntLim=%.1f",
-            channel_id, loop, (double)kp, (double)ki, (double)kd, (double)max_out,
-            (double)integral_limit);
+    LOGINFO("[motor_bench] pid set: ch=%u loop=%u", channel_id, loop);
     return MB_OK;
 }
 
@@ -1676,6 +1648,8 @@ static void MotorBenchSendHeartbeatAck(void)
 
 void MotorBenchTask(void)
 {
+    /* Recover a full TX queue even when no new frame can be enqueued. */
+    if (mb_link_type == MB_LINK_USB) MotorBenchUsbPump();
     /*
      * 先把 USB 接收队列里积压的数据全部解析掉。
      * @attention 这一步必须在任务上下文做,且要先于任何耗时动作 ——
@@ -1695,30 +1669,52 @@ void MotorBenchTask(void)
         mb_usb_rx_taken = (uint8_t)((slot + 1u) % MB_USB_RX_SLOTS);
     }
 
-    /*
-     * 混叠抑制:每一拍都累加电流与电压,发送时取平均(见 mb_tele_acc_* 的说明)。
-     *
-     * @attention 累加必须在**每一拍**做,不能只在发送那一拍做 ——
-     *   只在发送拍读一次,就等于没做平均,欠采样依旧。
-     */
-    for (uint8_t i = 0; i < MB_CHANNEL_MAX; i++)
-    {
-        if (!mb_channels[i].is_used)
-            continue;
-        MB_TelemetryItem_s snap;
-        if (MotorBenchGetMeasure(i, &snap) == MB_OK)
-        {
-            mb_tele_acc_current[i] += snap.measure_torque;
-            mb_tele_acc_voltage[i] += (float)snap.measure_speed;
-            if (mb_tele_acc_count[i] < 255)
-                mb_tele_acc_count[i]++;
+    if (mb_remote_reader)
+        mb_remote_reader(&mb_remote_online, mb_remote_axes, &mb_remote_switch);
+    if (mb_control.source >= 2) {
+        if (!MotorBenchChassisValid(&mb_control)) {
+            MotorBenchStopAll();
+            BenchControlSelect(&mb_control, 0, 0, 0);
+        } else {
+            uint8_t enabled_mask = 0, all_online = 1;
+            for (int i = 0; i < 4; ++i) {
+                MB_TelemetryItem_s measure;
+                uint8_t ch = mb_control.channels[i];
+                if (mb_channels[ch].status_bit_enable) enabled_mask |= 1u << i;
+                if (MotorBenchGetMeasure(ch, &measure) != MB_OK || !(measure.status & 1)) all_online = 0;
+            }
+            float refs[4];
+            int action = BenchControlUpdateChassis(&mb_control,
+                mb_remote_online && mb_link_online && all_online, mb_remote_axes,
+                mb_remote_switch, enabled_mask, refs);
+            for (int i = 0; i < 4; ++i) {
+                uint8_t ch = mb_control.channels[i];
+                if (action == BENCH_STOP) MotorBenchSetEnable(ch, 0);
+                else if (action == BENCH_SET_REF && MotorBenchSetRef(ch, refs[i]) != MB_OK) {
+                    MotorBenchStopAll(); break;
+                }
+            }
+        }
+    } else if (mb_control.source) {
+        uint8_t ch = mb_control.channel;
+        if (ch >= MB_CHANNEL_MAX || !mb_channels[ch].is_used) {
+            MotorBenchStopAll();
+            BenchControlSelect(&mb_control, 0, 0, 0);
+        } else {
+            float ref = 0;
+            int action = BenchControlUpdate(&mb_control, mb_remote_online && mb_link_online,
+                mb_remote_axes[0], mb_remote_switch, mb_channels[ch].status_bit_enable, &ref);
+            if (action == BENCH_STOP)
+                MotorBenchSetEnable(ch, 0);
+            else if (action == BENCH_SET_REF)
+                MotorBenchSetRef(ch, ref);
         }
     }
-
     if (++mb_telemetry_div >= MB_TELEMETRY_DIVIDER)
     {
         mb_telemetry_div = 0;
         MotorBenchSendTelemetry();
+        MotorBenchSendControlReport(MB_OK);
     }
 }
 
@@ -1748,32 +1744,8 @@ static void MotorBenchSendTelemetry(void)
     {
         if (!mb_channels[i].is_used)
             continue;
-        if (MotorBenchGetMeasure(i, &items[count]) != MB_OK)
-            continue;
-
-        /*
-         * 用累加平均替换瞬时值(抗混叠,见 mb_tele_acc_* 的说明)。
-         *
-         * @attention 角度与温度**不参与平均**:
-         *   角度是位置量,跨圈跳变(359°→0°)会让平均值毫无意义;
-         *   温度本身是慢变量,平均它只会延迟响应。
-         *   只对**高频抖动的电流/转速**做平均,这才是混叠的来源。
-         *
-         * @note 累加器读完即清零,下一轮从 0 重新累加 ——
-         *   这样平均窗口恰好等于上报间隔(50Hz → 每窗口 10 拍),
-         *   不重置会让窗口随时间越拉越长、响应越来越迟钝。
-         */
-        if (mb_tele_acc_count[i] > 0)
-        {
-            float inv = 1.0f / (float)mb_tele_acc_count[i];
-            items[count].measure_torque = mb_tele_acc_current[i] * inv;
-            items[count].measure_speed = mb_tele_acc_voltage[i] * inv;
-        }
-        mb_tele_acc_current[i] = 0.0f;
-        mb_tele_acc_voltage[i] = 0.0f;
-        mb_tele_acc_count[i] = 0;
-
-        count++;
+        if (MotorBenchGetMeasure(i, &items[count]) == MB_OK)
+            count++;
     }
     if (count == 0)
         return; /* 无绑定通道时不发,节省带宽 */

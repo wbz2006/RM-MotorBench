@@ -60,7 +60,9 @@ void DMMotorCaliEncoder(DMMotorInstance *motor)
 
 DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
 {
+    if (!config || idx >= DM_MOTOR_CNT) return NULL;
     DMMotorInstance *motor = (DMMotorInstance *)malloc(sizeof(DMMotorInstance));
+    if (!motor) return NULL;
     memset(motor, 0, sizeof(DMMotorInstance));
     
     motor->motor_settings = config->controller_setting_init_config;
@@ -86,13 +88,31 @@ DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
         return NULL;
     }
 
-    DMMotorEnable(motor);
+    DMMotorStop(motor);
     DMMotorSetMode(DM_CMD_MOTOR_MODE, motor);
     DWT_Delay(0.1);
     DMMotorCaliEncoder(motor);
     DWT_Delay(0.1);
     dm_motor_instance[idx++] = motor;
     return motor;
+}
+
+void DMMotorDestroy(DMMotorInstance *motor)
+{
+    if (!motor) return;
+    DMMotorStop(motor);
+    DMMotorSetMode(DM_CMD_RESET_MODE, motor);
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    for (size_t i = 0; i < idx; ++i) {
+        if (dm_motor_instance[i] != motor) continue;
+        for (size_t j = i + 1; j < idx; ++j) dm_motor_instance[j - 1] = dm_motor_instance[j];
+        dm_motor_instance[--idx] = NULL;
+        CANUnregister(motor->motor_can_instace);
+        free(motor);
+        break;
+    }
+    __set_PRIMASK(mask);
 }
 
 void DMMotorSetRef(DMMotorInstance *motor, float ref)
@@ -129,6 +149,8 @@ void DMMotorControl()
 
         pid_ref = motor->pid_ref;
         set = pid_ref;
+        if (setting->close_loop_type & SPEED_LOOP)
+            set = PIDCalculate(&motor->speed_PID, motor->measure.velocity, pid_ref);
 
         if (setting->motor_reverse_flag == MOTOR_DIRECTION_REVERSE)
             set *= -1;

@@ -1,0 +1,61 @@
+{
+  "version": "2.0.0",
+  "presentation": {
+    "reveal": "always",
+    "panel": "dedicated",
+    "clear": true
+  },
+  "tasks": [
+    {
+      "label": "MotorBench: 编译 C 板",
+      "type": "process",
+      "command": "D:/mingw/mingw64/bin/mingw32-make.exe",
+      "args": ["-j4", "all"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PATH": "D:/Arm_GNU_Toolchain/13.3 rel1/bin;D:/mingw/mingw64/bin;${env:PATH}"
+        }
+      },
+      "group": "build",
+      "problemMatcher": {
+        "base": "$gcc",
+        "fileLocation": ["relative", "${workspaceFolder}"]
+      }
+    },
+    {
+      "label": "MotorBench: 烧录 C 板（CMSIS-DAP）",
+      "detail": "SWD：自动编译 C 板，再写入、校验并复位运行。",
+      "type": "process",
+      "command": "D:/hanako/xpack-openocd-0.12.0-7/bin/openocd.exe",
+      "args": [
+        "-s", "D:/hanako/xpack-openocd-0.12.0-7/openocd/scripts",
+        "-f", "openocd_dap.cfg",
+        "-c", "program build/basic_framework_CTYPE.elf verify reset exit"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": "MotorBench: 编译 C 板",
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "MotorBench: 烧录 C 板（J-Link）",
+      "detail": "SWD：自动编译 C 板，通过 OpenOCD + J-Link 写入、校验并复位运行。",
+      "type": "process",
+      "command": "D:/hanako/xpack-openocd-0.12.0-7/bin/openocd.exe",
+      "args": [
+        "-s", "D:/hanako/xpack-openocd-0.12.0-7/openocd/scripts",
+        "-f", "openocd_jlink.cfg",
+        "-c", "program build/basic_framework_CTYPE.elf verify reset exit"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": "MotorBench: 编译 C 板",
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    }
+  ]
+}

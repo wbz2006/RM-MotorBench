@@ -67,7 +67,6 @@ static void MotorSenderGrouping(DJIMotorInstance *motor, CAN_Init_Config_s *conf
 
         // 计算接收id并设置分组发送id
         config->rx_id = 0x200 + motor_id + 1;   // 把ID+1,进行分组设置
-        sender_enable_flag[motor_grouping] = 1; // 设置发送标志位,防止发送空帧
         motor->message_num = motor_send_num;
         motor->sender_group = motor_grouping;
 
@@ -109,7 +108,6 @@ static void MotorSenderGrouping(DJIMotorInstance *motor, CAN_Init_Config_s *conf
         }
 
         config->rx_id = 0x204 + motor_id + 1;   // 把ID+1,进行分组设置
-        sender_enable_flag[motor_grouping] = 1; // 只要有电机注册到这个分组,置为1;在发送函数中会通过此标志判断是否有电机注册
         motor->message_num = motor_send_num;
         motor->sender_group = motor_grouping;
 
@@ -170,34 +168,14 @@ static void DecodeDJIMotor(CANInstance *_instance)
     DaemonReload(motor->daemon);
     motor->dt = DWT_GetDeltaT(&motor->feed_cnt);
 
+    // 解析数据并对电流和速度进行滤波,电机的反馈报文具体格式见电机说明手册
     measure->last_ecd = measure->ecd;
     measure->ecd = ((uint16_t)rxbuff[0]) << 8 | rxbuff[1];
     measure->angle_single_round = ECD_ANGLE_COEF_DJI * (float)measure->ecd;
-
-    /*
-     * 解析数据并对电流和速度做一阶低通。
-     *
-     * @attention 【2026-10-13 修正】原公式把滤波系数的语义用反了。
-     *
-     * 原写法:
-     *     measure->real_current = (1 - COEF) * 旧值 + COEF * 新采样;
-     * 且 CURRENT_SMOOTH_COEF = 0.9 —— 即新采样占 90% 权重,
-     * **几乎等于不做滤波**(实测噪声只降 10%)。
-     * 注释"系数为1即关闭滤波"是对的,但由此推出"必须大于0.9"就完全反了:
-     * 在这个公式下系数越大越不滤波。
-     *
-     * 这是"电流曲线怎么滤都抖"的根源 —— 源头这道滤波器形同虚设,
-     * 后面无论再叠多少级平滑,都只是在补它的窟窿。
-     *
-     * 现改为系数 = 旧值权重的标准写法,含义与直觉一致:
-     *     measure = COEF * 旧值 + (1 - COEF) * 新采样
-     */
-    measure->speed_aps = SPEED_SMOOTH_COEF * measure->speed_aps +
-                         (1.0f - SPEED_SMOOTH_COEF) * RPM_2_ANGLE_PER_SEC *
-                             (float)((int16_t)(rxbuff[2] << 8 | rxbuff[3]));
-    measure->real_current = CURRENT_SMOOTH_COEF * measure->real_current +
-                            (1.0f - CURRENT_SMOOTH_COEF) *
-                                (float)((int16_t)(rxbuff[4] << 8 | rxbuff[5]));
+    measure->speed_aps = (1.0f - SPEED_SMOOTH_COEF) * measure->speed_aps +
+                         RPM_2_ANGLE_PER_SEC * SPEED_SMOOTH_COEF * (float)((int16_t)(rxbuff[2] << 8 | rxbuff[3]));
+    measure->real_current = (1.0f - CURRENT_SMOOTH_COEF) * measure->real_current +
+                            CURRENT_SMOOTH_COEF * (float)((int16_t)(rxbuff[4] << 8 | rxbuff[5]));
     measure->temperature = rxbuff[6];
 
     // 多圈角度计算,前提是假设两次采样间电机转过的角度小于180°,自己画个图就清楚计算过程了
@@ -236,7 +214,12 @@ static void DJIMotorLostCallback(void *motor_ptr)
 // 电机初始化,返回一个电机实例
 DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config)
 {
+    if (!config || idx >= DJI_MOTOR_CNT || config->can_init_config.tx_id < 1 ||
+        config->can_init_config.tx_id > 8 ||
+        (config->motor_type != GM6020 && config->motor_type != M3508 && config->motor_type != M2006))
+        return NULL;
     DJIMotorInstance *instance = (DJIMotorInstance *)malloc(sizeof(DJIMotorInstance));
+    if (!instance) return NULL;
     memset(instance, 0, sizeof(DJIMotorInstance));
 
     // motor basic setting 电机基本设置
@@ -290,10 +273,40 @@ DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config)
 #endif
     };
     instance->daemon = DaemonRegister(&daemon_config);
+    if (!instance->daemon) {
+        CANUnregister(instance->motor_can_instance);
+        free(instance);
+        return NULL;
+    }
 
-    DJIMotorEnable(instance);
+    DJIMotorStop(instance);
     dji_motor_instance[idx++] = instance;
+    sender_enable_flag[instance->sender_group] = 1;
     return instance;
+}
+
+void DJIMotorDestroy(DJIMotorInstance *motor)
+{
+    if (!motor) return;
+    DJIMotorStop(motor);
+    memset(sender_assignment[motor->sender_group].tx_buff + 2 * motor->message_num, 0, 2);
+    CANTransmit(&sender_assignment[motor->sender_group], 1);
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    for (size_t i = 0; i < idx; ++i) {
+        if (dji_motor_instance[i] != motor) continue;
+        uint8_t group = motor->sender_group;
+        for (size_t j = i + 1; j < idx; ++j) dji_motor_instance[j - 1] = dji_motor_instance[j];
+        dji_motor_instance[--idx] = NULL;
+        sender_enable_flag[group] = 0;
+        for (size_t j = 0; j < idx; ++j)
+            if (dji_motor_instance[j]->sender_group == group) sender_enable_flag[group] = 1;
+        DaemonUnregister(motor->daemon);
+        CANUnregister(motor->motor_can_instance);
+        free(motor);
+        break;
+    }
+    __set_PRIMASK(mask);
 }
 
 /* 电流只能通过电机自带传感器监测,后续考虑加入力矩传感器应变片等 */
@@ -340,26 +353,8 @@ void DJIMotorChangeLoop(DJIMotorInstance *motor, Closeloop_Type_e loop)
     if (!motor)
         return;
 
-    /*
-     * @attention 【2026-10-13 修复】这里必须接受**组合值**,不能只放行单环。
-     *
-     * 原判断是 `loop != ANGLE_LOOP && loop != SPEED_LOOP && ...` ——
-     * 只认 4 个单环常量,于是 SPEED_AND_CURRENT_LOOP(0b0011) 与
-     * ANGLE_AND_SPEED_LOOP(0b0110) 会被当作非法参数直接拒绝,
-     * 日志打 "invalid loop"。
-     *
-     * 但串级叠加本就是框架的原生能力:close_loop_type 是**位掩码**,
-     * DJIMotorControl() 逐环判断 `close_loop_type & XXX_LOOP`,
-     * pid_ref 顺次穿过被启用的每一环。
-     * 结果就是"界面上选不到双环",看起来像功能不存在,实际只是入口被这道校验挡住了。
-     *
-     * 现在改成位掩码合法性检查:允许的位必须非空,且不含未定义的位。
-     */
-    if (loop == OPEN_LOOP)
-    {
-        /* 开环是合法目标,单独放行(掩码为 0,不能用下面的非空判断) */
-    }
-    else if ((loop & ~(ANGLE_LOOP | SPEED_LOOP | CURRENT_LOOP)) != 0 || loop == 0)
+    if (loop != ANGLE_LOOP && loop != SPEED_LOOP && loop != CURRENT_LOOP &&
+        loop != OPEN_LOOP)
     {
         LOGERROR("[dji_motor] change loop failed: invalid loop %d", (int)loop);
         return;
@@ -379,19 +374,8 @@ void DJIMotorChangeLoop(DJIMotorInstance *motor, Closeloop_Type_e loop)
      *    DJIMotorControl() 的判定条件是
      *      位置环:(close_loop & ANGLE_LOOP) && outer_loop == ANGLE_LOOP
      *      速度环:(close_loop & SPEED_LOOP)  && (outer_loop & (ANGLE|SPEED))
-     *      电流环:(close_loop & CURRENT_LOOP)  —— 只要启用就执行,不限外层
      *    只改 outer_loop 而 close_loop 里没有对应位,那一环就根本不会执行。
-     *
-     * @attention 【2026-10-13】补全组合值的映射。
-     *   "速度环 + 电流环"是最常用的组合(速度环输出作为电流环参考),
-     *   也是本测试台建电机时的默认配置。
-     *   "角度环 + 速度环"由单环 ANGLE_LOOP 的既有语义推广而来
-     *   (位置环输出必须经过速度环才能变成电流指令)。
-     *
-     * @note 电流环的开启是**叠加式**而非替换式:
-     *   选 SPEED_LOOP 单环时 close_loop 里不含 CURRENT_LOOP ——
-     *   此时速度环输出**直接当作电流值**下发给电调,
-     *   表现为"没有电流内环的纯速度控制",这是有意保留的对照模式。
+     *    串级时位置环输出作为速度环参考,故位置环需同时打开速度环。
      */
     switch (loop)
     {
@@ -403,18 +387,6 @@ void DJIMotorChangeLoop(DJIMotorInstance *motor, Closeloop_Type_e loop)
         break;
     case CURRENT_LOOP:
         motor->motor_settings.close_loop_type = CURRENT_LOOP;
-        break;
-    case SPEED_AND_CURRENT_LOOP:
-        /* 速度外环 + 电流内环:速度环输出作为电流环参考 */
-        motor->motor_settings.close_loop_type = SPEED_LOOP | CURRENT_LOOP;
-        break;
-    case ANGLE_AND_SPEED_LOOP:
-        /* 位置外环 + 速度内环(不含电流环,与单环 ANGLE_LOOP 语义对齐) */
-        motor->motor_settings.close_loop_type = ANGLE_LOOP | SPEED_LOOP;
-        break;
-    case ALL_THREE_LOOP:
-        /* 三环全开:位置 → 速度 → 电流 */
-        motor->motor_settings.close_loop_type = ANGLE_LOOP | SPEED_LOOP | CURRENT_LOOP;
         break;
     default:
         motor->motor_settings.close_loop_type = OPEN_LOOP;

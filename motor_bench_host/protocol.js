@@ -29,12 +29,15 @@ export const FrameType = {
   PID_SET: 0x0a,
   PID_QUERY: 0x0b,
   MOTOR_UNBIND: 0x0c,
+  CONTROL_SOURCE: 0x0d,
+  CHASSIS_ENABLE: 0x0e,
   TELEMETRY: 0x81,
   INVENTORY_REPORT: 0x82,
   MOTOR_ADD_ACK: 0x8a,
   PID_REPORT: 0x8b,
   PID_SET_ACK: 0x8c,
   UNBIND_ACK: 0x8d,
+  CONTROL_REPORT: 0x8e,
 };
 
 /** 电机种类,需与固件 MB_MotorKind_e 一致 */
@@ -57,191 +60,19 @@ export const MotorKindLabel = {
   [MotorKind.HT]: 'HT04',
 };
 
-/* ============================================================
- * CAN ID 冲突预检
- *
- * 与固件 modules/motor_bench/motor_bench.c 的 MotorBenchPredictRxId()
- * 使用**完全相同**的公式(该公式又来自 DJI 库 dji_motor.c 的 MotorSenderGrouping)。
- * 三处必须一致 —— 这里只是把固件的预检提前到"用户还没点添加"的时刻,
- * 让用户当场看到冲突,而不是等板子拒绝。
- *
- * 公式:
- *   GM6020      : rx_id = 0x204 + id  → 0x205 ~ 0x20C
- *   M3508/M2006 : rx_id = 0x200 + id  → 0x201 ~ 0x208
- *   重叠区 0x205 ~ 0x208
- *
- * 关键:M3508 与 M2006 用**同一个公式**,所以它们之间"同 ID 必撞"。
- * 这一点最容易被忽略 —— 用户往往只想到 6020 与 3508 之间会冲突。
- * ============================================================ */
-
-/** 该型号是否占用 DJI 的 0x200 ID 段(DM/LK/HT 走另一套,不参与冲突判定) */
-export function usesDjiIdSegment(kind) {
-  return kind === MotorKind.GM6020
-    || kind === MotorKind.M3508
-    || kind === MotorKind.M2006;
-}
-
-/**
- * 预估某配置算出的反馈 ID(rx_id)
- * @returns {number} rx_id;非 DJI 系返回 0(表示不占用该 ID 段)
- */
-export function predictRxId(kind, motorId) {
-  if (kind === MotorKind.GM6020) return 0x204 + motorId;
-  if (kind === MotorKind.M3508 || kind === MotorKind.M2006) return 0x200 + motorId;
-  return 0;
-}
-
-/** ID 上限(MB_CHANNEL_MAX / 电调拨码范围) */
-export const MOTOR_ID_MIN = 1;
-export const MOTOR_ID_MAX = 8;
-
-/**
- * 计算某总线上哪些电调 ID 还可安全使用
- *
- * @param {number} canBus        要检查的总线(1 或 2)
- * @param {Array}  inventory     已添加的电机清单,每项含 {kind, canBus, motorId}
- * @param {number} kind          打算添加的型号
- * @returns {number[]} 可用 ID 升序数组
- *
- * @note 只在**同一条总线**上比对 —— 不同 CAN 总线是独立 ID 空间,互不影响。
- *       达妙等非 DJI 系不占用 0x200 段,任何 ID 都不与它们冲突。
- */
-export function availableIds(canBus, inventory, kind) {
-  if (!usesDjiIdSegment(kind)) {
-    /* 非 DJI 系不参与该段判定,1~8 全可用 */
-    return Array.from({ length: MOTOR_ID_MAX }, (_, i) => i + MOTOR_ID_MIN);
-  }
-
-  const taken = new Set();
-  for (const m of inventory) {
-    if (!m || m.canBus !== canBus) continue;       // 不同总线,跳过
-    if (!usesDjiIdSegment(m.kind)) continue;       // 非 DJI 系不占该段
-    taken.add(predictRxId(m.kind, m.motorId));
-  }
-
-  const free = [];
-  for (let id = MOTOR_ID_MIN; id <= MOTOR_ID_MAX; id++) {
-    if (!taken.has(predictRxId(kind, id))) free.push(id);
-  }
-  return free;
-}
-
-/**
- * 检查一个待添加的电机是否与已有电机冲突
- *
- * @returns {null|{existing:object, rxId:number}} 冲突时返回占用者;无冲突返回 null
- */
-export function findConflict(canBus, inventory, kind, motorId) {
-  if (!usesDjiIdSegment(kind)) return null;
-
-  const rx = predictRxId(kind, motorId);
-  for (const m of inventory) {
-    if (!m || m.canBus !== canBus) continue;
-    if (!usesDjiIdSegment(m.kind)) continue;
-    if (predictRxId(m.kind, m.motorId) === rx) {
-      return { existing: m, rxId: rx };
-    }
-  }
-  return null;
-}
-
-/**
- * 生成给用户看的冲突提示文案
- *
- * 设计要点(2026-10-13 用户要求):
- *   1. **说清改谁** —— 用户首先要知道调哪颗电机的拨码。
- *      6020 与 3508/2006 冲突时,建议改 3508/2006,因为 6020 常用的
- *      ID 1~4 与 3508 的 5~8 才冲突,而 6020 换到 5~8 会挤占更多;
- *      更重要的原因:3508/2006 通常成组(底盘 4 颗、拨弹 1 颗),
- *      改动它们其中一个的代价比动云台 6020 小。
- *   2. **给出可用 ID** —— 只说"冲突了"没用,用户下一步必然是问"那我填几"。
- *   3. 说明冲突的硬件原因(共用 rx_id),让用户下次能自己判断。
- *
- * @returns {string} 面向用户的中文提示
- */
-export function describeConflict(canBus, inventory, kind, motorId) {
-  const hit = findConflict(canBus, inventory, kind, motorId);
-  if (!hit) return '';
-
-  const me = MotorKindLabel[kind] ?? `类型${kind}`;
-  const other = MotorKindLabel[hit.existing.kind] ?? `类型${hit.existing.kind}`;
-  const rx = `0x${hit.rxId.toString(16).toUpperCase().padStart(3, '0')}`;
-
-  const free = availableIds(canBus, inventory, kind);
-
-  /*
-   * @attention 可用 ID 必须注明是"**本颗**该型号的可选项"。
-   *
-   * 原始文案只写"当前 CAN1 可用 ID:2、3、4、5…",而其中的 5 是按
-   * **本颗 6020** 算出来的(6020 拨 5 = 0x209,确实不冲突)。
-   * 但用户看到列表里有 5,极易理解成"3508 拨 5 也行"——
-   * 而 3508 拨 5 恰恰就是发生冲突的那个 ID,等于把人往坑里带。
-   * 所以把型号写进这句,并说明列表随型号而变。
-   */
-  const freeLine = free.length
-    ? `当前 CAN${canBus} 上 ${me} 可用的拨码 ID:${free.join('、')}`
-    : `当前 CAN${canBus} 已无 ${me} 可用的拨码 ID(请改接另一条总线,或先移除一颗电机)`;
-
-  /* 建议改谁:若对方是 3508/2006,优先建议改对方 —— 见函数注释 */
-  const otherIsDji3xxx = hit.existing.kind === MotorKind.M3508
-    || hit.existing.kind === MotorKind.M2006;
-  const meIsDji3xxx = kind === MotorKind.M3508 || kind === MotorKind.M2006;
-
-  let advice;
-  if (otherIsDji3xxx && !meIsDji3xxx) {
-    /* 我要加的是 6020,占位的是 3508/2006 → 建议改 3508/2006 */
-    advice = `请改 ${other}(CAN${canBus} 拨码 ID${hit.existing.motorId})的拨码,`
-      + `或把本颗 6020 拨到 5~8(0x209~0x20C 与它们不重叠)`;
-  } else if (meIsDji3xxx && !otherIsDji3xxx) {
-    advice = `本颗 ${me} 与已是 6020 的 ${other} 冲突。`
-      + `6020 与 3508/2006 的 ID 区间只在"相差 4"时重叠,`
-      + `请把本颗 ${me} 拨到上面的可用 ID`;
-  } else if (meIsDji3xxx && otherIsDji3xxx) {
-    /* 3508 与 2006 同 ID —— 这是最容易被忽略的一类 */
-    advice = `M3508 与 M2006 的反馈 ID 用同一公式(0x200+ID),`
-      + `所以同一个 ID 只能有一个。请把本颗 ${me} 或 ${other} 改成可用 ID`;
-  } else {
-    advice = `请把本颗 ${me} 拨到上面的可用 ID`;
-  }
-
-  return `ID 冲突:${me}(CAN${canBus} ID${motorId})与已添加的 `
-    + `${other}(CAN${canBus} ID${hit.existing.motorId})共用反馈 ID ${rx}。`
-    + `${advice}。${freeLine}(可用 ID 随型号而变,以本颗型号为准)`;
-}
-
-/**
- * 闭环类型,需与固件 Closeloop_Type_e 一致。
- *
- * @attention 【2026-10-13】补上组合值。
- *   此前只有 4 个单环,于是"速度环 + 电流环"这个**最常用的配置**
- *   在上位机根本表达不出来 —— 界面上选不到,协议里也没有对应常量。
- *   而串级叠加是框架的原生能力(close_loop_type 是位掩码),
- *   缺的只是上层入口。
- *
- * @note 位掩码里"有速度位"不代表外层就是速度环:
- *   外层只能有**一个**环,组合值中的速度位表示"速度环被启用"。
- *   SPEED_AND_CURRENT_LOOP(0b0011) 的外层是速度环、电流是内环;
- *   ANGLE_AND_SPEED_LOOP(0b0110) 的外层是位置环、速度是内环。
- *   固件据此决定 rpm 换算,判外层必须精确匹配。
- */
+/** 闭环类型,需与固件 Closeloop_Type_e 一致 */
 export const LoopType = {
   OPEN_LOOP: 0b0000,
   CURRENT_LOOP: 0b0001,
   SPEED_LOOP: 0b0010,
   ANGLE_LOOP: 0b0100,
-  SPEED_AND_CURRENT_LOOP: 0b0011,
-  ANGLE_AND_SPEED_LOOP: 0b0110,
-  ALL_THREE_LOOP: 0b0111,
 };
 
 export const LoopLabel = {
   [LoopType.OPEN_LOOP]: '开环',
   [LoopType.CURRENT_LOOP]: '电流环',
-  [LoopType.SPEED_LOOP]: '速度环(单环)',
+  [LoopType.SPEED_LOOP]: '速度环',
   [LoopType.ANGLE_LOOP]: '角度环',
-  [LoopType.SPEED_AND_CURRENT_LOOP]: '速度+电流环',
-  [LoopType.ANGLE_AND_SPEED_LOOP]: '角度+速度环',
-  [LoopType.ALL_THREE_LOOP]: '角度+速度+电流环',
 };
 
 /**
@@ -352,6 +183,51 @@ export function buildSetRef(channelId, ref) {
  */
 export function buildEnable(channelId, enable) {
   return buildFrame(FrameType.MOTOR_ENABLE, Buffer.from([channelId, enable ? 1 : 0]));
+}
+
+export function buildControlSource(source, channelId = 0, maxRef = 0) {
+  if (![0, 1].includes(source) || !Number.isInteger(channelId) || channelId < 0 || channelId >= 8 ||
+      !Number.isFinite(maxRef) || (source === 1 && (maxRef <= 0 || maxRef > 12000)))
+    throw new RangeError('控制来源、通道或遥控最大转速不合法');
+  const body = Buffer.alloc(6);
+  body[0] = source;
+  body[1] = channelId;
+  body.writeFloatLE(maxRef, 2);
+  return buildFrame(FrameType.CONTROL_SOURCE, body);
+}
+
+export function parseControlReport(body) {
+  if (body.length !== 12 && body.length !== 21) return null;
+  if (body[1] >= 2 && body.length !== 21) return null;
+  const report = {
+    result: body[0], source: body[1], channelId: body[2], online: !!body[3],
+    switchRight: body[4], ready: !!body[5], rocker: body.readInt16LE(6),
+    maxRef: body.readFloatLE(8),
+  };
+  if (body.length === 21) Object.assign(report, {
+    channels: [...body.subarray(12, 16)], reverseMask: body[16],
+    lateral: body.readInt16LE(17), yaw: body.readInt16LE(19),
+  });
+  return report;
+}
+
+export function buildChassisControl(source, channels, maxRef, reverseMask = 0) {
+  if (![2, 3].includes(source) || !Array.isArray(channels) || channels.length !== 4 ||
+      new Set(channels).size !== 4 || channels.some(id => !Number.isInteger(id) || id < 0 || id >= 8) ||
+      !Number.isInteger(reverseMask) || reverseMask < 0 || reverseMask > 15 ||
+      !Number.isFinite(maxRef) || maxRef <= 0 || maxRef > 12000)
+    throw new RangeError('底盘类型、四轮通道、反向或最大转速不合法');
+  const body = Buffer.alloc(10);
+  body[0] = source;
+  channels.forEach((id, i) => { body[1 + i] = id; });
+  body[5] = reverseMask;
+  body.writeFloatLE(maxRef, 6);
+  return buildFrame(FrameType.CONTROL_SOURCE, body);
+}
+
+export function buildChassisEnable(enable) {
+  if (typeof enable !== 'boolean') throw new RangeError('底盘使能需为布尔值');
+  return buildFrame(FrameType.CHASSIS_ENABLE, Buffer.from([enable ? 1 : 0]));
 }
 
 export function buildAllStop() {
@@ -492,45 +368,31 @@ export const PidLoopLabel = {
 /**
  * PID 默认参数 —— 与固件 motor_bench_app.c 的 bench_dji_*_pid[] 逐项对应。
  *
- * @attention 【2026-10-13 实测修正】速度环 Kp 由 1 提高到 3 / 2 / 8。
- *
- *   Kp=1 时电机实际**转不起来**。量纲算一下就清楚:
- *     速度环输出 = Kp × 误差(rpm)
- *   裸电机的静摩擦与齿槽转矩要吃掉可观电流。若 Kp=1,
- *   要输出 1000(约相当于 3508 的 6% 电流值)需要 1000rpm 的误差 ——
- *   而电机全速也不过 9000rpm,等于开环都转不动,更别说闭环。
- *
- *   空载台架起点取原实车值的 1/5 ~ 1/7:
- *     M3508  Kp=3  (原 20,摩擦轮)
- *     M2006  Kp=2  (原 10,拨弹盘)
- *     GM6020 Kp=8  (原 50;Ki 由 200 降为 0 —— 先只用比例项判断能否转稳)
- *   Ki 一律 0:先看"能不能转、稳不稳",再由使用者自己加 Ki 消静差。
- *   这三个值只是**能转起来的保守起点**,不是最优,真正整定在网页面板上做。
- *
- * MaxOut 是输出限幅不是增益,仍按型号留足余量:
- *   M3508 约 16000,M2006 约 10000,GM6020 约 30000。
- * 电流环保持 Kp=0.7/Ki=0.1(Ki=0 时速度环输出才不会长期偏离真实电流需求)。
+ * 来源:gimbal-fed infantry 工程实机整定值(2026-10-12 迁移)。
+ *   M3508  -> shoot.c   摩擦轮 friction_config
+ *   M2006  -> shoot.c   拨弹盘 loader_config (速度环部分)
+ *   GM6020 -> gimbal.c  yaw 轴
  *
  * @note 放在 protocol.js 而非 ui.js:这是**协议层数据**,不是界面状态。
  *   ui.js 要在页面里显示默认值,selftest.js 要校验与固件一致,
  *   两边都 import 同一份就消除了"页面显示一套、固件生效另一套"的风险。
  */
 export const PID_DEFAULTS = {
-  // 大疆 M3508 —— Kp=1/0/0 基线(close_loop = SPEED|CURRENT)
+  // 大疆 M3508 —— 摩擦轮实参(close_loop = SPEED|CURRENT)
   [MotorKind.M3508]: {
-    speed: { Kp: 3, Ki: 0, Kd: 0, MaxOut: 15000, IntegralLimit: 10000, improve: 0 },
+    speed: { Kp: 20, Ki: 1, Kd: 0, MaxOut: 15000, IntegralLimit: 10000, improve: 0 },
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 15000, IntegralLimit: 10000, improve: 0 },
     angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
   },
-  // 大疆 M2006
+  // 大疆 M2006 —— 拨弹盘速度环实参
   [MotorKind.M2006]: {
-    speed: { Kp: 2, Ki: 0, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
+    speed: { Kp: 10, Ki: 1, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
     angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
   },
-  // 大疆 GM6020
+  // 大疆 GM6020 —— yaw 轴实参
   [MotorKind.GM6020]: {
-    speed: { Kp: 8, Ki: 0, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 5 },
+    speed: { Kp: 50, Ki: 200, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 5 },
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 0 },
     angle: { Kp: 8, Ki: 0, Kd: 0, MaxOut: 500, IntegralLimit: 100, improve: 5 },
   },

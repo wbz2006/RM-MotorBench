@@ -19,16 +19,16 @@ static uint8_t idx; // 全局CAN实例索引,每次有新的模块注册会自�
  *            现提升为文件作用域,配合 CANUnregister() 回收,
  *            以支持运行期动态创建/销毁电机(测试台按电调实际 ID 现场配置)。
  */
-static uint8_t can1_filter_idx = 0;
-static uint8_t can2_filter_idx = 14;
+static uint16_t can1_filter_used;
+static uint16_t can2_filter_used;
 
 /** CAN1/CAN2 各自可用的 filter bank 总数(F427 双 CAN 共享 28 个,各 14 个) */
 #define CAN_FILTER_BANK_TOTAL 14u
 
 /** 取该总线的过滤器索引池指针 */
-static uint8_t *CANFilterIdxPtr(CAN_HandleTypeDef *handle)
+static uint16_t *CANFilterIdxPtr(CAN_HandleTypeDef *handle)
 {
-    return (handle == &hcan1) ? &can1_filter_idx : &can2_filter_idx;
+    return (handle == &hcan1) ? &can1_filter_used : &can2_filter_used;
 }
 
 /** 取该总线索引池的起始 bank 号(CAN1 从 0,CAN2 从 14) */
@@ -39,7 +39,10 @@ static uint8_t CANFilterBankBase(CAN_HandleTypeDef *handle)
 
 uint8_t CANGetFilterUsed(CAN_HandleTypeDef *can_handle)
 {
-    return (uint8_t)(*CANFilterIdxPtr(can_handle) - CANFilterBankBase(can_handle));
+    uint16_t bits = *CANFilterIdxPtr(can_handle);
+    uint8_t used = 0;
+    while (bits) { used += bits & 1u; bits >>= 1; }
+    return used;
 }
 
 uint8_t CANGetFilterFree(CAN_HandleTypeDef *can_handle)
@@ -59,11 +62,10 @@ static void CANReleaseFilter(CAN_HandleTypeDef *handle, uint8_t bank)
     f.FilterMode = CAN_FILTERMODE_IDLIST;
     f.FilterScale = CAN_FILTERSCALE_16BIT;
     f.FilterActivation = CAN_FILTER_DISABLE; // 禁用即释放
+    f.SlaveStartFilterBank = 14;
     HAL_CAN_ConfigFilter(handle, &f);
 
-    uint8_t *pool = CANFilterIdxPtr(handle);
-    if (*pool > CANFilterBankBase(handle))
-        (*pool)--;
+    *CANFilterIdxPtr(handle) &= (uint16_t)~(1u << (bank - CANFilterBankBase(handle)));
 }
 
 /**
@@ -77,6 +79,8 @@ uint8_t CANUnregister(CANInstance *_instance)
 {
     if (!_instance)
         return 1;
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
 
     for (size_t i = 0; i < idx; i++)
     {
@@ -91,9 +95,11 @@ uint8_t CANUnregister(CANInstance *_instance)
             idx--;
 
             free(_instance); // 释放 malloc 出来的空间
+            __set_PRIMASK(mask);
             return 0;
         }
     }
+    __set_PRIMASK(mask);
     return 1; // 未找到
 }
 
@@ -112,23 +118,32 @@ uint8_t CANUnregister(CANInstance *_instance)
  *
  * @param _instance can instance owned by specific module
  */
-static void CANAddFilter(CANInstance *_instance)
+static uint8_t CANAddFilter(CANInstance *_instance)
 {
-    CAN_FilterTypeDef can_filter_conf;
-    uint8_t *pool = CANFilterIdxPtr(_instance->can_handle);
+    CAN_FilterTypeDef can_filter_conf = {0};
+    uint16_t *pool = CANFilterIdxPtr(_instance->can_handle);
+    uint8_t slot = 0;
+    while (slot < CAN_FILTER_BANK_TOTAL && (*pool & (1u << slot))) slot++;
+    if (slot == CAN_FILTER_BANK_TOTAL) return 0;
 
     can_filter_conf.FilterMode = CAN_FILTERMODE_IDLIST;  //使用id list模式,即只有将rxid添加到过滤器中才会接收到,其他报文会被过滤
     can_filter_conf.FilterScale = CAN_FILTERSCALE_16BIT; //使用16位id模式,即只有低16位有效
     can_filter_conf.FilterFIFOAssignment = (_instance->tx_id & 1) ? CAN_RX_FIFO0 : CAN_RX_FIFO1; //奇数id的模块会被分配到FIFO0,偶数id的模块会被分配到FIFO1
     can_filter_conf.SlaveStartFilterBank = 14; // 从第14个过滤器开始配置从机过滤器(在STM32的BxCAN控制器中CAN2是CAN1的从机)
     can_filter_conf.FilterIdLow = _instance->rx_id << 5; // 过滤器寄存器的低16位,因为使用STDID,所以只有低11位有效,高5位要填0
-    can_filter_conf.FilterBank = (*pool)++; // 使用文件作用域的索引池,便于 CANUnregister() 回收
+    can_filter_conf.FilterIdHigh = can_filter_conf.FilterIdLow;
+    can_filter_conf.FilterMaskIdHigh = can_filter_conf.FilterIdLow;
+    can_filter_conf.FilterMaskIdLow = can_filter_conf.FilterIdLow;
+    can_filter_conf.FilterBank = CANFilterBankBase(_instance->can_handle) + slot;
     can_filter_conf.FilterActivation = CAN_FILTER_ENABLE; // 启用过滤器
 
     /* 记录本实例占用的 bank,供 CANUnregister() 精确禁用 */
     _instance->filter_bank = (uint8_t)can_filter_conf.FilterBank;
 
-    HAL_CAN_ConfigFilter(_instance->can_handle, &can_filter_conf);
+    if (HAL_CAN_ConfigFilter(_instance->can_handle, &can_filter_conf) != HAL_OK)
+        return 0;
+    *pool |= (uint16_t)(1u << slot);
+    return 1;
 }
 
 /**
@@ -151,9 +166,14 @@ static void CANServiceInit()
 
 CANInstance *CANRegister(CAN_Init_Config_s *config)
 {
-    if (!idx)
+    if (!config || (config->can_handle != &hcan1 && config->can_handle != &hcan2) ||
+        config->tx_id > 0x7ff || config->rx_id > 0x7ff)
+        return NULL;
+    static uint8_t service_started;
+    if (!service_started)
     {
         CANServiceInit(); // 第一次注册,先进行硬件初始化
+        service_started = 1;
     }
 
     /*
@@ -193,6 +213,7 @@ CANInstance *CANRegister(CAN_Init_Config_s *config)
     }
 
     CANInstance *instance = (CANInstance *)malloc(sizeof(CANInstance)); // 分配空间
+    if (!instance) return NULL;
     memset(instance, 0, sizeof(CANInstance));                           // 分配的空间未必是0,所以要先清空
     // 进行发送报文的配置
     instance->txconf.StdId = config->tx_id; // 发送id
@@ -206,8 +227,15 @@ CANInstance *CANRegister(CAN_Init_Config_s *config)
     instance->can_module_callback = config->can_module_callback;
     instance->id = config->id;
 
-    CANAddFilter(instance);         // 添加CAN过滤器规则
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    if (!CANAddFilter(instance)) {
+        free(instance);
+        __set_PRIMASK(mask);
+        return NULL;
+    }
     can_instance[idx++] = instance; // 将实例保存到can_instance中
+    __set_PRIMASK(mask);
 
     return instance; // 返回can实例指针
 }

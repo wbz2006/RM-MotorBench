@@ -62,6 +62,7 @@ typedef enum
 }DMMotor_Mode_e;
 
 DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config);
+void DMMotorDestroy(DMMotorInstance *motor);
 
 void DMMotorSetRef(DMMotorInstance *motor, float ref);
 

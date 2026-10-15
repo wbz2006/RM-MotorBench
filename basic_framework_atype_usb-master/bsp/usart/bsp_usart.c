@@ -40,6 +40,8 @@ USARTInstance *USARTRegister(USART_Init_Config_s *init_config)
         while (1)
             ;
     USARTInstance *instance = (USARTInstance *)malloc(sizeof(USARTInstance));
+    if (!instance)
+        return NULL;
     memset(instance, 0, sizeof(USARTInstance));
 
     instance->usart_handle = init_config->usart_handle;
@@ -102,6 +104,9 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     { // find the instance which is being handled
         if (huart == usart_instance[i]->usart_handle)
         { // call the callback function if it is not NULL
+            if (Size > usart_instance[i]->recv_buff_size)
+                Size = usart_instance[i]->recv_buff_size;
+            usart_instance[i]->recv_len = Size;
             if (usart_instance[i]->module_callback != NULL)
             {
                 usart_instance[i]->module_callback();

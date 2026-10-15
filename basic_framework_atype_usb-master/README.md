@@ -6,6 +6,14 @@ https://gitee.com/hnuyuelurm/basic_framework_atype
 
 当前工程基于 STM32F427 A 板生成，时钟频率暂保持 168MHz。工程结构已经切换为 CubeMX 生成的 `Core/Inc`、`Core/Src` 目录，并使用 `STM32F427IIHx_FLASH.ld`、`startup_stm32f427xx.s` 和根目录 `Makefile` 构建。
 
+## VS Code 编译与烧录
+
+用 VS Code 直接打开本目录，按 `Ctrl+Shift+P` 选择“任务：运行任务”，即可运行 `MotorBench: 烧录 A 板（CMSIS-DAP）` 或 `MotorBench: 烧录 A 板（J-Link）`。任务会先编译本板固件，成功后写入 `build/basic_framework_ATYPE.elf`、校验并复位运行；编译失败则停止烧录。仅编译时按 `Ctrl+Shift+B`，选择 `MotorBench: 编译 A 板`。
+
+任务配置位于本目录的 `.vscode/tasks.json`，使用本机已配置的 Make、ARM GCC 和 OpenOCD 路径。连接与工具路径说明见[总工程 README](../README.md#在-vs-code-中烧录本机已配置)。
+
+## IMU 与外设适配
+
 IMU 方案已由原工程的 `BMI088 + IST8310` 替换为 A 板上的 `MPU6500`。当前 `modules/mpu6500` 中保留了上层惯导接口：
 
 - `attitude_t`
@@ -296,7 +304,7 @@ app、module和bsp都有相应的rtos任务。其中bsp为创建任务提供了�
 
 工具链会预测ram，ccram以及flash的使用情况，并报告最终二进制文件的大小和存放位置。
 
-随后，通过调试器将开发板连接至你的电脑，点击上方tab页的终端（terminal）->运行任务（run task)，选择download_dap or download_jlink（或你自己编写的stlink/ulink/...），便会开始下载，终端或jFlash中会提示擦除、下载、验证的进度。
+随后，通过调试器将开发板连接至你的电脑，点击上方tab页的终端（terminal）->运行任务（run task)，选择 `MotorBench: 烧录 A 板（CMSIS-DAP）` 或 `MotorBench: 烧录 A 板（J-Link）`，任务会先编译，再通过 OpenOCD 完成下载、校验并复位运行。
 
 想要调试，在左侧tab页选择合适的调试选项，按F5或图形界面的绿色小三角形按钮，开始调试。当然，调试器的设置也请参考配置文档，主要是将可执行文件路劲加入环境变量的PATH。
 
@@ -340,7 +348,7 @@ app、module和bsp都有相应的rtos任务。其中bsp为创建任务提供了�
 
 ### VSCode集成工具
 
-我们在`.vscode`下提供了编写好的一些任务，包括编译，烧录，启动RTT终端（LOG），启动Ozone调试等。有些功能需要配置vscode的插件设置或将一些可执行文件加入环境变量，这些步骤已经在[VSCode+Ozone使用方法.md](.Doc/VSCode+Ozone使用方法.md)中给出；`launch.json`里包含了最常见的四种调试任务：使用jlink-server/openocd，启动或附加调试。
+当前 A 板的 `.vscode/tasks.json` 提供三个任务：编译、CMSIS-DAP 烧录和 J-Link 烧录，使用方法见本文开头的“VS Code 编译与烧录”。RTT、Ozone 和 F5 调试需按[VSCode+Ozone使用方法.md](.Doc/VSCode+Ozone使用方法.md)另行配置。
 
 ### for pro-user
 

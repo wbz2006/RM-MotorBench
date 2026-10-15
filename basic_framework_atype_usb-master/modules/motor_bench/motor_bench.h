@@ -33,7 +33,7 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 0
+#define MB_FW_VERSION_MINOR 2
 
 /** 通道数上限 */
 #define MB_CHANNEL_MAX 8
@@ -93,12 +93,15 @@ typedef enum
     MB_FRAME_PID_SET = 0x0A,   /* 运行期写入单通道单环 PID 参数 */
     MB_FRAME_PID_QUERY = 0x0B, /* 请求上报单通道三套 PID 参数 */
     MB_FRAME_MOTOR_UNBIND = 0x0C, /* 解绑通道(释放 is_used,否则无法改绑) */
+    MB_FRAME_CONTROL_SOURCE = 0x0D,
+    MB_FRAME_CHASSIS_ENABLE = 0x0E, /* Enable/stop the four selected chassis wheels atomically. */
     MB_FRAME_TELEMETRY = 0x81,    /* 板端遥测上报(仅板端发出) */
     MB_FRAME_INVENTORY_REPORT = 0x82, /* 电机清单应答(仅板端发出) */
     MB_FRAME_MOTOR_ADD_ACK = 0x8A,   /* 建电机结果应答(仅板端发出) */
     MB_FRAME_PID_REPORT = 0x8B,      /* PID 参数应答(仅板端发出) */
     MB_FRAME_PID_SET_ACK = 0x8C,     /* PID 写入结果应答(仅板端发出) */
     MB_FRAME_UNBIND_ACK = 0x8D,      /* 解绑结果应答(仅板端发出) */
+    MB_FRAME_CONTROL_REPORT = 0x8E,
 } MB_FrameType_e;
 
 /** 支持的电机种类,与 motor_def.h / 各驱动一一对应 */
@@ -302,7 +305,7 @@ typedef struct
     uint8_t tail;
 } MB_TelemetryFrame_s;
 
-/** 心跳应答帧:body = fw_major fw_minor inventory flags uptime(2) seq(2) = 9 字节 */
+/** 心跳应答帧:body = fw_major fw_minor inventory flags uptime(2) seq(2) reserved = 9 字节 */
 typedef struct
 {
     uint8_t head;
@@ -314,6 +317,7 @@ typedef struct
     uint8_t board_flags;
     uint16_t uptime_s;
     uint16_t seq;
+    uint8_t reserved;
     uint8_t crc;
     uint8_t tail;
 } MB_HeartbeatAck_s;
@@ -451,6 +455,9 @@ _Static_assert(offsetof(MB_HeartbeatAck_s, motor_inventory_count) == 5, "ack inv
 _Static_assert(offsetof(MB_HeartbeatAck_s, board_flags) == 6, "ack flags @6");
 _Static_assert(offsetof(MB_HeartbeatAck_s, uptime_s) == 7, "ack uptime @7");
 _Static_assert(offsetof(MB_HeartbeatAck_s, seq) == 9, "ack seq @9");
+_Static_assert(offsetof(MB_HeartbeatAck_s, reserved) == 11, "ack reserved @11");
+_Static_assert(sizeof(MB_HeartbeatAck_s) == 5 + MB_HEARTBEAT_ACK_CRC_LEN,
+               "heartbeat frame length must match its declared payload");
 #endif
 
 /* ============================================================
@@ -546,17 +553,9 @@ void MotorBenchSetMotorFactory(MB_MotorFactory_t factory, MB_MotorDestroy_t dest
  * @param kind       电机种类
  * @param can_bus    1=CAN1 2=CAN2
  * @param motor_id   电调 ID(DJI 系 1~8,达妙 1~4)
- * @param outer_loop 外层闭环。**位掩码,可叠加**:
- *                    OPEN_LOOP(0) / CURRENT_LOOP(1) / SPEED_LOOP(2) / ANGLE_LOOP(4)
- *                    组合值:SPEED_AND_CURRENT_LOOP(3,速度外环+电流内环)
- *                           ANGLE_AND_SPEED_LOOP(6,位置外环+速度内环)
- *                           ALL_THREE_LOOP(7,三环全开)
- *
- * @attention 位掩码里"有速度位"不代表外层就是速度环 ——
- *   外层只能有**一个**环,组合值里的速度位表示"速度环被启用"。
- *   例:SPEED_AND_CURRENT_LOOP(0b0011) 的外层是速度环,电流位表示电流内环也开着。
- *       同理 ANGLE_AND_SPEED_LOOP(0b0110) 的外层是位置环。
- *   判外层要精确匹配,不要用 `&` 判断(详见 motor_bench.c 的 need_rpm_conv)。
+ * @param outer_loop 外层闭环:OPEN_LOOP / SPEED_LOOP / ANGLE_LOOP
+ * @param instance   已由 DJIMotorInit()/DMMotorInit() 等创建好的实例指针
+ * @return MB_OK 成功
  *
  * @note  登记后该电机立即被置为停止状态,须由上位机 enable 才会输出。
  *        同一总线上不允许重复登记相同 ID。
@@ -674,6 +673,10 @@ uint8_t MotorBenchAnyMotorOnline(void);
  * @note  内部按 MB_TELEMETRY_DIVIDER 节流到约 50Hz 上报遥测
  */
 void MotorBenchTask(void);
+
+/* axes: right vertical (forward), right horizontal (right), left horizontal (clockwise). */
+typedef void (*MB_RemoteReader_t)(uint8_t *online, int16_t axes[3], uint8_t *switch_right);
+void MotorBenchSetRemoteReader(MB_RemoteReader_t reader);
 
 /**
  * @brief 手动重载上位机链路守护

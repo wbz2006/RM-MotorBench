@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { ChannelBindings } from './channel_bindings.js';
 import {
   FrameParser,
   FrameType,
@@ -34,6 +35,10 @@ import {
   buildMotorAdd,
   buildMotorRemove,
   buildUnbind,
+  buildControlSource,
+  buildChassisControl,
+  buildChassisEnable,
+  parseControlReport,
   parseUnbindAck,
   buildSetPid,
   buildPidQuery,
@@ -103,6 +108,11 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 const parser = new FrameParser();
+const channelBindings = new ChannelBindings();
+
+function bindingReport() {
+  return { type: 'bindings', data: { items: channelBindings.snapshot() } };
+}
 
 /** 串口实例,未连接时为 null */
 let serialPort = null;
@@ -145,21 +155,14 @@ function writeToSerial(buf) {
 function handleCommand(cmd) {
   switch (cmd.type) {
     case 'bind':
-      writeToSerial(
+      if (writeToSerial(
         buildBind(cmd.channelId, {
           kind: cmd.kind,
           canBus: cmd.canBus,
           motorId: cmd.motorId,
-          /*
-           * @attention 默认值与固件建电机时的配置保持一致:
-           *   SPEED_AND_CURRENT_LOOP(速度外环 + 电流内环)。
-           * 原先默认是单环 SPEED_LOOP(2),而固件建电机用 3 ——
-           * 上位机旧版本若不传 outerLoop,就会静默降级成"没有电流内环",
-           * 表现为低速爬行差、负载突变时跟随不上,且没有任何报错。
-           */
-          outerLoop: cmd.outerLoop ?? LoopType.SPEED_AND_CURRENT_LOOP,
+          outerLoop: cmd.outerLoop ?? LoopType.SPEED_LOOP,
         }),
-      );
+      )) channelBindings.request(cmd);
       break;
     case 'setRef':
       writeToSerial(buildSetRef(cmd.channelId, Number(cmd.ref)));
@@ -181,6 +184,7 @@ function handleCommand(cmd) {
 wss.on('connection', (ws) => {
   broadcast({ type: 'clients', count: wss.clients.size });
   ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0' }));
+  ws.send(JSON.stringify(bindingReport()));
 
   ws.on('message', (data) => {
     let cmd;
@@ -189,7 +193,22 @@ wss.on('connection', (ws) => {
     } catch {
       return;
     }
-    if (cmd.type === 'listPorts') {
+    if (cmd.type === 'identifyChannel') {
+      // Display metadata supplied by the user; never send this to the motor.
+      channelBindings.identify(cmd);
+      broadcast(bindingReport());
+    } else if (cmd.type === 'controlSource') {
+      try {
+        writeToSerial(cmd.source >= 2
+          ? buildChassisControl(cmd.source, cmd.channels, Number(cmd.maxRef), cmd.reverseMask)
+          : buildControlSource(cmd.source, cmd.channelId, Number(cmd.maxRef)));
+      } catch (error) {
+        ws.send(JSON.stringify({ type: 'error', message: error.message }));
+      }
+    } else if (cmd.type === 'chassisEnable') {
+      try { writeToSerial(buildChassisEnable(cmd.enable)); }
+      catch (error) { ws.send(JSON.stringify({ type: 'error', message: error.message })); }
+    } else if (cmd.type === 'listPorts') {
       listSerialPorts().catch((e) =>
         ws.send(JSON.stringify({ type: 'error', message: `枚举串口失败: ${e.message}` })),
       );
@@ -244,7 +263,7 @@ wss.on('connection', (ws) => {
       if (!writeToSerial(buildUnbind(channelId))) {
         ws.send(JSON.stringify({
           type: 'unbindAck',
-          data: { channelId, result: MBResult.BAD_PARAM },
+          data: { channelId, result: MBResult.BAD_PARAM, boardConfirmed: false },
         }));
         ws.send(JSON.stringify({ type: 'error', message: '串口未连接,请先打开串口' }));
       }
@@ -272,7 +291,10 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => broadcast({ type: 'clients', count: wss.clients.size }));
+  ws.on('close', () => {
+    if (wss.clients.size === 0 && serialPort?.isOpen) writeToSerial(buildAllStop());
+    broadcast({ type: 'clients', count: wss.clients.size });
+  });
 });
 
 /* ---------------- 串口 ---------------- */
@@ -299,6 +321,7 @@ async function openSerial(portPath, baud) {
       { path: portPath, baudRate: baud, autoOpen: true },
       (err) => {
         if (err) return reject(err);
+        channelBindings.reset();
         broadcast({ type: 'serial', open: true, path: portPath, baud });
         startHeartbeat();
         // 立刻拉一次电机清单,让界面马上知道这块板能测哪些电机
@@ -326,10 +349,17 @@ async function openSerial(portPath, baud) {
           if (ack) broadcast({ type: 'heartbeat', data: ack });
         } else if (fr.type === FrameType.TELEMETRY) {
           const tm = parseTelemetry(fr.payload);
-          if (tm) broadcast({ type: 'telemetry', data: tm });
+          if (tm) {
+            if (channelBindings.telemetry(tm.items)) broadcast(bindingReport());
+            broadcast({ type: 'telemetry', data: tm });
+          }
         } else if (fr.type === FrameType.INVENTORY_REPORT) {
           const inv = parseInventory(fr.payload);
-          if (inv) broadcast({ type: 'inventory', data: inv });
+          if (inv) {
+            channelBindings.inventory(inv.items);
+            broadcast(bindingReport());
+            broadcast({ type: 'inventory', data: inv });
+          }
         } else if (fr.type === FrameType.MOTOR_ADD_ACK) {
           const ack = parseMotorAddAck(fr.payload);
           if (ack) broadcast({ type: 'motorAck', data: ack });
@@ -341,12 +371,20 @@ async function openSerial(portPath, baud) {
           if (ack) broadcast({ type: 'pidAck', data: ack });
         } else if (fr.type === FrameType.UNBIND_ACK) {
           const ack = parseUnbindAck(fr.payload);
-          if (ack) broadcast({ type: 'unbindAck', data: ack });
+          if (ack) {
+            channelBindings.unbind(ack);
+            broadcast({ type: 'unbindAck', data: ack });
+            broadcast(bindingReport());
+          }
+        } else if (fr.type === FrameType.CONTROL_REPORT) {
+          const report = parseControlReport(fr.payload);
+          if (report) broadcast({ type: 'controlReport', data: report });
         }
       }
     });
     sp.on('error', (e) => broadcast({ type: 'error', message: `串口错误: ${e.message}` }));
     sp.on('close', () => {
+      channelBindings.reset();
       broadcast({ type: 'serial', open: false });
       stopHeartbeat();
       console.log(`[RX] 本次连接累计收到 ${rxTotalBytes} 字节,共 ${rxDiagCount} 个数据包`);

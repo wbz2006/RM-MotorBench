@@ -28,6 +28,7 @@
 #include "motor_task.h"
 #include "daemon.h"
 #include "robot.h"
+#include "robot_def.h"
 #include "mpu6500.h"
 #include "usb_device.h"
 /* USER CODE END Includes */
@@ -142,7 +143,7 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
 
-  osThreadDef(motortask, StartMOTORTASK, osPriorityNormal, 0, 256);
+  osThreadDef(motortask, StartMOTORTASK, osPriorityNormal, 0, 512);
   motorTaskHandle = osThreadCreate(osThread(motortask), NULL);
 
   osThreadDef(daemontask, StartDAEMONTASK, osPriorityNormal, 0, 128);
@@ -151,8 +152,10 @@ void MX_FREERTOS_Init(void) {
   osThreadDef(robottask, StartROBOTTASK, osPriorityNormal, 0, 1024);
   defaultTaskHandle = osThreadCreate(osThread(robottask), NULL);
 
+#if !defined(MOTOR_BENCH_APP)
   osThreadDef(instask, StartINSTASK, osPriorityNormal, 0, 1024);
   insTaskHandle = osThreadCreate(osThread(instask), NULL);
+#endif
   /* USER CODE END RTOS_THREADS */
 
 }

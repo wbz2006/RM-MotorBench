@@ -32,6 +32,11 @@
       <button id="rescan" class="ghost">重新获取电机清单</button>
     </section>
 
+    <div id="connectionNotice" class="connection-notice" role="status" aria-live="polite" hidden>
+      <span id="connectionMessage"></span>
+      <button id="dismissNotice" class="ghost" type="button">关闭提示</button>
+    </div>
+
     <!--
       动态添加电机:板端启动后清单为空,需在此按"实际电调拨码 ID"现场添加。
       这是"换电机不用重烧固件"的入口。
@@ -59,23 +64,64 @@
         <input id="addId" type="number" min="1" max="8" value="1" />
       </label>
       <button id="addMotor">添加</button>
+      <button id="addChannel" class="ghost" title="为已登记的电机添加通道卡片">添加通道</button>
       <span id="addMsg" class="hint"></span>
     </section>
 
-    <!--
-      静态「ID 冲突提示」面板已于 2026-10-14 按用户要求移除。
+    <section class="panel hint-panel">
+      <strong>ID 冲突提示:</strong>6020 的反馈 ID 是 <code>0x204+ID</code>(0x205~0x20C),
+      3508/2006 是 <code>0x200+ID</code>(0x201~0x208),<strong>两段区间重叠</strong>。
+      所以 6020 不能与 3508/2006 挂在<strong>同一条总线</strong>上 —— 例如 6020 用 ID1 会和
+      3508 用 ID5 撞车。建议:<strong>CAN1 只接 6020,CAN2 接 3508/2006</strong>。
+      每条总线最多挂 14 颗(受 CAN 过滤器数量限制)。
+    </section>
 
-      理由:静态说明要求用户在出错**之前**先读一遍,而 ID 冲突是偶发事件 ——
-      用户明确表示"等出现 ID 冲突时会自动提示"。而这两层提示本来就有:
+    <section class="panel source-panel">
+      <label>控制方式<select id="controlSource"><option value="0">网页控制</option><option value="1">单电机遥控</option><option value="2">麦克纳姆底盘</option><option value="3">四轮全向底盘</option></select></label>
+      <label data-single-remote>遥控通道<select id="remoteChannel"><option value="0">通道 0</option></select></label>
+      <label data-single-remote>遥控最大转速<input id="remoteMaxRef" type="number" min="1" max="6000" value="3000" /></label>
+      <span id="remoteUnit" data-single-remote>rpm</span>
+      <button id="applySource">应用控制方式</button>
+      <span id="remoteStatus" class="hint">等待板端确认控制方式</span>
+      <div id="chassisFields" class="chassis-fields" hidden>
+        <div class="chassis-wheels">
+          <label>左前 FL<select data-wheel="0" aria-label="左前轮通道"></select><span><input type="checkbox" data-reverse="0" />反向</span></label>
+          <label>右前 FR<select data-wheel="1" aria-label="右前轮通道"></select><span><input type="checkbox" data-reverse="1" />反向</span></label>
+          <label>左后 RL<select data-wheel="2" aria-label="左后轮通道"></select><span><input type="checkbox" data-reverse="2" />反向</span></label>
+          <label>右后 RR<select data-wheel="3" aria-label="右后轮通道"></select><span><input type="checkbox" data-reverse="3" />反向</span></label>
+        </div>
+        <div class="chassis-actions">
+          <label>最大轮电机转速<input id="chassisMaxRef" type="number" min="1" max="6000" value="3000" />rpm</label>
+          <button id="chassisEnable" disabled>底盘使能</button>
+          <button id="chassisStop" class="ghost" disabled>底盘停机</button>
+        </div>
+        <p class="hint">四个同型号 DJI 电机须先绑定速度环。麦轮为 X 型辊子布局,全向轮为四轮 45° X 型布局;按实际安装设置反向。右摇杆上下/左右控制平移,左摇杆左右控制旋转。右拨杆上档、两摇杆回中后使能;任一成员停机将整组停机。</p>
+      </div>
+      <p class="hint">网页模式可直接输入转速或拖动滑块。单电机遥控使用右摇杆上下控制选定通道。切换方式会停机,恢复通信后需重新使能。</p>
+    </section>
 
-        1. 本地预检:protocol.js 的 describeConflict() 在点"添加"之前就给出
-           "和谁撞、该改谁、当前可用哪些 ID";
-        2. 板端回执:添加失败时把 MBResult 映射成具体原因
-           (ID 冲突 / 0x200 与 0x204 段重叠 / 滤波器耗尽,每条总线最多 14 颗)。
-
-      也就是说面板承载的信息在真正需要时都会自动出现,静态版只是重复一遍。
-      **不要因为"首页看不到冲突说明"而把静态面板加回来** —— 要改就改动态文案。
-    -->
+    <section id="waveformPanel" class="waveform-panel" aria-labelledby="waveTitle">
+      <div class="wave-toolbar">
+        <h2 id="waveTitle">实时转速波形</h2>
+        <label>通道<select id="waveChannel" aria-label="波形通道"></select></label>
+        <label>时间范围<select id="waveWindow">
+          <option value="5">最近 5 秒</option>
+          <option value="10" selected>最近 10 秒</option>
+          <option value="30">最近 30 秒</option>
+          <option value="60">最近 60 秒</option>
+        </select></label>
+        <button id="wavePause" class="ghost" aria-pressed="false">暂停显示</button>
+        <button id="waveClear" class="ghost">清空波形</button>
+      </div>
+      <div class="wave-readings">
+        <span class="wave-target">目标转速 <b id="waveTarget">--</b></span>
+        <span class="wave-actual">实际转速 <b id="waveActual">--</b></span>
+        <span>跟踪误差 <b id="waveError">--</b></span>
+        <span id="waveStatus" class="hint" role="status">等待遥测</span>
+      </div>
+      <canvas id="waveCanvas" role="img" aria-label="目标转速蓝色虚线与实际转速绿色实线,横轴为时间,纵轴为转速">目标转速与实际转速实时波形</canvas>
+      <p class="hint wave-note">目标值以开发板回传为准,时间为网页接收时间。暂停和清空只影响波形显示,电机继续按当前设定运行。</p>
+    </section>
 
     <main id="channels" class="channels"></main>
 
@@ -83,20 +129,6 @@
       <article class="channel" data-empty="1">
         <header>
           <span class="ch-title">通道</span>
-          <!--
-            绑定 / 解绑 **都在标题行**(2026-10-14 用户指出不对称)。
-
-            此前只把解绑提上来、绑定仍留在 bind-row 里,结果标题行有解绑、
-            下面一行有绑定 —— 同一类操作被拆在两个地方,看着像漏改。
-            现在两个动作都在标题行,顺序按使用频次排:绑定在前、解绑在后。
-
-            徽章(未绑定/已绑定/运行中)仍贴最右:操作按钮在状态之前,
-            符合"操作 → 状态"的阅读顺序。
-
-            bind-row 于是只剩**配置项**(选电机 + 选闭环),职责更单纯。
-          -->
-          <button data-role="bind" class="ch-act">绑定</button>
-          <button data-role="unbind" class="ghost ch-act">解绑</button>
           <span class="badge" data-role="status">未绑定</span>
         </header>
 
@@ -104,140 +136,22 @@
           <select data-role="motor" class="motor-select">
             <option value="">选择电机…</option>
           </select>
-          <!--
-            闭环鱼骨图:点亮=启用,最外层(掩码最高位)的亮节点=外层环。
-
-            【主脊顺序】2026-10-14 用户裁定:位置环与电流环**位置对调**,
-              主脊改按"由内到外"排列:
-                设定 ──▶ [电流环] ──▶ [速度环] ──▶ [位置环] ──▶ 电调
-
-            @attention 这是**展示顺序,不是信号流向**。真实串级永远是
-                设定 → 位置环 → 速度环 → 电流环 → 电调
-              (位置环输出"期望速度",速度环输出"期望电流",只有电流环的
-               输出直接作为 CAN 电流值下发电调)—— 即数据沿主脊**从右往左**走。
-              箭头只表示"由内到外的层级展开";节点下的动态说明(fbNote)
-              会把当前真正流到哪一级、输出交给谁写出来。
-
-            【为什么用鱼骨图】多环的本质是 pid_ref 顺次穿过各环的串级结构,
-              勾选框是平的,表达不了"层级"和"必须经过"这两件事。
-              两条约束:
-                1. 位置环在速度环的信号上游 → 启用位置环必然点亮速度环
-                   (由 fishbone.js 的 _toggle 联动保证,不靠节点位置);
-                2. 外层环 = 掩码最高位的亮节点 → 不必再单选。
-
-            @attention 电流环常亮不可关:它是串级的**最后一级**,
-              关掉就只剩"位置/速度环输出直接当电流值下发"的危险组合。
-          -->
-          <!--
-            闭环子卡片:**鱼骨图与 PID 整定同属一张卡片**(2026-10-14 用户要求)。
-
-            原先鱼骨图和 PID 面板各自带边框与背景,上下两个框看起来像两张卡片、
-            两件不相干的事。实际上它们是同一件事的两面 ——
-            上面选环,下面调该环的参数,合并后"选哪个环就调哪个环"是一个整体。
-
-            两段之间用一条虚线分隔,而不是再套一个带边框的框:
-            套框会重新产生"卡片里还套着卡片"的层级错觉。
-          -->
-          <div class="loop-card">
-            <div class="loop-fishbone" data-role="loopPicker"></div>
-
-            <!--
-              PID 整定 —— 常驻显示(未绑定电机时各控件为 disabled)。
-
-              交互契约:点击鱼骨图上的环节点 → 切换该环启用状态,
-                同时把本段的 pidLoop 切到对应环并填入该型号默认值。
-            -->
-            <div class="pid-panel" data-role="pidPanel">
-              <div class="pid-head">
-                <span class="panel-title" data-role="pidTitle">PID 整定</span>
-                <select data-role="pidLoop" disabled>
-                  <option value="0">速度环</option>
-                  <option value="1">电流环</option>
-                  <option value="2">位置环</option>
-                </select>
-                <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回</button>
-              </div>
-              <div class="pid-grid">
-                <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
-                <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
-                <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
-                <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
-                <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
-              </div>
-              <div class="pid-actions">
-                <button data-role="pidApply" disabled>应用到电机</button>
-                <button data-role="pidReset" class="ghost" disabled>恢复默认值</button>
-                <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
-              </div>
-            </div>
-          </div>
+          <select data-role="loop" class="loop-select">
+            <option value="2">速度环</option>
+            <option value="0">开环</option>
+            <option value="1">电流环</option>
+            <option value="4">角度环</option>
+          </select>
+          <button data-role="bind">绑定</button>
+          <button data-role="unbind" class="ghost">解绑</button>
         </div>
 
-        <!--
-          数字读数行(设定/实测转速/电流/角度/温度)已于 2026-10-13 移除。
-          理由:曲线已经把这些量的走势完整呈现,而数字每 100ms 跳一次、
-          在波动大的场合反而干扰判读 —— 用户明确要求"这一行就没必要显示了"。
-          温度仍保留显示,但它挪到了曲线下方的曲线框里(见下)。
-
-          实时曲线:转速与电流。
-
-          为什么改成曲线(2026-10-12 用户要求):
-            数字读数只能看到"此刻是多少",而电机测试真正要判断的是
-            **波动与振荡** —— 转速抖 20 rpm、电流在正负之间来回抽,
-            数字每 100ms 刷新一次,肉眼根本看不出来。
-            曲线把一段时间内的走势摊开,震荡一眼可见。
-
-          实现:原生 <canvas>,不引任何图表库(本工程刻意零依赖)。
-          采样:每次遥测到达 push 一个点,环形保留 CHART_POINTS 个。
-          滤波:转速与电流在入图前经一阶低通(见 chart.js 的 LowPass),
-                原始值波动过大时曲线糊成一团,看不出趋势。
-        -->
-        <div class="chart-box">
-          <div class="chart-head">
-            <span class="panel-title">实时曲线</span>
-            <span class="chart-legend">
-              <i class="lg lg-speed"></i>实测转速
-              <i class="lg lg-torque"></i>电流
-              <i class="lg lg-ref"></i>设定值
-            </span>
-            <!--
-              温度仍以数字显示:它是慢变量,不会像转速/电流那样抖,
-              放曲线里反而占地方。留在这里也免得为它单开一行。
-            -->
-            <span class="metric-inline">温度 <b data-role="temp">--</b></span>
-            <select data-role="chartWindow" title="曲线显示的时间窗口">
-              <option value="50">50 点</option>
-              <option value="120" selected>120 点</option>
-              <option value="300">300 点</option>
-            </select>
-            <button data-role="chartClear" class="ghost" title="清空历史">清空</button>
-          </div>
-          <canvas data-role="chart" width="600" height="170"></canvas>
-          <div class="chart-foot">
-            <!--
-              滤波开关(2026-10-13 用户要求:电流和转速波动太大)。
-
-              @attention 这里曾把档位值搞反:选项写的是 0.15/0.3/0.5,
-                而代码里 alpha 是**旧值权重**(alpha 越接近 1 越平滑)。
-                于是标着"强"的 0.5 其实是**最弱**那一档 ——
-                用户选了"强"却几乎没效果,正是这个原因。
-
-              现在档位与语义对齐,并补足更强的档位:
-                alpha 越小 → 新采样占比越小 → 越平滑(但阶跃响应越滞后)
-            -->
-            <label class="chart-filter">
-              <input type="checkbox" data-role="filterOn" checked />
-              低通滤波
-            </label>
-            <select data-role="filterAlpha" title="越靠右越平滑,但阶跃响应越滞后">
-              <option value="0.1">关(直通)</option>
-              <option value="0.3">弱</option>
-              <option value="0.5">中</option>
-              <option value="0.7">强</option>
-              <option value="0.85" selected>很强</option>
-              <option value="0.95">超强</option>
-            </select>
-          </div>
+        <div class="readout">
+          <div class="metric"><span>设定</span><b data-role="ref">--</b></div>
+          <div class="metric"><span>实测转速</span><b data-role="speed">--</b></div>
+          <div class="metric"><span>电流/转矩</span><b data-role="torque">--</b></div>
+          <div class="metric"><span>角度</span><b data-role="angle">--</b></div>
+          <div class="metric"><span>温度</span><b data-role="temp">--</b></div>
         </div>
 
         <div class="control">
@@ -259,13 +173,37 @@
             之前用 hidden 完全藏起来,导致用户根本不知道这个功能存在 ——
             而测试台的卖点之一正是"不用重烧就能改参数",入口却找不到。
         -->
+        <div class="pid-panel" data-role="pidPanel">
+          <div class="pid-head">
+            <span class="panel-title">PID 整定</span>
+            <select data-role="pidLoop" disabled>
+              <option value="0">速度环</option>
+              <option value="1">电流环</option>
+              <option value="2">位置环</option>
+            </select>
+            <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回板端值</button>
+            <button data-role="pidCollapse" class="ghost" title="收起/展开">收起</button>
+          </div>
+          <div class="pid-grid">
+            <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
+            <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
+            <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
+          </div>
+          <div class="pid-actions">
+            <button data-role="pidApply" disabled>应用到电机</button>
+            <button data-role="pidReset" class="ghost" disabled>恢复该型号默认值</button>
+            <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
+          </div>
+        </div>
       </article>
     </template>
 
     <footer class="hint">
       <p>
-        安全说明:电机在固件中预先登记,上位机只能选择清单内的电机。
-        <strong>未使能前电机不出力</strong>;约 1 秒收不到上位机心跳,A 板会自动全停;
+        支持 A 板和 C 板,在页面添加电机后绑定通道。
+        <strong>未使能前电机不出力</strong>;约 1.5 秒收不到上位机心跳,开发板会自动全停;
         关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
       </p>
     </footer>

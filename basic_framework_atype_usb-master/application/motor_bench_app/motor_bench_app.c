@@ -11,7 +11,20 @@
 #include "bsp_dwt.h"
 #include "can.h"
 #include "usart.h"
-#include <string.h> /* memset —— 生成电机配置前必须把整个结构体清零 */
+#include "remote_control.h"
+
+static RC_ctrl_t *bench_remote;
+static void BenchReadRemote(uint8_t *online, int16_t axes[3], uint8_t *switch_right)
+{
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    *online = RemoteControlIsOnline();
+    axes[0] = bench_remote ? bench_remote[TEMP].rc.rocker_r1 : 0;
+    axes[1] = bench_remote ? bench_remote[TEMP].rc.rocker_r_ : 0;
+    axes[2] = bench_remote ? bench_remote[TEMP].rc.rocker_l_ : 0;
+    *switch_right = bench_remote ? bench_remote[TEMP].rc.switch_right : 0;
+    __set_PRIMASK(mask);
+}
 
 /*
  * 使用哪张电机配置表由 robot_def.h 的 MOTOR_BENCH_DEFAULT_CONFIG 等宏决定;
@@ -107,31 +120,11 @@ typedef struct
 } BenchPidSet_s;
 
 /* DJI 速度环:ref 单位为 rpm,输出为发送电流值。
- *
- * @attention 【2026-10-13 实测修正】Kp=1 太小,电机实际转不起来。
- *
- * 上一版曾统一设为 Kp=1/Ki=0/Kd=0,理由是"原实车参数(摩擦轮 20、yaw 50/200)
- * 是带机构与 IMU 前馈整定的,裸电机必然震荡"。方向对,但**幅度走极端了**。
- *
- * 量纲算一下就清楚:裸电机静摩擦与齿槽转矩要吃掉可观的电流,
- * 速度环输出 = Kp × 误差(rpm)。若 Kp=1,要输出 1000(约相当于
- * 3508 的 6% 电流值)就需要 1000rpm 的误差 —— 而电机全速也不过 9000rpm,
- * 等于开环都转不动,更别说闭环。
- *
- * 空载台架的经验起点:Kp 用原值除以 4~8。取:
- *   M3508  Kp=3    (原 20  → /6.7)
- *   M2006  Kp=2    (原 10  → /5)
- *   GM6020 Kp=8    (原 50  → /6.2)
- * Ki 保持 0:先只用比例项,让使用者判断"能不能转、稳不稳",再自己加 Ki 消静差。
- * 这三个值只是**能转起来的保守起点**,不是最优 —— 真正的整定在网页面板上做。
- *
- * MaxOut 仍按型号留足余量(它是输出限幅不是增益):
- *   M3508 最大约 16000,M2006 约 10000,GM6020 约 30000。
- */
+ * M3508 最大约 16000,M2006 最大约 10000,GM6020 最大约 30000。 */
 static const BenchPidSet_s bench_dji_speed_pid[BENCH_PID_TABLE_SIZE] = {
-    [M3508] = {3.0f, 0.0f, 0.0f, 15000.0f, 10000.0f, PID_Integral_Limit},
-    [M2006] = {2.0f, 0.0f, 0.0f, 5000.0f, 5000.0f, PID_Integral_Limit},
-    [GM6020] = {8.0f, 0.0f, 0.0f, 20000.0f, 3000.0f,
+    [M3508] = {20.0f, 1.0f, 0.0f, 15000.0f, 10000.0f, PID_Integral_Limit},
+    [M2006] = {10.0f, 1.0f, 0.0f, 5000.0f, 5000.0f, PID_Integral_Limit},
+    [GM6020] = {50.0f, 200.0f, 0.0f, 20000.0f, 3000.0f,
                 PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement},
 };
 
@@ -160,25 +153,6 @@ static void BenchApplyPid(PID_Init_Config_s *dst, const BenchPidSet_s *src)
     dst->MaxOut = src->MaxOut;
     dst->IntegralLimit = src->IntegralLimit;
     dst->Improve = src->Improve;
-
-    /*
-     * @attention 【2026-10-13】DeadBand 必须显式写 0,不能靠结构体清零"顺带"解决。
-     *
-     * 为什么这里刻意不用死区:
-     *   controller.c 的死区分支是 `else { Output = 0; ITerm = 0; }` ——
-     *   **误差进入死区时输出直接归零**,而不是保持或衰减。
-     *   在速度环上这等于一个开关控制器:接近目标 → 输出断掉 → 电机减速
-     *   → 误差重新变大 → 再次输出。结果就是每次阶跃都过冲、然后来回抽,
-     *   而且**与 Kp 大小无关**(Kp=2 也照样过冲)。
-     *
-     *   测试台要的是把电机当被控对象如实呈现,不是让内建死区替我们
-     *   "隐藏"小误差。死区应当由使用者在整定时自行决定是否启用,
-     *   而不是被框架默认值悄悄塞进来。
-     *
-     * @note 若将来要给死区留接口,应做成界面上的可调项并同步改
-     *   controller.c 的死区语义(保持输出而非归零),不要只改这里。
-     */
-    dst->DeadBand = 0.0f;
 }
 
 /**
@@ -241,17 +215,6 @@ static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus,
     ref->controller_param_init_config.speed_PID.MaxOut = 10.0f; /* 对应 DM_T_MAX=18 留余量 */
     ref->controller_param_init_config.speed_PID.Improve = PID_Integral_Limit;
     ref->controller_param_init_config.speed_PID.IntegralLimit = 8.0f;
-
-    /*
-     * @attention 死区必须显式写 0,与 BenchApplyPid 的理由相同:
-     *   controller.c 的死区分支是 `else { Output = 0; }` ——
-     *   误差进入死区时输出被**直接归零**而非保持,
-     *   在速度环上会变成开关控制,造成与增益大小无关的过冲。
-     *   虽然调用方已对整个 cfg 做过 memset,这里仍显式写一遍:
-     *   让"这个字段被有意设置过"在代码里看得见,
-     *   而不是依赖远处那一句 memset 的副作用。
-     */
-    ref->controller_param_init_config.speed_PID.DeadBand = 0.0f;
 }
 
 /* ============================================================
@@ -270,29 +233,7 @@ static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus,
  */
 static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, void **out_instance)
 {
-    /*
-     * @attention 【2026-10-13 修复】必须显式清零。
-     *
-     * 原写法 `Motor_Init_Config_s cfg;` 是**未初始化的栈变量**,
-     * 而 BenchBuildDJIConfig / BenchBuildDMConfig 只写其中一部分字段 ——
-     * 没被写到的字段就是**随机栈垃圾**。
-     *
-     * 实测症状:每次设定新速度都出现明显超调(尖峰 4280 → 回落 1050),
-     *   而速度环 Kp 只有 2 —— 这么小的增益不可能产生那种过冲。
-     *
-     * 根因在 controller.c 的死区分支:
-     *     if (abs(Err) > DeadBand) { 正常PID }
-     *     else { Output = 0; ITerm = 0; }   // 进入死区直接归零输出
-     *   DeadBand 恰好是**没人写过**的字段。若它被填成正值,
-     *   误差一进入死区输出就归零 → 电机减速 → 误差重新变大 → 再输出,
-     *   形成开关式极限环:每次阶跃都过冲,然后来回抽。
-     *
-     * 显式清零 + 在 BenchApplyPid 里明确设置 DeadBand,二者缺一不可:
-     *   清零保证"没打算用的字段"不会带着垃圾值参与运算;
-     *   显式赋值保证"确实要用的字段"有一个经过思考的值。
-     */
-    Motor_Init_Config_s cfg;
-    memset(&cfg, 0, sizeof(cfg));
+    Motor_Init_Config_s cfg = {0};
     CAN_HandleTypeDef *bus = (can_bus == 1) ? &hcan1 : &hcan2;
 
     if (!out_instance)
@@ -345,28 +286,20 @@ static void BenchMotorDestroy(MB_MotorKind_e kind, void *instance)
 
     if (kind == MB_MOTOR_DM)
     {
-        DMMotorInstance *m = (DMMotorInstance *)instance;
-        DMMotorStop(m);
-        CANUnregister(m->motor_can_instace);
-        free(m);
+        DMMotorDestroy((DMMotorInstance *)instance);
     }
     else
     {
-        DJIMotorInstance *m = (DJIMotorInstance *)instance;
-        DJIMotorStop(m);
-        CANUnregister(m->motor_can_instance);
-        free(m);
+        DJIMotorDestroy((DJIMotorInstance *)instance);
     }
 }
 
 void MotorBenchAppInit(void)
 {
-    /*
-     * @note 这里原先声明了 dji_config / dm_config 两个结构体并立即 (void) 弃用,
-     *   是从"静态清单"版本遗留下来的死代码。已删除 ——
-     *   未初始化的栈结构体留在代码里除了误导没有别的作用
-     *   (本轮修的那处 DeadBand 垃圾值就是同类问题的真实后果)。
-     */
+    Motor_Init_Config_s dji_config;
+    Motor_Init_Config_s dm_config;
+    (void)dji_config;
+    (void)dm_config;
 
     /*
      * ★ 电机清单为空:全部由上位机在运行期动态创建。
@@ -379,6 +312,8 @@ void MotorBenchAppInit(void)
      *       （CAN 过滤器由硬件分配且不跨复位保存,这是框架的固有限制。）
      */
     MotorBenchSetMotorFactory(BenchMotorFactory, BenchMotorDestroy);
+    bench_remote = RemoteControlInit(MOTOR_BENCH_RC_UART);
+    MotorBenchSetRemoteReader(BenchReadRemote);
     LOGINFO("[motor_bench_app] dynamic motor factory registered, inventory starts empty");
 
     /*

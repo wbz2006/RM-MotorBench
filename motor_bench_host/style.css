@@ -12,6 +12,17 @@
   --radius: 12px;
 }
 
+.source-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.source-panel p { flex-basis: 100%; margin: 0; }
+.source-panel input { max-width: 110px; }
+.source-panel [hidden] { display: none; }
+.chassis-fields { flex-basis: 100%; display: grid; gap: 14px; }
+.chassis-wheels { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.chassis-wheels label, .chassis-actions, .chassis-actions label { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.chassis-wheels label { padding: 10px; background: var(--panel-2); border-radius: 8px; }
+.chassis-wheels span { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.chassis-wheels input[type=checkbox] { width: auto; margin: 0; accent-color: var(--accent); }
+
 * {
   box-sizing: border-box;
 }
@@ -114,6 +125,26 @@ body {
   gap: 8px;
 }
 
+.connection-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 18px;
+  color: var(--danger);
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.connection-notice[hidden] {
+  display: none;
+}
+
+.connection-notice button {
+  flex: none;
+}
+
 /* ---- 动态添加电机 ---- */
 .panel.addmotor {
   display: flex;
@@ -155,11 +186,27 @@ body {
   color: var(--err, #f85149);
 }
 
-/* ---- 静态「ID 冲突提示」面板的样式已随该面板一起移除(2026-10-14) ----
- * .panel.hint-panel / strong / code 三条规则只服务于首页那条静态说明,
- * 面板删除后即为死样式,已清掉。冲突相关信息改由动态提示承载
- * (protocol.js 的 describeConflict() 与 MBResult 文案)。
- */
+/* ---- ID 冲突提示 ---- */
+.panel.hint-panel {
+  padding: 10px 18px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.panel.hint-panel strong {
+  color: var(--text);
+}
+
+.panel.hint-panel code {
+  font-family: ui-monospace, Consolas, monospace;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(110, 118, 129, 0.25);
+  color: var(--text);
+}
 
 select,
 input[type='number'],
@@ -198,6 +245,49 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* ---------- 实时转速波形 ---------- */
+
+.waveform-panel {
+  margin: 18px 18px 0;
+  padding: 16px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.wave-toolbar, .wave-readings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 18px;
+}
+
+.wave-toolbar h2 { margin: 0 auto 0 0; font-size: 16px; }
+.wave-toolbar label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.wave-readings { margin: 16px 0 12px; font-size: 13px; color: var(--muted); }
+.wave-readings b { margin-left: 6px; font-variant-numeric: tabular-nums; color: var(--text); }
+.wave-target::before, .wave-actual::before {
+  content: '';
+  display: inline-block;
+  width: 18px;
+  margin-right: 6px;
+  vertical-align: middle;
+  border-top: 2px dashed var(--accent);
+}
+.wave-actual::before { border-top: 2px solid var(--ok); }
+#waveStatus { margin-left: auto; }
+#waveCanvas { display: block; width: 100%; height: 290px; border-radius: 8px; }
+.wave-note { margin: 10px 0 0; line-height: 1.6; }
+
+@media (max-width: 600px) {
+  .waveform-panel { padding: 12px; }
+  .wave-toolbar h2 { flex-basis: 100%; }
+  .wave-toolbar { gap: 10px; }
+  #waveStatus { margin-left: 0; flex-basis: 100%; }
+  #waveCanvas { height: 240px; }
+}
+
 /* ---------- 通道卡片 ---------- */
 
 .channels {
@@ -218,43 +308,18 @@ button:disabled {
 }
 
 .channel header {
-  /*
-   * @attention 不能用 space-between:标题行有四个元素
-   *   (通道名 / 绑定 / 解绑 / 状态徽章),space-between 会把它们均匀撑开,
-   *   按钮之间出现大片空隙。改用 gap + 徽章 margin-left:auto:
-   *     通道名与两个按钮紧凑靠左、徽章贴右。
-   */
   display: flex;
   align-items: center;
-  gap: 8px;
-}
-
-/*
- * 标题行的操作按钮(绑定/解绑)。
- *
- * 2026-10-14:**这里不再覆盖字号与内边距**。
- *   原先缩到 `11px / 2px 8px`,比页面其它按钮(使能、应用到电机)明显小一号,
- *   同一类动作两种尺寸,用户要求「和使能的按键一样大」。
- *   删掉覆盖后按钮直接继承全局 `button`(14px / 8px 14px),尺寸自然一致。
- *
- * 保留本条规则只为 flex 布局做保护:通道卡片窄时,
- *   标题行里的按钮不被压缩变形、不在按钮内部折行。
- */
-.ch-act {
-  flex: none;
-  white-space: nowrap;
+  justify-content: space-between;
 }
 
 .ch-title {
-  /* 标题行整体放大(2026-10-14):15px 时通道名压不住旁边的大按钮 */
   font-weight: 700;
-  font-size: 17px;
+  font-size: 15px;
 }
 
 .badge {
-  /* 贴右:标题行是「通道名 / 绑定 / 解绑 / 徽章」,徽章推到最右 */
-  margin-left: auto;
-  font-size: 13px;
+  font-size: 12px;
   padding: 3px 9px;
   border-radius: 999px;
   background: var(--panel-2);
@@ -315,35 +380,19 @@ button:disabled {
   font-weight: 600;
 }
 
-/* ---------------- 闭环卡片(鱼骨图 + PID 整定) ---------------- */
+/* ---------------- PID 整定面板 ---------------- */
 
-/*
- * 一张卡片装两段:上面选环(鱼骨图),下面调该环的参数(PID 整定)。
- *
- * 2026-10-14 用户要求合并 —— 原先鱼骨图与 PID 面板各自带边框与背景,
- * 上下两个框看起来像两张不相干的卡片,而它们其实是同一件事的两面:
- * 上面选的是哪个环,下面就调哪个环的参数。
- *
- * 现在边框与背景只在 .loop-card 上出现一次,
- * 内部两段之间用一条虚线分隔(不再套第二个框,避免"卡片里还有卡片"的错觉)。
- */
-.loop-card {
-  position: relative; /* 供内部需要定位的元素作基准 */
-  flex: 1 1 100%;     /* 独占一行:电机下拉在上,本卡片在下 */
-  padding: 8px 10px 10px;
-  background: var(--panel-2);
+.pid-panel {
+  margin-top: 12px;
+  padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
+  background: var(--panel-2);
 }
 
-/*
- * PID 整定段:**不再是独立卡片**。
- * 去掉原来 margin-top 撑出的"两张卡片之间的缝",改为卡片内的分区分隔线。
- */
-.pid-panel {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--line);
+.pid-panel[data-collapsed="1"] .pid-grid,
+.pid-panel[data-collapsed="1"] .pid-actions {
+  display: none;
 }
 
 .pid-head {
@@ -414,348 +463,6 @@ button:disabled {
 
 .pid-actions .hint {
   font-size: 12px;
-}
-
-/* ---------------- 实时曲线(2026-10-12 新增) ---------------- */
-
-.chart-box {
-  margin-top: 10px;
-  padding: 8px 10px 10px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-}
-
-.chart-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 6px;
-}
-
-.chart-head select {
-  margin-left: auto;
-}
-
-/*
- * 图例:用色块 + 文字,不用特殊字符 —— 颜色与曲线一一对应即可,
- * 双 Y 轴(左 rpm / 右 A)已在画布上标注,图例只区分三条线。
- */
-.chart-legend {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.lg {
-  display: inline-block;
-  width: 12px;
-  height: 2px;
-  margin-right: 3px;
-  vertical-align: middle;
-  border-radius: 1px;
-}
-
-.lg-speed {
-  background: var(--accent);
-}
-
-.lg-torque {
-  background: var(--warn);
-}
-
-.lg-ref {
-  background: var(--muted);
-}
-
-/*
- * canvas 必须给一个确定的 CSS 高度。
- * 若只写 width:100%,元素高度会塌成默认的 150px 上下浮动,
- * 而 JS 侧的 getBoundingClientRect().height 在布局未稳定时可能读到 0,
- * 导致曲线画不出来。这里写死高度,布局一次到位。
- */
-.channel canvas[data-role="chart"] {
-  display: block;
-  width: 100%;
-  height: 170px;
-}
-
-/* 温度:慢变量,以数字形式嵌在曲线标题行里,不单独占一行 */
-.metric-inline {
-  font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.metric-inline b {
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-}
-
-/* 曲线下方:滤波控制条(2026-10-13 新增) */
-.chart-foot {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.chart-filter {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  cursor: pointer;
-  user-select: none;
-}
-
-.chart-filter input {
-  cursor: pointer;
-}
-
-.chart-foot select {
-  margin-left: auto;
-}
-
-/* ---------------- 闭环选择器(勾选 + 外层单选) ---------------- */
-
-/*
- * 【为什么不用下拉】多环本质是位掩码,不是互斥枚举。
- * 用一列组合值让用户猜,既看不出组合怎么来的,也表达不了
- * "勾选 位置+速度、外层选速度"这种合法组合。
- * 勾选对应 close_loop_type 的位,外层单选对应 outer_loop_type,
- * 与固件两个字段一一对应。
- */
-.loop-picker {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px 8px;
-  padding: 5px 9px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.loop-picker .picker-label {
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.loop-picker .picker-sep {
-  width: 1px;
-  align-self: stretch;
-  margin: 0 2px;
-  background: var(--line);
-}
-
-.loop-checks,
-.loop-outer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.loop-checks label,
-.loop-outer label {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  cursor: pointer;
-  color: var(--text);
-  white-space: nowrap;
-}
-
-.loop-checks input,
-.loop-outer input {
-  cursor: pointer;
-  accent-color: var(--accent);
-}
-
-/* 位掩码回显:便于与固件 RTT 日志里的 outer_loop 值对照 */
-.loop-mask {
-  margin-left: auto;
-  padding: 1px 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  color: var(--muted);
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-}
-
-/* ---------------- 闭环鱼骨图 ---------------- */
-
-/*
- * 鱼骨图:主脊 = pid_ref 的数据流方向。
- *
- * 【为什么用鱼骨图】多环的本质是 pid_ref **顺次穿过**各环的串级结构,
- *   勾选框是平的,表达不了"方向"和"必须经过"。
- *   主脊摆成 设定 → 位置 → 速度 → 电流 → 电调,于是两条约束由拓扑保证:
- *     1. 位置环在速度环上游 → 启用位置必然经过速度;
- *     2. 最上游的亮节点就是外层环 → 不必再单选。
- *   这比"勾选 + 外层单选"少两个控件,且不需要代码兜底补齐。
- */
-.loop-fishbone {
-  /*
-   * @note 边框/背景/内边距**不在这里**,由 .loop-card 统一提供 ——
-   *   鱼骨图与下面的 PID 整定段同属一张卡片(2026-10-14 合并)。
-   *   这里再画一道框就会重新变成"卡片套卡片"。
-   *   曾经这里的 position: relative 是为已废弃的 PID 浮空卡片服务的,一并移除。
-   */
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap; /* 允许 fb-meta 掉到下一行 */
-  gap: 6px;
-  font-size: 12px;
-}
-
-/* 左端"设定"与右端"电调"端点 */
-.fb-src,
-.fb-dst {
-  flex: none;
-  padding: 3px 7px;
-  color: var(--muted);
-  background: var(--panel);
-  border: 1px dashed var(--line);
-  border-radius: 5px;
-  white-space: nowrap;
-}
-
-/* 主脊:容纳三个环节点,节点之间用 ::before 画箭头 */
-.fb-spine {
-  display: flex;
-  align-items: center;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-/*
- * 环节点:暗色=未启用,亮色=已启用。
- * 亮色用 --accent 填充 + 微光,一眼看出当前数据流经哪些环。
- */
-.fb-node {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1px;
-  flex: none;
-  min-width: 62px;
-  padding: 5px 8px;
-  color: var(--muted);
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-
-/* 节点之间的箭头(画在节点左侧,首个节点不画) */
-.fb-spine .fb-node:not(:first-child)::before {
-  content: '▶';
-  position: absolute;
-  left: -11px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 8px;
-  color: var(--line);
-  pointer-events: none;
-}
-
-.fb-node:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--text);
-}
-
-/* 已启用:亮色 */
-.fb-node.is-on {
-  color: #fff;
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-.fb-node.is-on::before {
-  color: var(--accent);
-}
-
-/* 常亮节点(电流环):可看出区别,但不接受点击 */
-.fb-node.is-locked {
-  cursor: default;
-}
-
-.fb-node.is-locked.is-on {
-  background: var(--ok);
-  border-color: var(--ok);
-}
-
-.fb-node-name {
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-/* 位掩码小标:便于与固件 RTT 日志对照 */
-.fb-node-bit {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 9px;
-  opacity: 0.75;
-}
-
-/* 底部信息行:外层环 + 说明 + 合成掩码 */
-.fb-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1 1 100%;
-  margin-top: 2px;
-  padding-top: 5px;
-  border-top: 1px dashed var(--line);
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.fb-outer b {
-  color: var(--text);
-}
-
-.fb-note {
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fb-mask {
-  flex: none;
-  padding: 1px 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-}
-
-/*
- * PID 面板的标题。
- *
- * @attention 这里曾**重复定义过一份 `.pid-panel`**(margin/padding/背景/边框/圆角)。
- *   两份同名规则里后写的生效,于是"改了一份却被另一份悄悄覆盖"是必然的坑。
- *   2026-10-14 合并卡片时已把那份删掉,.pid-panel 的样式只在文件上方
- *   「闭环卡片」一节定义一处。新增样式请也写在那里。
- *
- * @note 面板本身已不是独立卡片(与鱼骨图同属 .loop-card),
- *   边框与背景一律由 .loop-card 提供。
- */
-
-.pid-panel .panel-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text);
 }
 
 .hint.ok {

@@ -11,15 +11,8 @@
 
 #define I_MIN -2000
 #define I_MAX 2000
-/*
- * @attention 【2026-10-13】原为无前缀的 CURRENT_SMOOTH_COEF / SPEED_SMOOTH_COEF,
- *   与 DJImotor.h、HT04.h 中的同名宏**互相覆盖** ——
- *   三个电机库各有一套滤波系数,却共用一个宏名,
- *   实际生效值取决于头文件的包含顺序,是典型的全局命名污染。
- *   加 LK_ 前缀区分。取值沿用原值,未做改动(本电机未参与本次整定)。
- */
-#define LK_CURRENT_SMOOTH_COEF 0.9f
-#define LK_SPEED_SMOOTH_COEF 0.85f
+#define CURRENT_SMOOTH_COEF 0.9f
+#define SPEED_SMOOTH_COEF 0.85f
 #define REDUCTION_RATIO_DRIVEN 1
 #define ECD_ANGLE_COEF_LK (360.0f / 65536.0f)
 #define CURRENT_TORQUE_COEF_LK 0.00512f  // 电流设定值转换成扭矩的系数，这里对应的是16T
