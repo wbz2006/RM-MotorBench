@@ -36,7 +36,8 @@
 
 | 目录 | 说明 |
 |---|---|
-| [`basic_framework_atype_usb-master`](basic_framework_atype_usb-master) | **固件工程**（主工程）。基于跃鹿 `basic_framework` 的 A 板适配版，新增 USB CDC 与动态建电机 |
+| [`motorbench-a`](motorbench-a) | **固件主工程**。CubeMX + CMake/Ninja，电机测试台、USB CDC 与动态建电机 |
+| [`basic_framework_atype_usb-master`](basic_framework_atype_usb-master) | 保留的旧 Makefile 工程，作为已验证可用的参考版本 |
 | [`motor_bench_host`](motor_bench_host) | **上位机**。Node 服务（WebSocket 桥接串口）+ 原生 Web UI |
 | `电机测试台方案.md` | 完整方案文档（设计推导、协议定义、排查记录） |
 | [`basic_framework_atype_usb-master/USB排障指南.md`](basic_framework_atype_usb-master/USB排障指南.md) | USB 枚举失败（电脑报"无法识别的USB设备"）的 RTT 诊断步骤 |
@@ -49,13 +50,15 @@
 ### 1. 编译并烧录固件
 
 ```powershell
-cd basic_framework_atype_usb-master
-# ARM GCC 加入 PATH，例如：
-$env:PATH = "C:\ST\STM32CubeCLT_1.21.0\GNU-tools-for-STM32\bin;$env:PATH"
-mingw32-make -j4
+cd motorbench-a
+# 确保 cmake、ninja、arm-none-eabi-gcc 在 PATH 中。
+cmake --preset Debug
+cmake --build --preset Debug --parallel
 ```
 
-产物：`build/basic_framework_ATYPE.hex`，烧录到 A 板。
+产物：`motorbench-a/build/Debug/basic_framework_ATYPE.{elf,hex,bin}`。
+
+使用 VS Code 时，直接打开 `motorbench-a` 文件夹，安装 ST 官方 STM32Cube 扩展，选择 `Debug` CMake preset，再使用项目提供的 ST-Link 或 J-Link 调试配置。详见 [新工程说明](motorbench-a/README.md)。
 
 ### 2. 启动上位机
 

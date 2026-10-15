@@ -1,0 +1,34 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: MotorBench ST-Link",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "deviceName": "STM32F427IIHx",
+            "runEntry": "main",
+            "serverInterface": "SWD",
+            "imagesAndSymbols": [
+                {"imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"}
+            ]
+        },
+        {
+            "type": "jlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: MotorBench J-Link",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "deviceName": "STM32F427IIHx",
+            "serverDevice": "STM32F427II",
+            "runEntry": "main",
+            "serverInterface": "SWD",
+            "imagesAndSymbols": [
+                {"imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"}
+            ]
+        }
+    ]
+}

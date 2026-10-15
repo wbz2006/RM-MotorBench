@@ -1,6 +1,7 @@
 # 电机测试台上位机
 
-配套固件:`basic_framework_atype_usb-master`(A 板 + USB CDC)
+配套固件:[`motorbench-a`](../motorbench-a)(A 板 + USB CDC，CMake 主工程)。
+`npm test` 与 `npm run test:integration` 均读取该目录中的固件源码。
 
 ## 快速开始
 

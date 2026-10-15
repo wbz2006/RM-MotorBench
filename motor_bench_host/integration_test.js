@@ -10,17 +10,14 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { crc8, buildFrame, buildBind, buildSetRef, buildEnable, MotorKind, LoopType } from './protocol.js';
 
-const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\//, '')), '..');
-/*
- * 固件目录名迁移过一次(2026-10-11: basic_framework-atype-master → basic_framework_atype_usb-master),
- * 这里直接写死新名字。若以后又改名,这个测试会以"找不到固件 CRC 源文件"失败 ——
- * 那正是它该有的表现:固件找不到就没法做真正的交叉校验。
- */
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Cross-check the CMake firmware used for current builds.
 const firmwareCrc = path.join(
   repoRoot,
-  'basic_framework_atype_usb-master',
+  'motorbench-a',
   'modules',
   'algorithm',
   'crc8.c',

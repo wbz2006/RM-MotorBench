@@ -333,7 +333,7 @@ console.log('\n== 10. link gate allow-list covers all read-only frame types ==')
    * 以后再加新帧类型时,忘了加白名单会立刻被这条测试抓到。
    */
   const cPath = new URL(
-    '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+    '../motorbench-a/modules/motor_bench/motor_bench.c',
     import.meta.url,
   );
   let src;
@@ -402,7 +402,7 @@ console.log('\n== 11. USB TX must not share a reusable staging buffer ==');
    * 必须直接把环形队列的连续内存交给 CDC_Transmit_FS()。
    */
   const fwPath = new URL(
-    '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+    '../motorbench-a/modules/motor_bench/motor_bench.c',
     import.meta.url,
   );
   let c;
@@ -450,7 +450,7 @@ console.log('\n== 12. RTT diagnostic logs stay ASCII ==');
    * 诊断日志应使用纯 ASCII(网页 UI 里的中文不受影响,那是浏览器渲染)。
    */
   const fwPath = new URL(
-    '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+    '../motorbench-a/modules/motor_bench/motor_bench.c',
     import.meta.url,
   );
   let c;
@@ -483,7 +483,7 @@ console.log('\n== 13. USB RX callback must stay interrupt-safe ==');
    * 因此规则是:中断只负责把字节搬进环形队列,解析必须在任务上下文。
    */
   const fwPath = new URL(
-    '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+    '../motorbench-a/modules/motor_bench/motor_bench.c',
     import.meta.url,
   );
   let c;
@@ -549,7 +549,7 @@ console.log('\n== 14. firmware variable-length frames must not use fixed-size ar
    * 固件的清单/遥测发送函数是按字节拼装的,且发送长度由实际数量决定。
    */
   const fwPath = new URL(
-    '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+    '../motorbench-a/modules/motor_bench/motor_bench.c',
     import.meta.url,
   );
   let c;
@@ -619,7 +619,7 @@ console.log('\n== 15. link timeout must outlast the host heartbeat interval ==')
   let fwPeriodMs = null;
   try {
     const fw = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+      '../motorbench-a/modules/motor_bench/motor_bench.c',
       import.meta.url,
     ), 'utf8');
     const m = fw.match(/#define\s+MB_LINK_TIMEOUT_COUNT\s+(\d+)/);
@@ -629,7 +629,7 @@ console.log('\n== 15. link timeout must outlast the host heartbeat interval ==')
   // daemon 周期:freertos.c 里 StartDAEMONTASK 的 osDelay(10)
   try {
     const fr = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/Core/Src/freertos.c',
+      '../motorbench-a/Core/Src/freertos.c',
       import.meta.url,
     ), 'utf8');
     const m = fr.match(/StartDAEMONTASK[\s\S]{0,300}?osDelay\((\d+)\)/);
@@ -678,7 +678,7 @@ console.log('\n== 16. stream parser minimum-frame check must accept empty payloa
   let fw;
   try {
     fw = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+      '../motorbench-a/modules/motor_bench/motor_bench.c',
       import.meta.url,
     ), 'utf8');
   } catch {
@@ -943,7 +943,7 @@ console.log('\n== 18. PID protocol: frame layout, fixed-point, defaults ==');
   let fwApp;
   try {
     fwApp = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/application/motor_bench_app/motor_bench_app.c',
+      '../motorbench-a/application/motor_bench_app/motor_bench_app.c',
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench_app.c not reachable'); }
@@ -1068,7 +1068,7 @@ console.log('\n== 20. telemetry frame must be split to fit the 64B USB limit =='
   let fw;
   try {
     fw = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c', import.meta.url,
+      '../motorbench-a/modules/motor_bench/motor_bench.c', import.meta.url,
     ), 'utf8');
   } catch {
     console.log('  SKIP  firmware motor_bench.c not reachable');
@@ -1279,8 +1279,8 @@ console.log('\n== 22. "unbind" must really unbind, not just stop ==');
     const b = new URL('./', import.meta.url);
     ui = readFileSync(new URL('ui.js', b), 'utf8');
     srv = readFileSync(new URL('server.js', b), 'utf8');
-    fwC = readFileSync(new URL('../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c', b), 'utf8');
-    fwH = readFileSync(new URL('../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.h', b), 'utf8');
+    fwC = readFileSync(new URL('../motorbench-a/modules/motor_bench/motor_bench.c', b), 'utf8');
+    fwH = readFileSync(new URL('../motorbench-a/modules/motor_bench/motor_bench.h', b), 'utf8');
   } catch {
     console.log('  SKIP  source files not reachable');
   }
@@ -1588,7 +1588,7 @@ console.log('\n== 26. CAN rx_id collision rules (see CAN_ID冲突说明.md) ==')
      *   这正是最危险的一种测试状态:跳过伪装成通过。
      *   所以下面额外断言两个文件确实读到了内容。
      */
-    const fwBase = '../basic_framework_atype_usb-master/';
+    const fwBase = '../motorbench-a/';
     fwDji = readFileSync(new URL(`${fwBase}modules/motor/DJImotor/dji_motor.c`, import.meta.url), 'utf8');
     fwBench = readFileSync(new URL(`${fwBase}modules/motor_bench/motor_bench.c`, import.meta.url), 'utf8');
   } catch (e) { console.log('  SKIP  firmware sources not reachable:', e.message); }
@@ -1649,7 +1649,7 @@ console.log('\n== 23. unbind must clear the motor instance residual ref ==');
   let fwC;
   try {
     fwC = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+      '../motorbench-a/modules/motor_bench/motor_bench.c',
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench.c not reachable'); }
@@ -2054,7 +2054,7 @@ console.log('\n== 25. anti-aliasing: average at the sample source, not just on d
   let fwC;
   try {
     fwC = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+      '../motorbench-a/modules/motor_bench/motor_bench.c',
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench.c not reachable'); }
@@ -2196,13 +2196,13 @@ console.log('\n== 28. smoothing coefficient semantics must match the formula =='
 
   let djiH, djiC, lkH, lkC, htH, htC;
   try {
-    const base = 'D:/Main_Files/RM-MotorBench/basic_framework_atype_usb-master/modules/motor/';
-    djiH = readFileSync(`${base}DJImotor/dji_motor.h`, 'utf8');
-    djiC = readFileSync(`${base}DJImotor/dji_motor.c`, 'utf8');
-    lkH = readFileSync(`${base}LKmotor/LK9025.h`, 'utf8');
-    lkC = readFileSync(`${base}LKmotor/LK9025.c`, 'utf8');
-    htH = readFileSync(`${base}HTmotor/HT04.h`, 'utf8');
-    htC = readFileSync(`${base}HTmotor/HT04.c`, 'utf8');
+    const base = new URL('../motorbench-a/modules/motor/', import.meta.url);
+    djiH = readFileSync(new URL('DJImotor/dji_motor.h', base), 'utf8');
+    djiC = readFileSync(new URL('DJImotor/dji_motor.c', base), 'utf8');
+    lkH = readFileSync(new URL('LKmotor/LK9025.h', base), 'utf8');
+    lkC = readFileSync(new URL('LKmotor/LK9025.c', base), 'utf8');
+    htH = readFileSync(new URL('HTmotor/HT04.h', base), 'utf8');
+    htC = readFileSync(new URL('HTmotor/HT04.c', base), 'utf8');
   } catch { console.log('  SKIP  motor driver sources not reachable'); }
 
   if (djiC && djiH) {
@@ -2272,7 +2272,7 @@ console.log('\n== 29. motor init config must be zeroed and DeadBand set explicit
   let app;
   try {
     app = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/application/motor_bench_app/motor_bench_app.c',
+      '../motorbench-a/application/motor_bench_app/motor_bench_app.c',
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench_app.c not reachable'); }
@@ -2382,11 +2382,11 @@ console.log('\n== 31. cascade loops: combos must be selectable end to end ==');
   let fw, fwH;
   try {
     fw = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor/DJImotor/dji_motor.c',
+      '../motorbench-a/modules/motor/DJImotor/dji_motor.c',
       import.meta.url,
     ), 'utf8');
     fwH = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor/motor_def.h',
+      '../motorbench-a/modules/motor/motor_def.h',
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  firmware sources not reachable'); }
@@ -2448,7 +2448,7 @@ console.log('\n== 31. cascade loops: combos must be selectable end to end ==');
   let mb;
   try {
     mb = readFileSync(new URL(
-      '../basic_framework_atype_usb-master/modules/motor_bench/motor_bench.c',
+      '../motorbench-a/modules/motor_bench/motor_bench.c',
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench.c not reachable'); }

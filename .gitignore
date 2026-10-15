@@ -24,12 +24,15 @@ Thumbs.db
 # ---- 调试 ----
 *.log
 
-# ---- 未完成的 CubeMX 骨架(2026-10-13 用户确认不上传) ----
-# motorbench-a/ 是纯 CubeMX 生成的空工程:只有 ST HAL / CMSIS / FreeRTOS /
-# USB CDC 等厂商代码,没有 bsp/ 与 application/,也没接任何本项目逻辑。
-# 真正的固件工程是 basic_framework_atype_usb-master
-# 把空骨架一并公开会让使用者分不清该用哪个,故排除。
-motorbench-a/
+# ---- 主工程共享 VS Code 配置 ----
+!motorbench-a/.vscode/
+motorbench-a/.vscode/*
+!motorbench-a/.vscode/settings.json
+!motorbench-a/.vscode/extensions.json
+!motorbench-a/.vscode/tasks.json
+!motorbench-a/.vscode/launch.json
+CMakeUserPresets.json
+*.su
 
 # ---- 临时文件(推送脚本用,勿提交) ----
 _commit_msg.txt
