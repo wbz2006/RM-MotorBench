@@ -1,0 +1,9 @@
+build
+mx.scratch
+
+# ---- ST 插件 / clangd 机器本地产物,不入库 ----
+# .settings/ 由 STM32Cube 扩展写入运行时状态(bundles/ide store),
+# 每台机器内容不同;.clangd 指向本机 build 目录。
+# 原 CubeMX 模板的 !.settings 会抵消父级 .gitignore 的忽略规则,故删除。
+.settings/
+.clangd
