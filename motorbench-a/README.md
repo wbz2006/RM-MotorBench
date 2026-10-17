@@ -3,10 +3,44 @@
 本目录是当前固件主工程，基于 STM32F427IIH6、CubeMX 和 CMake/Ninja。旧的
 `../basic_framework_atype_usb-master` 保留为实机可用的 Makefile 参考工程。
 
-## 构建
+## 编译与烧录（推荐：VS Code + ST 官方插件）
 
-需要 CMake 3.22+、Ninja、ARM GNU 工具链。本机已经安装 STM32CubeCLT 1.21.0，
-其中的 `cmake`、`ninja` 和 `arm-none-eabi-gcc` 已在 PATH 中。项目不绑定机器绝对路径。
+**不需要命令行。** 用 VS Code 打开本目录 `motorbench-a`，装好
+**STM32CubeIDE for Visual Studio Code** 扩展（STMicroelectronics 出品），
+编译、烧录、调试都能在界面里完成：
+
+| 想做什么 | 怎么做 |
+|---|---|
+| 编译 | 左下角状态栏点 `Build`，或命令面板搜 `STM32Cube: Build`；也可 `Ctrl+Shift+B` 走项目自带的 `Build Debug` 任务 |
+| 烧录 + 调试 | 接好 A 板电源、SWD 和调试器，左侧「运行和调试」选 `STM32Cube: MotorBench ST-Link` 或 `STM32Cube: MotorBench J-Link`，按 F5 |
+| 只烧录不调试 | 用调试配置旁的「下载」入口；也可另用 STM32CubeProgrammer 烧 `build/` 下已有的 HEX/BIN |
+
+调试启动会**先自动编译，再下载 ELF，然后停在 `main`**——所以平时只按 F5 即可，
+不必先手动构建。继续运行（F5 之后再按一次）才能使用 USB 测试台。
+
+扩展首次使用时，在它的工具管理界面里安装所需的构建与调试工具
+（CMake、Ninja、ARM GCC、ST-Link/J-Link GDB Server）。本机已装
+STM32CubeCLT 1.21.0 与 SEGGER J-Link V9.48，插件通常能直接识别。
+
+`.vscode/launch.json` 使用 ST 官方调试组件声明的
+`stlinkgdbtarget` / `jlinkgdbtarget` 类型，以及官方的构建与 ELF 选择命令
+（`preBuild` 与 `get-projects-binary-from-context1`）。它们不依赖 Cortex-Debug。
+RTT 日志后端保持 SEGGER RTT；**调试器连接成功不等于已打开 RTT 日志窗口**，
+看日志需要手动打开 RTT View。
+
+### 调试配置中的设备名
+
+`deviceName` 使用 CMSIS 设备库的 `STM32F427IIH6`，`deviceCore` 为 `Cortex-M4`。
+CubeMX 的 `STM32F427IIHx` 是带占位符的型号表示，**不能**直接用于官方插件的
+设备名称校验，否则会在烧录前报 `Device not found: No matching device`。
+J-Link 的 `serverDevice` 则使用 SEGGER 的型号名称 `STM32F427II`。
+
+## 命令行构建（可选，用于 CI 或脚本化）
+
+日常开发不必用命令行；仅在需要脚本化/CI 构建时使用。
+
+需要 CMake 3.22+、Ninja、ARM GNU 工具链（STM32CubeCLT 已包含，加入 PATH 即可）。
+项目不绑定机器绝对路径。
 
 ```powershell
 cmake --preset Debug
@@ -19,26 +53,6 @@ cmake --build --preset Release --parallel
 生成 `build/Debug/basic_framework_ATYPE.elf`、`.hex`、`.bin`、`.map`，
 Release 产物在 `build/Release`。保留 CubeMX 的原项目名和产物名，目录名为 `motorbench-a`。
 Debug 使用与旧工程一致的 `-Og` 优化，Release 使用 `-Os`；浮点 ABI 为 Cortex-M4F hard-float。
-
-## VS Code：ST 官方 STM32Cube 插件
-
-1. 用 VS Code **打开本目录 `motorbench-a`**，不要打开旧固件目录。
-2. 安装 STMicroelectronics 的 STM32Cube 扩展及其依赖；在官方插件的工具管理界面完成所需构建和调试工具安装。
-3. 选择 CMake 的 `Debug` configure/build preset，构建项目。也可以按 `Ctrl+Shift+B` 使用提供的 `Build Debug` 任务。
-4. 接好 A 板电源、SWD 和调试器，在“运行和调试”选择
-   `STM32Cube: MotorBench ST-Link` 或 `STM32Cube: MotorBench J-Link`，按 F5。
-   调试启动会构建、下载当前选中工程的 ELF，并停在 `main`；继续运行后才能使用 USB 测试台。
-5. 需要正常烧录运行时，使用 ST 官方插件的 Run/下载入口；已有 HEX/BIN 也可用 STM32CubeProgrammer 烧录。
-
-`.vscode/launch.json` 使用本机 ST 官方 1.4.0 调试组件声明的
-`stlinkgdbtarget` / `jlinkgdbtarget` 类型，以及官方的构建与 ELF 选择命令。
-它们不依赖 Cortex-Debug。调试服务器和工具路径由官方插件管理；J-Link 需要可用的 SEGGER 软件包。
-RTT 日志后端保持 SEGGER RTT；调试器连接成功不等于已打开 RTT 日志窗口。
-
-调试配置中的 `deviceName` 使用 CMSIS 设备库的 `STM32F427IIH6`，`deviceCore` 为
-`Cortex-M4`。CubeMX 的 `STM32F427IIHx` 是包含占位符的型号表示，不能直接用于官方插件的
-设备名称校验，否则会在烧录前报 `Device not found: No matching device`。
-J-Link 的 `serverDevice` 则使用 SEGGER 的型号名称 `STM32F427II`。
 
 ## 迁移范围与执行顺序
 

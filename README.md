@@ -49,16 +49,27 @@
 
 ### 1. 编译并烧录固件
 
+用 VS Code 打开 `motorbench-a` 文件夹，装好 **STM32CubeIDE for Visual Studio Code**
+扩展（STMicroelectronics 出品），编译和烧录都在界面里完成，**不需要命令行**：
+
+- **编译**：状态栏 `Build`，或命令面板搜 `STM32Cube: Build`；也可 `Ctrl+Shift+B`
+- **烧录 + 调试**：接好 A 板电源、SWD 和调试器，「运行和调试」里选
+  `STM32Cube: MotorBench ST-Link` 或 `STM32Cube: MotorBench J-Link`，按 F5
+  —— 会**先自动编译，再下载 ELF，然后停在 `main`**
+
+首次使用请在扩展的工具管理界面安装所需的构建/调试工具
+（CMake、Ninja、ARM GCC、ST-Link/J-Link GDB Server）。
+
+如果偏好命令行（CI / 脚本化场景），也可以：
+
 ```powershell
 cd motorbench-a
-# 确保 cmake、ninja、arm-none-eabi-gcc 在 PATH 中。
 cmake --preset Debug
 cmake --build --preset Debug --parallel
 ```
 
-产物：`motorbench-a/build/Debug/basic_framework_ATYPE.{elf,hex,bin}`。
-
-使用 VS Code 时，直接打开 `motorbench-a` 文件夹，安装 ST 官方 STM32Cube 扩展，选择 `Debug` CMake preset，再使用项目提供的 ST-Link 或 J-Link 调试配置。详见 [新工程说明](motorbench-a/README.md)。
+产物在 `motorbench-a/build/Debug/basic_framework_ATYPE.{elf,hex,bin}`。
+详见 [固件工程说明](motorbench-a/README.md)。
 
 ### 2. 启动上位机
 
@@ -75,8 +86,9 @@ npm start
 1. XT30 接 **15~24V** 电源（USB 口不供电）
 2. USB 线接 A 板 Micro-USB
 3. 网页选择串口 → 打开
-4. 「添加电机」填：型号 / 总线 / 电调 ID
+4. 右上角 `＋` 添加电机：型号 / 总线 / 电调 ID（达妙还需填 TX / RX 两个 ID）
 5. 通道卡片里选电机 → 绑定 → 使能 → 拖动滑块设转速
+6. 列表里每行末尾 `×` 可移除该电机
 
 ---
 
@@ -136,7 +148,12 @@ npm start
 | MOTOR_REMOVE | `0x09` | 下行 | 移除电机 |
 | TELEMETRY | `0x81` | 上行 | 遥测上报 |
 | INVENTORY_REPORT | `0x82` | 上行 | 清单应答 |
-| MOTOR_ADD_ACK | `0x8A` | 上行 | 建电机结果 |
+| MOTOR_ADD_ACK | `0x8A` | 上行 | 建/拆电机结果 |
+
+**达妙 DM-4310 的两个 ID**：DM 走 MIT 协议，发送与接收是独立 ID——
+`TX`（主机→电机的控制指令）与 `RX`（电调→主机的反馈，主机的 CAN 过滤器按它匹配）。
+界面上直接填十六进制，例如 TX `06`、RX `302`。DJI 系只需填 1~8 的电调拨码 ID，
+反馈 ID 由固件按 `0x200+ID` / `0x204+ID` 算出。
 
 **安全设计**：心跳中断约 1.5s 自动全停；通道未使能时拒绝写参考值；关闭网页/服务时下发全停。
 
@@ -146,16 +163,20 @@ npm start
 
 ```powershell
 cd motor_bench_host
-npm test                  # 协议自测（100+ 项）
-npm run test:integration  # 与固件 CRC 表逐字节交叉校验
+npm test                   # 协议自测（含 DOM/CSS 契约与界面接线断言）
+npm run test:integration   # 与固件 CRC 表逐字节交叉校验
+npm run test:motor-state   # 编译真实固件控制路径,验证启停/积分残留/增删电机
 ```
 
 ---
 
 ## 已知限制
 
-- 电机清单在断电后不保留，重新上电需在网页重新添加（CAN 过滤器为启动期硬件资源）
-- PID 当前为实验室通用经验值，实际电机需按型号整定
+- **电机清单不跨断电保留**：重新上电后板端清单为空，需在网页重新添加
+  （CAN 过滤器由硬件在启动期分配，这是框架的固有限制）
+- **达妙 DM 尚未实机验证**：TX/RX 双 ID、速度闭环参数（`Kp=0.05`、`MaxOut=0.5 N·m`）
+  与离线检测都只经过原生回归验证，未上真机
+- PID 需按实际电机与负载整定，网页默认值只是起点
 - 同总线 6020 与 3508/2006 不能共存（见上文 ID 规则）
 
 ---
