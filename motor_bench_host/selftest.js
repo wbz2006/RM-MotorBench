@@ -44,6 +44,9 @@ import {
   findConflict,
   describeConflict,
   usesDjiIdSegment,
+  needsRxId,
+  RX_ID_MIN,
+  RX_ID_MAX,
   MOTOR_ID_MIN,
   MOTOR_ID_MAX,
 } from './protocol.js';
@@ -225,11 +228,11 @@ console.log('\n== 8. dynamic add/remove motor ==');
   check('add frame parses', f.length === 1, `got ${f.length}`);
   check('add frame type is MOTOR_ADD', f[0]?.type === FrameType.MOTOR_ADD);
   const p = f[0].payload;
-  check('add payload len 4', p.length === 4, `len=${p.length}`);
+  check('add payload len 5', p.length === 5, `len=${p.length}`);
   check('add kind field', p[0] === MotorKind.M3508, `got ${p[0]}`);
   check('add canBus field', p[1] === 2, `got ${p[1]}`);
   check('add motorId field', p[2] === 1, `got ${p[2]}`);
-  check('add reserved must be 0', p[3] === 0, `got ${p[3]}`);
+  check('DJI add rx_id must be 0', p.readUInt16LE(3) === 0);
 }
 
 {
@@ -281,6 +284,81 @@ console.log('\n== 8. dynamic add/remove motor ==');
     `6020=${rxOf(MotorKind.GM6020, 1)} 3508=${rxOf(MotorKind.M3508, 5)}`);
   check('6020 id1 != 3508 id1 (same id, different base)',
     rxOf(MotorKind.GM6020, 1) !== rxOf(MotorKind.M3508, 1));
+}
+
+/* ---------------- 达妙 DM 的 tx_id / rx_id 双 ID(2026-10-17) ---------------- */
+{
+  /*
+   * 背景:达妙 DM-4310 走 MIT 协议,发送与接收是**两个独立 ID** ——
+   *   主机 → 电机 用 tx_id,电机 → 主机 回传感测 用 rx_id,
+   *   而主机的 CAN 过滤器按 rx_id 匹配。
+   * 迁移时 BenchBuildDMConfig() 只设了 tx_id,**从未设置 rx_id**
+   * (结构体 memset 后恒为 0),导致两个实测故障:
+   *   ① 挂第二颗 DM 时 CANRegister() 因"rx_id 0x00 already used"直接失败,
+   *      而上层只转成 NO_RESOURCE,提示成了"滤波器已用完",方向完全跑偏;
+   *   ② 单颗 DM 只要实际反馈 ID 不是 0,过滤器就收不到任何反馈,遥测永远 --。
+   *
+   * rx_id 使用小端 16 位,以容纳 0x302 等标准 CAN ID。DJI 系填 0。
+   *
+   * 本组锁死三件事:
+   *   1. 第 4 字节就是 rx_id,DM 填真值、DJI 填 0;
+   *   2. DM 不给 rx_id 就是错的(不能默认 0 蒙混过关);
+   *   3. 拆电机时 rx_id 必须与添加时一致。
+   */
+  const dm = new FrameParser().push(buildMotorAdd(MotorKind.DM, 1, 3, 0x11));
+  check('DM add frame carries rx_id in byte 3',
+    dm.length === 1 && dm[0].payload[3] === 0x11,
+    `got ${dm[0]?.payload[3]}`);
+
+  const dmDefault = new FrameParser().push(buildMotorAdd(MotorKind.DM, 1, 3));
+  check('DM add without rx_id defaults to 0 (caller must pass it)',
+    dmDefault[0]?.payload[3] === 0, `got ${dmDefault[0]?.payload[3]}`);
+
+  const dji = new FrameParser().push(buildMotorAdd(MotorKind.M3508, 2, 5));
+  check('DJI add still sends 0 in byte 3 (driver computes rx_id)',
+    dji[0]?.payload[3] === 0, `got ${dji[0]?.payload[3]}`);
+
+  check('DM and DJI add both use a 5-byte payload',
+    dm[0].payload.length === 5 && dji[0].payload.length === 5);
+
+  for (const id of [0x100, 0x302, 0x7ff]) {
+    const add = new FrameParser().push(buildMotorAdd(MotorKind.DM, 1, 6, id))[0];
+    const remove = new FrameParser().push(buildMotorRemove(MotorKind.DM, 1, 6, id))[0];
+    check(`DM RX 0x${id.toString(16)} survives add/remove without truncation`,
+      add.payload.readUInt16LE(3) === id && remove.payload.readUInt16LE(3) === id);
+  }
+
+  const dmRm = new FrameParser().push(buildMotorRemove(MotorKind.DM, 1, 3, 0x11));
+  check('DM remove echoes rx_id so the board can match the right motor',
+    dmRm.length === 1 && dmRm[0].payload[3] === 0x11,
+    `got ${dmRm[0]?.payload[3]}`);
+
+  const djiRm = new FrameParser().push(buildMotorRemove(MotorKind.M3508, 2, 5));
+  check('DJI remove sends 0 in byte 3', djiRm[0]?.payload[3] === 0);
+
+  /* 只有 DM 需要 rx_id —— 界面据此决定是否显示那个输入框 */
+  check('needsRxId is true only for DM',
+    needsRxId(MotorKind.DM) === true
+    && needsRxId(MotorKind.M3508) === false
+    && needsRxId(MotorKind.M2006) === false
+    && needsRxId(MotorKind.GM6020) === false);
+
+  /* rx_id 范围 = CAN 标准帧 11 位 */
+  check('rx_id range covers the CAN standard-frame ID space',
+    RX_ID_MIN === 0 && RX_ID_MAX === 0x7ff,
+    `got ${RX_ID_MIN}..${RX_ID_MAX}`);
+
+  /*
+   * 固件侧校验规则的镜像(见 motor_bench.c 的 MotorBenchAddMotor):
+   *   DM   → rx_id 必须非 0
+   *   其它 → rx_id 必须为 0(否则 BAD_PARAM,防止"配了却不生效"的静默忽略)
+   */
+  const firmwareRxRule = (kind, rxId) =>
+    kind === MotorKind.DM ? (rxId !== 0 ? 'ok' : 'reject') : (rxId === 0 ? 'ok' : 'reject');
+  check('mirror rule: DM rejects a zero rx_id', firmwareRxRule(MotorKind.DM, 0) === 'reject');
+  check('mirror rule: DJI rejects a non-zero rx_id',
+    firmwareRxRule(MotorKind.M3508, 0x11) === 'reject');
+  check('mirror rule: DM accepts a real rx_id', firmwareRxRule(MotorKind.DM, 0x11) === 'ok');
 }
 
 /* ---------------- 串口写入返回值(回归测试) ---------------- */
@@ -891,14 +969,23 @@ console.log('\n== 18. PID protocol: frame layout, fixed-point, defaults ==');
     PID_DEFAULTS[MotorKind.GM6020].speed.MaxOut === 20000);
   /* DJI 三型必须带电流环参数 —— 这三组实参都是在电流内环下整定的,
    * 少了电流环"同样的 Kp/Ki"不会有同样效果。
-   * 达妙不在此列:用户明确要求"达妙暂时不变",固件侧也没开电流环。 */
+   * 达妙的 MIT 命令直接给扭矩,固件侧不叠加 DJI 电流环。 */
   const djiKinds = [MotorKind.M3508, MotorKind.M2006, MotorKind.GM6020];
   check('DJI 三型都带电流环参数(三环闭环必要条件)',
     djiKinds.every((k) => PID_DEFAULTS[k].current.Kp > 0));
-  check('达妙暂不引入电流环(延用原值,用户要求不变)',
+  check('达妙 MIT 不叠加 DJI 电流环',
     PID_DEFAULTS[MotorKind.DM].current.Kp === 0);
-  check('达妙参数暂不引入(延用原值)',
-    PID_DEFAULTS[MotorKind.DM].speed.Kp === 5);
+  {
+    const app = readFileSync(new URL('../motorbench-a/application/motor_bench_app/motor_bench_app.c', import.meta.url), 'utf8');
+    const dm = app.match(/static void BenchBuildDMConfig\([\s\S]*?\n\}/)?.[0] ?? '';
+    const defaults = PID_DEFAULTS[MotorKind.DM].speed;
+    for (const key of ['Kp', 'Ki', 'Kd', 'MaxOut', 'IntegralLimit']) {
+      const value = dm.match(new RegExp(`speed_PID\\.${key} = ([0-9.]+)f`))?.[1];
+      check(`DM ${key} matches the real firmware default`, value !== undefined && Number(value) === defaults[key]);
+    }
+    check('DM MIT 默认速度增益适用于低扭矩起步', defaults.Kp > 0 && defaults.Kp <= 0.05);
+    check('DM MIT 默认扭矩限幅不超过 0.5 N*m', defaults.MaxOut > 0 && defaults.MaxOut <= 0.5);
+  }
 
   /*
    * 【2026-10-13 实测修正】速度环 Kp 由 1 提高到 3 / 2 / 8。
@@ -2019,8 +2106,25 @@ console.log('\n== 27. add-motor panel: conflict hint and available-ID list ==');
   if (uiSrc2) {
     check('ui defines refreshAddHint at module scope',
       /^function refreshAddHint\(\)/m.test(uiSrc2));
-    check('ui binds the live hint on all three inputs',
-      /for \(const id of \['#addKind', '#addBus', '#addId'\]\)[\s\S]{0,240}?oninput = refreshAddHint/.test(uiSrc2));
+    /*
+     * 2026-10-17:#addRxId(达妙反馈 ID)加入后输入项从三个变成四个。
+     *
+     * @attention 这里**不能**简单地改成正则匹配四个字面 id ——
+     *   那就把这条断言退化成"当前恰好这四个"的脆检查,
+     *   将来再加第五个输入框又得改测试。
+     *   改成**反证**:从 ui.js 里抽出实际监听列表,断言它覆盖
+     *   页面上所有带实时预检需求的输入控件,一个不漏。
+     *   这样新增控件时忘记接线,测试会立刻红,而不是静默漏绑。
+     */
+    const listenerIds = (uiSrc2.match(/for \(const id of \[([^\]]+)\]\)[\s\S]{0,240}?oninput = refreshAddHint/)?.[1] ?? '')
+      .split(',')
+      .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+      .filter(Boolean);
+    check('ui extracts the live-hint listener list', listenerIds.length > 0,
+      'could not parse the for-of id list from ui.js');
+    check('ui binds the live hint on every add-panel input',
+      ['#addKind', '#addBus', '#addId', '#addRxId'].every((id) => listenerIds.includes(id)),
+      `listener list = ${listenerIds.join(', ')}`);
     check('ui uses onXxx assignment, not addEventListener',
       !/\.addEventListener\('input', refreshAddHint\)/.test(uiSrc2),
       'bindEvents runs on every card rebuild; addEventListener would stack handlers');
@@ -2030,6 +2134,13 @@ console.log('\n== 27. add-motor panel: conflict hint and available-ID list ==');
     check('ui recomputes the hint when inventory changes',
       /typeof refreshAddHint === 'function'[\s\S]{0,60}?refreshAddHint\(\)/.test(uiSrc2),
       'a stale available-ID list would lead the user straight into a collision');
+    /* 达妙专用:rx_id 输入框必须按型号切换可见性,且非 DM 时清零 */
+    check('ui toggles the rx_id input by motor kind',
+      /function syncRxIdVisibility\(\)/.test(uiSrc2) && /syncRxIdVisibility\(\)/.test(uiSrc2),
+      'a DM-only control that stays visible on DJI kinds is misleading');
+    check('ui validates rx_id before sending',
+      /readRxIdInput\(\)/.test(uiSrc2) && /if \(!rx\.ok\)/.test(uiSrc2),
+      'an out-of-range feedback ID must be caught before the frame goes out');
   }
 }
 
@@ -2846,10 +2957,25 @@ console.log('\n== 34. 通道操作按钮归位;急停单击即停 ==');
       check('the estop sends stopAll directly',
         /send\(\{ type: 'stopAll' \}\)/.test(estopFn[0]));
     }
-    /* 刻意保留的确认只有解绑 + 使能两处;多一处说明又有人给急停之类加了门槛 */
-    check('exactly 2 deliberate confirms remain (unbind + enable)',
-      (code.match(/confirm\(/g) || []).length === 2,
+    /*
+     * 刻意保留的确认有三处:解绑 + 使能 + 移除电机(2026-10-17 新增)。
+     *
+     * @attention 为什么移除电机也值得一道确认:
+     *   它会**真的释放 CAN 过滤器并销毁电机实例**。若该电机还绑在某个通道上,
+     *   那个通道会立刻失去控制对象 —— 界面显示"未绑定",但用户可能没意识到
+     *   是自己刚把控制对象删了。这是不可逆的破坏性操作,与"解绑"同类。
+     *
+     *   这与"急停不得有确认"**不矛盾**:急停是时间敏感动作(多一步点击就多一份
+     *   危险),而移除是有预期的计划性操作。判据是"是否时间敏感",不是"是否危险"。
+     *
+     * 多出第四处说明又有人给不该拦的动作加了门槛(尤其是急停)。
+     */
+    check('exactly 3 deliberate confirms remain (unbind + enable + remove)',
+      (code.match(/confirm\(/g) || []).length === 3,
       `found ${(code.match(/confirm\(/g) || []).length}`);
+    /* 移除电机的确认必须在移除按钮的处理里,不能挪到别处 */
+    check('the remove handler carries the confirmation',
+      /function removeRegisteredMotor\(m\)[\s\S]{0,600}?confirm\(/.test(code));
     check('the enable interlock is still there',
       /该通道当前设定值不为 0/.test(ui), 'must warn before a motor jumps to speed');
   }
@@ -3043,18 +3169,30 @@ console.log('\n== 37. 串口与添加电机并成一行;鱼骨图底部信息行
     check('the two old full-width bars are gone',
       !/class="panel serial"/.test(htmlCode) && !/class="panel addmotor"/.test(htmlCode),
       'both used to be separate <section>s stacked one per row');
-    check('it holds two groups with one divider between them',
-      (htmlCode.match(/class="setup-group"/g) || []).length === 2
-      && /class="setup-sep"/.test(htmlCode));
+    /*
+     * 2026-10-17:setup 面板从两组变成三组(连接 / 添加电机 / 移除电机),
+     * 分隔线相应变成两条。
+     *
+     * @attention 这里不断言具体数字,而是"组数 = 分隔线数 + 1" ——
+     *   硬编码 2 或 3 都会在下次加组时又红一次,而那条断言本来要防的是
+     *   "漏加分隔线"(两组挤在一起没有视觉分隔),不是"组数必须是几"。
+     */
+    const groupCount = (htmlCode.match(/class="(?:setup-group|motor-registry)"/g) || []).length;
+    const sepCount = (htmlCode.match(/class="setup-sep"/g) || []).length;
+    check('setup panel holds N groups with N-1 dividers between them',
+      groupCount >= 2 && sepCount === groupCount - 1,
+      `groups=${groupCount} separators=${sepCount}`);
 
     /*
-     * 十个控件 id 一个都不能少、一个字都不能改。
+     * 控件 id 一个都不能少、一个字都不能改。
      * @attention 这是本组的核心断言:布局随便改,id 改了就是崩溃。
      */
     const ids = ['portSelect', 'refreshPorts', 'openPort', 'closePort', 'rescan',
-      'addKind', 'addBus', 'addId', 'addMotor', 'addMsg'];
+      'addKind', 'addBus', 'addId', 'addMotor', 'addMsg',
+      /* 2026-10-17 移除电机入口 */
+      'motorList', 'openAddMotor', 'registryMsg'];
     const missing = ids.filter((id) => !htmlCode.includes(`id="${id}"`));
-    check('all ten control ids survived the merge',
+    check('all control ids survived the merge',
       missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : '');
 
     check('the serial group comes first, 添加电机 second',
@@ -3147,12 +3285,27 @@ console.log('\n== 38. PID 状态消息与「应用到电机」同行;.hint 的�
       && row.indexOf('pidReset') < row.indexOf('pidMsg'));
 
     /*
-     * .hint 的使用者就这三处:两个行内状态消息 + 页脚段落。
-     * 数量变了说明有人加了第四处 —— 那就得先想清楚它是行内还是段落。
+     * .hint 的使用者:行内状态消息 + 页脚段落。
+     *
+     * @attention 2026-10-17 从 3 处变成 4 处 —— 新增的 #removeMsg
+     *   (移除电机的回执)也是行内状态消息,与 #addMsg / pidMsg 同类。
+     *
+     *   这里**不硬编码数字**,改为"每个行内消息都必须同时满足:
+     *   ① 是 <span>(不是 <p>/<div>,否则会被迫独占一行);
+     *   ② 不带 padding(否则宽度被撑开、被 flex-wrap 甩到下一行)"。
+     *   这是这条断言真正要防的东西 —— 硬编码 3 或 4 都挡不住
+     *   "新增了一处但用了块级元素"这种真正的回归。
      */
-    check('.hint has exactly three users (2 inline messages + footer paragraph)',
-      (htmlCode.match(/class="hint"/g) || []).length === 3,
-      'inline vs paragraph styling differs — re-check before adding another');
+    const inlineHints = [...htmlCode.matchAll(/<span[^>]*class="hint"[^>]*>/g)].map((m) => m[0]);
+    check('every inline .hint is a span (never a block element)',
+      inlineHints.length > 0
+      && inlineHints.every((tag) => /^<span/.test(tag)),
+      `found ${inlineHints.length} inline hints`);
+    check('the footer paragraph still uses .hint',
+      /<footer class="hint"/.test(htmlCode));
+    check('.hint total users are the inline messages plus the footer paragraph',
+      (htmlCode.match(/class="hint"/g) || []).length === inlineHints.length + 1,
+      `inline=${inlineHints.length} total=${(htmlCode.match(/class="hint"/g) || []).length}`);
   }
 
   if (css) {
@@ -3187,6 +3340,42 @@ console.log('\n== 38. PID 状态消息与「应用到电机」同行;.hint 的�
       !/text-overflow\s*:\s*ellipsis/.test(act || ''),
       'truncating an error message is worse than wrapping');
   }
+}
+
+/* ---------------- 39. 电机列表与完整反馈 ID ---------------- */
+console.log('\n== 39. 电机列表、十六进制 ID、删除匹配键 ==');
+{
+  const ui = readFileSync(new URL('./ui.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  check('registry has list, add toggle, result and inline form',
+    ['motorList', 'openAddMotor', 'registryMsg', 'addForm', 'cancelAddMotor']
+      .every(id => html.includes(`id="${id}"`)));
+  check('list rows remove the captured motor with all four keys',
+    /remove.onclick = \(\) => removeRegisteredMotor\(m\)/.test(ui)
+    && /sendMotorEdit\(\{ type: 'removeMotor', kind: m\.kind, canBus: m\.canBus, motorId: m\.motorId, rxId \}\)/.test(ui)
+    && /const rxId = m\.rxId/.test(ui));
+  check('registry edits share an acknowledgement timeout',
+    /function sendMotorEdit\(command\)[\s\S]*?if \(pendingMotor\) return/.test(ui)
+    && /}, 3000\)/.test(ui));
+  check('old firmware cannot delete a DM motor without its feedback ID',
+    /remove.disabled = !!pendingMotor \|\| missingRx/.test(ui));
+  check('DM4310 is the only DM model offered',
+    /<option value="4">DM4310<\/option>/.test(html));
+
+  const body = Buffer.from([2, MotorKind.M2006, 1, 3, 2, 0, 0,
+    MotorKind.DM, 1, 6, 2, 0x02, 0x03]);
+  const parsed = parseInventory(new FrameParser().push(buildFrame(FrameType.INVENTORY_REPORT, body))[0].payload);
+  check('new inventory preserves DJI and complete DM RX 0x302',
+    parsed.count === 2 && parsed.items[0].rxId === 0 && parsed.items[1].rxId === 0x302);
+  check('DM label is DM4310 throughout protocol', MotorKindLabel[parsed.items[1].kind] === 'DM4310');
+  check('legacy inventory omits unknown RX instead of inventing zero', !('rxId' in inv.items[1]));
+  check('truncated inventory is rejected', parseInventory(body.subarray(0, -1)) === null);
+  const maximum = Buffer.alloc(49);
+  maximum[0] = 8;
+  for (let i = 0; i < 8; i++) body.copy(maximum, 1+i*6, 7, 13);
+  const maxFrames = new FrameParser().push(buildFrame(FrameType.INVENTORY_REPORT, maximum));
+  check('eight complete inventory records fit the transport frame',
+    maxFrames.length === 1 && parseInventory(maxFrames[0].payload).items.length === 8);
 }
 
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);

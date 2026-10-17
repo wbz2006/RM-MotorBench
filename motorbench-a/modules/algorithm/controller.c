@@ -137,6 +137,13 @@ void PIDInit(PIDInstance *pid, PID_Init_Config_s *config)
     DWT_GetDeltaT(&pid->DWT_CNT);
 }
 
+void PIDReset(PIDInstance *pid)
+{
+    PID_Init_Config_s config;
+    memcpy(&config, pid, sizeof(config));
+    PIDInit(pid, &config);
+}
+
 /**
  * @brief          PID计算
  * @param[in]      PID结构体

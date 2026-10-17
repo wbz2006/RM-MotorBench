@@ -107,6 +107,7 @@ const parser = new FrameParser();
 /** 串口实例,未连接时为 null */
 let serialPort = null;
 let heartbeatTimer = null;
+let heartbeatBurstTimer = null;
 
 /** 向所有浏览器广播 */
 function broadcast(obj) {
@@ -165,10 +166,28 @@ function handleCommand(cmd) {
       writeToSerial(buildSetRef(cmd.channelId, Number(cmd.ref)));
       break;
     case 'enable':
-      writeToSerial(buildEnable(cmd.channelId, !!cmd.enable));
+      if (cmd.enable) {
+        const ref = Number(cmd.ref ?? 0);
+        if (!Number.isFinite(ref)) {
+          broadcast({ type: 'error', message: '目标值必须为有限数值' });
+          break;
+        }
+        // Firmware enables at zero. Apply the value actually shown in this card,
+        // including zero, in the same serial write and in protocol order.
+        writeToSerial(Buffer.concat([
+          buildEnable(cmd.channelId, true), buildSetRef(cmd.channelId, ref),
+        ]));
+      } else {
+        writeToSerial(buildEnable(cmd.channelId, false));
+      }
       break;
     case 'stopAll':
       writeToSerial(buildAllStop());
+      break;
+    case 'resetChannels':
+      // Start with channel 0. The page sends the next unbind after each ACK.
+      // Serial writes do not define USB packet boundaries; avoid a 61-byte burst.
+      writeToSerial(Buffer.concat([buildAllStop(), buildUnbind(0)]));
       break;
     case 'query':
       writeToSerial(buildQuery());
@@ -180,7 +199,10 @@ function handleCommand(cmd) {
 
 wss.on('connection', (ws) => {
   broadcast({ type: 'clients', count: wss.clients.size });
-  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0' }));
+  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels'] }));
+  // A page reload does not close the Node-owned USB serial connection.
+  ws.send(JSON.stringify({ type: 'serial', open: !!serialPort?.isOpen,
+    path: serialPort?.path, baud: serialPort?.baudRate }));
 
   ws.on('message', (data) => {
     let cmd;
@@ -198,8 +220,11 @@ wss.on('connection', (ws) => {
         .then((info) => ws.send(JSON.stringify({ type: 'serial', open: true, ...info })))
         .catch((e) => ws.send(JSON.stringify({ type: 'error', message: `打开串口失败: ${e.message}` })));
     } else if (cmd.type === 'closeSerial') {
-      closeSerial();
-      ws.send(JSON.stringify({ type: 'serial', open: false }));
+      closeSerial()
+        .then(() => {
+          if (!serialPort?.isOpen) ws.send(JSON.stringify({ type: 'serial', open: false }));
+        })
+        .catch((e) => ws.send(JSON.stringify({ type: 'error', message: `关闭串口失败: ${e.message}` })));
     } else if (cmd.type === 'scanMotors') {
       // 向板端询问"这块板上登记了哪些电机",界面据此列出可选项
       writeToSerial(buildInventoryQuery());
@@ -209,12 +234,20 @@ wss.on('connection', (ws) => {
        * 板端负责校验(rx_id 冲突 / 过滤器耗尽)并回应答帧 0x8A,
        * 界面据 MBResultText 显示具体原因。
        *
+       * @param rxId 反馈 ID(2026-10-17 新增,达妙 DM 专用)。
+       *   DJI 系传 0 或不传(默认 0) —— 驱动的 rx_id 内部算;
+       *   DM 系必须传电机实际的反馈 ID,否则板端收不到回传。
+       *
        * @attention 这里的失败应答是"本机就没发出去",与板端拒绝是两回事,
        *   必须给出对应错误码 —— 早前误用了 NO_RESOURCE(资源不足),
        *   会让用户以为是板子上过滤器用完了,排查方向完全跑偏。
        */
-      const { kind, canBus, motorId } = cmd;
-      if (!writeToSerial(buildMotorAdd(kind, canBus, motorId))) {
+      const { kind, canBus, motorId, rxId = 0 } = cmd;
+      if (!Number.isInteger(rxId) || rxId < 0 || rxId > 0x7ff) {
+        ws.send(JSON.stringify({ type: 'error', message: '反馈 ID 必须为 0~2047 的整数' }));
+        return;
+      }
+      if (!writeToSerial(buildMotorAdd(kind, canBus, motorId, rxId))) {
         ws.send(JSON.stringify({
           type: 'motorAck',
           data: { result: MBResult.BAD_PARAM, kind, canBus, motorId,
@@ -223,8 +256,13 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'error', message: '串口未连接,请先打开串口' }));
       }
     } else if (cmd.type === 'removeMotor') {
-      const { kind, canBus, motorId } = cmd;
-      if (!writeToSerial(buildMotorRemove(kind, canBus, motorId))) {
+      /* rxId 须与添加时一致,否则板端找不到目标返回 NOT_PROVISIONED */
+      const { kind, canBus, motorId, rxId = 0 } = cmd;
+      if (!Number.isInteger(rxId) || rxId < 0 || rxId > 0x7ff) {
+        ws.send(JSON.stringify({ type: 'error', message: '反馈 ID 必须为 0~2047 的整数' }));
+        return;
+      }
+      if (!writeToSerial(buildMotorRemove(kind, canBus, motorId, rxId))) {
         ws.send(JSON.stringify({
           type: 'motorAck',
           data: { result: MBResult.BAD_PARAM, kind, canBus, motorId,
@@ -347,6 +385,8 @@ async function openSerial(portPath, baud) {
     });
     sp.on('error', (e) => broadcast({ type: 'error', message: `串口错误: ${e.message}` }));
     sp.on('close', () => {
+      if (serialPort && serialPort !== sp) return;
+      if (serialPort === sp) serialPort = null;
       broadcast({ type: 'serial', open: false });
       stopHeartbeat();
       console.log(`[RX] 本次连接累计收到 ${rxTotalBytes} 字节,共 ${rxDiagCount} 个数据包`);
@@ -359,10 +399,11 @@ async function openSerial(portPath, baud) {
 
 async function closeSerial() {
   stopHeartbeat();
-  if (serialPort && serialPort.isOpen) {
-    await new Promise((r) => serialPort.close(() => r()));
-  }
+  const closingPort = serialPort;
   serialPort = null;
+  if (closingPort && closingPort.isOpen) {
+    await new Promise((resolve, reject) => closingPort.close((error) => error ? reject(error) : resolve()));
+  }
 }
 
 /**
@@ -383,14 +424,21 @@ function startHeartbeat() {
    *   这里在开场密集补发几个,把建链时间压到几十毫秒内。
    */
   let burst = 0;
-  const burstTimer = setInterval(() => {
+  heartbeatBurstTimer = setInterval(() => {
     writeToSerial(buildHeartbeat());
-    if (++burst >= 8) clearInterval(burstTimer); // 8 × 30ms ≈ 240ms
+    if (++burst >= 8) {
+      clearInterval(heartbeatBurstTimer); // 8 × 30ms ≈ 240ms
+      heartbeatBurstTimer = null;
+    }
   }, 30);
 
   heartbeatTimer = setInterval(() => writeToSerial(buildHeartbeat()), 200);
 }
 function stopHeartbeat() {
+  if (heartbeatBurstTimer) {
+    clearInterval(heartbeatBurstTimer);
+    heartbeatBurstTimer = null;
+  }
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;

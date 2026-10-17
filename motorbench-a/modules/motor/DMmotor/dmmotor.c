@@ -33,10 +33,14 @@ static void DMMotorSetMode(DMMotor_Mode_e cmd, DMMotorInstance *motor)
 
 static void DMMotorDecode(CANInstance *motor_can)
 {
+    if (motor_can->rx_len != 8)
+        return;
     uint16_t tmp;
     uint8_t *rxbuff = motor_can->rx_buff;
     DMMotorInstance *motor = (DMMotorInstance *)motor_can->id;
     DM_Motor_Measure_s *measure = &(motor->measure);
+    if (motor->daemon)
+        DaemonReload(motor->daemon);
 
     measure->last_position = measure->position;
     tmp = (uint16_t)((rxbuff[1] << 8) | rxbuff[2]);
@@ -86,8 +90,9 @@ DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
         return NULL;
     }
 
+    Daemon_Init_Config_s daemon_config = {.reload_count = 10}; /* 100ms at 100Hz */
+    motor->daemon = DaemonRegister(&daemon_config);
     DMMotorEnable(motor);
-    DMMotorSetMode(DM_CMD_MOTOR_MODE, motor);
     DWT_Delay(0.1);
     DMMotorCaliEncoder(motor);
     DWT_Delay(0.1);
@@ -102,12 +107,24 @@ void DMMotorSetRef(DMMotorInstance *motor, float ref)
 
 void DMMotorEnable(DMMotorInstance *motor)
 {
+    if (motor->stop_flag == MOTOR_STOP)
+    {
+        PIDReset(&motor->speed_PID);
+        PIDReset(&motor->angle_PID);
+        PIDReset(&motor->current_PID);
+        DMMotorSetMode(DM_CMD_MOTOR_MODE, motor);
+    }
     motor->stop_flag = MOTOR_ENALBED;
 }
 
 void DMMotorStop(DMMotorInstance *motor)
 {
+    if (motor->stop_flag != MOTOR_STOP)
+        DMMotorSetMode(DM_CMD_RESET_MODE, motor);
     motor->stop_flag = MOTOR_STOP;
+    PIDReset(&motor->speed_PID);
+    PIDReset(&motor->angle_PID);
+    PIDReset(&motor->current_PID);
 }
 
 void DMMotorOuterLoop(DMMotorInstance *motor, Closeloop_Type_e type)
@@ -126,12 +143,29 @@ void DMMotorControl()
     {
         motor = dm_motor_instance[i];
         setting = &motor->motor_settings;
+        if (motor->stop_flag == MOTOR_STOP)
+        {
+            /* Retry the physical disable if an earlier CAN send was busy. */
+            DMMotorSetMode(DM_CMD_RESET_MODE, motor);
+            continue;
+        }
 
         pid_ref = motor->pid_ref;
         set = pid_ref;
 
         if (setting->motor_reverse_flag == MOTOR_DIRECTION_REVERSE)
             set *= -1;
+
+        /* Never drive against missing/stale feedback. Reset history as well. */
+        if (!motor->daemon || !DaemonIsOnline(motor->daemon))
+        {
+            set = 0;
+            PIDReset(&motor->speed_PID);
+        }
+        /* MIT torque commands are the inner loop; speed targets are rad/s,
+         * matching this driver's feedback and the host's DM unit label. */
+        else if (setting->outer_loop_type & SPEED_LOOP)
+            set = PIDCalculate(&motor->speed_PID, motor->measure.velocity, set);
 
         LIMIT_MIN_MAX(set, DM_T_MIN, DM_T_MAX);
 
@@ -140,9 +174,6 @@ void DMMotorControl()
         motor_send_mailbox.torque_des = float_to_uint(set, DM_T_MIN, DM_T_MAX, 12);
         motor_send_mailbox.Kp = 0;
         motor_send_mailbox.Kd = 0;
-
-        if (motor->stop_flag == MOTOR_STOP)
-            motor_send_mailbox.torque_des = float_to_uint(0, DM_T_MIN, DM_T_MAX, 12);
 
         motor->motor_can_instace->tx_buff[0] = (uint8_t)(motor_send_mailbox.position_des >> 8);
         motor->motor_can_instace->tx_buff[1] = (uint8_t)(motor_send_mailbox.position_des);

@@ -123,6 +123,9 @@ typedef struct // config parameter
  */
 void PIDInit(PIDInstance *pid, PID_Init_Config_s *config);
 
+/* Clear control history and restart timing while retaining the tuned parameters. */
+void PIDReset(PIDInstance *pid);
+
 /**
  * @brief 计算PID输出
  *

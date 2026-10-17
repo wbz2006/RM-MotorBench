@@ -15,6 +15,8 @@ import {
   describeConflict,
   findConflict,
   usesDjiIdSegment,
+  needsRxId,
+  RX_ID_MAX,
   MOTOR_ID_MIN,
   MOTOR_ID_MAX,
   LoopType,
@@ -33,10 +35,10 @@ let CHANNEL_COUNT = 1;
 
 /** 各电机种类的参考值限幅与单位(与固件 MB_REF_LIMIT_* 及驱动量程对应) */
 const MOTOR_SPEC = {
-  [MotorKindLabel[1]]: { unit: 'rpm', range: 6000 }, // GM6020
-  [MotorKindLabel[2]]: { unit: 'rpm', range: 6000 }, // M3508
-  [MotorKindLabel[3]]: { unit: 'rpm', range: 7000 }, // M2006
-  [MotorKindLabel[4]]: { unit: 'rad/s', range: 40 }, // DM
+  [MotorKindLabel[1]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // GM6020
+  [MotorKindLabel[2]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M3508
+  [MotorKindLabel[3]]: { unit: 'rpm', range: 7000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M2006
+  [MotorKindLabel[4]]: { unit: 'rad/s', range: 40, feedbackLabel: '转矩', feedbackUnit: 'N·m' }, // DM4310
   [MotorKindLabel[5]]: { unit: 'rad/s', range: 40 }, // LK
   [MotorKindLabel[6]]: { unit: 'rad/s', range: 40 }, // HT
 };
@@ -51,12 +53,146 @@ const ws = new WebSocket(wsUrl);
 /** 板端上报的电机清单(来自心跳应答的 inventoryCount,随后由遥测确认) */
 let inventory = [];
 const telemetryByChannel = new Map();
+let boardOnline = false;
+let boardLastSeen = null;
+let serialConnected = false;
+let serialPath = null;
+let channelsReady = false;
+let channelResetPending = null;
+let channelResetTimer = null;
+let channelResetAttempts = 0;
+let serverSupportsReset = false;
+let channelResetError = '';
+// A fresh page must never adopt telemetry from an earlier test session.
+const sessionChannels = new Set();
+const pendingUnbindChannels = new Set();
+
+function clearTestChannels() {
+  channelsReady = false;
+  sessionChannels.clear();
+  pendingUnbindChannels.clear();
+  telemetryByChannel.clear();
+  for (let i = 0; i < CHANNEL_COUNT; i++) {
+    const el = ch(i);
+    if (!el) continue;
+    el.querySelector('[data-role="motor"]').value = '';
+    el.querySelector('[data-role="num"]').value = '0';
+    el.querySelector('[data-role="slider"]').value = '0';
+    getChartIfExists(i)?.clear();
+    renderChannel(i);
+    initPidPanel(i);
+  }
+}
+
+function resetTestChannels() {
+  if (!serialConnected || channelResetPending) return;
+  clearTestChannels();
+  if (!serverSupportsReset) {
+    channelResetError = '后台版本过旧 · 请重启上位机服务';
+    showRegistryMsg(channelResetError, true);
+    setLink(false, channelResetError);
+    return;
+  }
+  channelResetError = '';
+  channelResetPending = new Set(Array.from({ length: 8 }, (_, i) => i));
+  channelResetAttempts = 0;
+  setLink(true, '正在清理旧测试通道…');
+  sendResetChannel(true);
+}
+
+function sendResetChannel(start = false) {
+  clearTimeout(channelResetTimer);
+  if (!channelResetPending?.size) return;
+  if (channelResetAttempts >= 3) {
+    const missing = [...channelResetPending].join('、');
+    channelResetPending = null;
+    channelResetTimer = null;
+    channelResetError = `通道 ${missing} 清理超时 · 点击同步清单重试`;
+    showRegistryMsg(channelResetError, true);
+    setLink(false, channelResetError);
+    return;
+  }
+  channelResetAttempts++;
+  channelResetTimer = setTimeout(() => sendResetChannel(), 400);
+  const channelId = channelResetPending.values().next().value;
+  send(start ? { type: 'resetChannels' } : { type: 'unbind', channelId });
+}
+
+function canControlChannel(i) {
+  return channelsReady && sessionChannels.has(i) && telemetryByChannel.has(i);
+}
+
+function noteBoardResponse() {
+  boardLastSeen = Date.now();
+  boardOnline = true;
+}
+
+// The server can remain connected while the board is stuck or stops responding.
+setInterval(() => {
+  if (!boardOnline || boardLastSeen === null || Date.now() - boardLastSeen < 2000) return;
+  boardOnline = false;
+  setLink(false, 'A 板无响应 · 数据已中断');
+  for (let i = 0; i < CHANNEL_COUNT; i++) renderChannel(i);
+}, 500);
 
 /** 在"添加电机"面板上显示一行结果提示 */
 function showAddMsg(text, isError) {
   const el = $('#addMsg');
   el.textContent = text;
   el.classList.toggle('error', !!isError);
+}
+
+/** DM4310 IDs are entered and displayed as hexadecimal; wire values remain numbers. */
+function readHexId(value, max, label) {
+  const raw = value.trim().replace(/^0x/i, '');
+  if (!/^[0-9a-f]+$/i.test(raw)) return { ok: false, value: 0, msg: `${label} 请填写十六进制 ID` };
+  const id = Number.parseInt(raw, 16);
+  if (id < 1 || id > max) return { ok: false, value: 0, msg: `${label} 范围为 0x01~0x${max.toString(16).toUpperCase()}` };
+  return { ok: true, value: id };
+}
+
+function readMotorIdInput() {
+  const kind = Number($('#addKind').value);
+  if (needsRxId(kind)) return readHexId($('#addId').value, 0xff, '发送 ID');
+  const raw = $('#addId').value.trim();
+  const value = Number(raw);
+  return /^\d+$/.test(raw) && value >= MOTOR_ID_MIN && value <= MOTOR_ID_MAX
+    ? { ok: true, value }
+    : { ok: false, value: 0, msg: `ID 需填 ${MOTOR_ID_MIN}~${MOTOR_ID_MAX} 的整数` };
+}
+
+function readRxIdInput() {
+  if (!needsRxId(Number($('#addKind').value))) return { ok: true, value: 0 };
+  return readHexId($('#addRxId').value, RX_ID_MAX, '反馈 ID');
+}
+
+function syncRxIdVisibility() {
+  const dm = needsRxId(Number($('#addKind').value));
+  $('#addRxIdWrap').hidden = !dm;
+  $('#addIdPrefix').hidden = !dm;
+  $('#addIdLabel').textContent = dm ? '发送 ID / TX' : '电调 ID';
+  $('#addId').inputMode = dm ? 'text' : 'numeric';
+  $('#addId').setAttribute('aria-label', dm ? '发送 ID 十六进制' : '电调 ID');
+}
+
+function formatMotorId(m) {
+  return needsRxId(m.kind) ? `0x${m.motorId.toString(16).toUpperCase().padStart(2, '0')}` : String(m.motorId);
+}
+
+function showRegistryMsg(text, isError = false) {
+  const el = $('#registryMsg');
+  el.textContent = text;
+  el.classList.toggle('error', isError);
+}
+
+function setAddFormOpen(open) {
+  $('#addForm').hidden = !open;
+  $('#openAddMotor').setAttribute('aria-expanded', String(open));
+  if (open) {
+    showRegistryMsg('');
+    refreshAddHint();
+    $('#addKind').focus();
+  } else $('#openAddMotor').focus();
 }
 
 /**
@@ -77,10 +213,18 @@ function refreshAddHint() {
 
   const kind = Number(kindEl.value);
   const canBus = Number(busEl.value);
-  const motorId = Number(idEl.value);
+  const id = readMotorIdInput();
+  const motorId = id.value;
 
-  if (!Number.isInteger(motorId) || motorId < MOTOR_ID_MIN || motorId > MOTOR_ID_MAX) {
-    showAddMsg(`ID 需填 ${MOTOR_ID_MIN}~${MOTOR_ID_MAX} 的整数`, true);
+  if (!id.ok) {
+    showAddMsg(id.msg, true);
+    return;
+  }
+
+  /* DM 的 rx_id 先校验:填错就没有必要再算冲突 */
+  const rx = readRxIdInput();
+  if (!rx.ok) {
+    showAddMsg(rx.msg, true);
     return;
   }
 
@@ -104,9 +248,69 @@ function refreshAddHint() {
   }
 }
 
-/** 添加/移除的待应答计时器:超时则提示"没收到板子应答",避免永久卡住 */
+/** Serialize registry edits: add/remove share the same firmware acknowledgement. */
 let addPendingTimer = null;
-let addPendingLabel = '添加电机';
+let pendingMotor = null;
+
+function renderMotorList() {
+  const list = $('#motorList');
+  list.replaceChildren();
+  $('#registryCount').textContent = String(inventory.length).padStart(2, '0');
+  $('#motorListEmpty').hidden = inventory.length > 0;
+  $('#openAddMotor').disabled = !!pendingMotor;
+  $('#addMotor').disabled = !!pendingMotor;
+  inventory.forEach((m, index) => {
+    const row = document.createElement('li');
+    row.className = 'motor-row';
+    const number = document.createElement('span');
+    number.className = 'motor-row-index';
+    number.textContent = String(index + 1).padStart(2, '0');
+    const info = document.createElement('div');
+    info.className = 'motor-row-info';
+    const name = document.createElement('strong');
+    name.textContent = m.label;
+    const details = document.createElement('span');
+    details.className = 'motor-row-details';
+    details.textContent = `CAN${m.canBus} · ${needsRxId(m.kind) ? 'TX' : 'ID'} ${formatMotorId(m)}`;
+    if (needsRxId(m.kind)) details.textContent += Number.isInteger(m.rxId)
+      ? ` · RX 0x${m.rxId.toString(16).toUpperCase().padStart(3, '0')}` : ' · RX 未上报，请更新固件至 1.2';
+    info.append(name, details);
+    const remove = document.createElement('button');
+    remove.className = 'motor-remove';
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', `删除 ${m.label} CAN${m.canBus} ID ${formatMotorId(m)}`);
+    const missingRx = needsRxId(m.kind) && !Number.isInteger(m.rxId);
+    remove.disabled = !!pendingMotor || missingRx;
+    remove.title = missingRx ? '请更新固件至 1.2,同步反馈 ID 后再删除' : `删除 ${m.label}`;
+    remove.onclick = () => removeRegisteredMotor(m);
+    row.append(number, info, remove);
+    list.appendChild(row);
+  });
+}
+
+function sendMotorEdit(command) {
+  if (pendingMotor) return;
+  pendingMotor = command;
+  renderMotorList();
+  addPendingTimer = setTimeout(() => {
+    const adding = pendingMotor.type === 'addMotor';
+    pendingMotor = null;
+    addPendingTimer = null;
+    const text = '3 秒内未收到板端应答,请同步清单后重试';
+    showRegistryMsg(text, true);
+    if (adding) showAddMsg(text, true);
+    renderMotorList();
+  }, 3000);
+  send(command);
+}
+
+function removeRegisteredMotor(m) {
+  if (pendingMotor) return;
+  if (!confirm(`确定删除 ${m.label} · CAN${m.canBus} · ID ${formatMotorId(m)}？已绑定的通道将停机并解绑。`)) return;
+  const rxId = m.rxId ?? 0;
+  showRegistryMsg('正在删除…');
+  sendMotorEdit({ type: 'removeMotor', kind: m.kind, canBus: m.canBus, motorId: m.motorId, rxId });
+}
 
 /* ---------------- 建卡片 ---------------- */
 
@@ -154,6 +358,7 @@ function buildChannels(count = null) {
   for (let i = have; i < n; i++) {
     const node = tpl.content.firstElementChild.cloneNode(true);
     node.dataset.ch = String(i);
+    node.querySelector('[data-role="channelIndex"]').textContent = String(i).padStart(2, '0');
     node.querySelector('.ch-title').textContent = `通道 ${i}`;
     host.appendChild(node);
   }
@@ -167,6 +372,7 @@ function buildChannels(count = null) {
    *   但重写时闭包捕获的 i 若与实际通道不一致,就会出现"点通道1发的是通道0"。
    */
   bindEvents();
+  for (let i = have; i < n; i++) renderChannel(i);
 }
 
 function ch(i) {
@@ -191,11 +397,15 @@ function renderChannel(i) {
   const el = ch(i);
   if (!el) return;
   const t = telemetryByChannel.get(i);
+  el.dataset.state = !t ? 'idle' : !boardOnline || !t.online ? 'offline' : t.enabled ? 'running' : 'bound';
 
   const badge = el.querySelector('[data-role="status"]');
   if (!t) {
     badge.textContent = '未绑定';
     badge.className = 'badge';
+  } else if (!boardOnline) {
+    badge.textContent = '数据中断';
+    badge.className = 'badge offline';
   } else if (!t.online) {
     badge.textContent = '离线';
     badge.className = 'badge offline';
@@ -208,6 +418,20 @@ function renderChannel(i) {
   }
 
   const r = (role) => el.querySelector(`[data-role="${role}"]`);
+  const spec = MOTOR_SPEC[MotorKindLabel[currentChannelKind(i)]];
+  const speedUnit = spec?.unit || 'rpm';
+  const feedbackLabel = spec?.feedbackLabel || '反馈';
+  const feedbackUnit = spec?.feedbackUnit || 'raw';
+  r('speedLegend').textContent = `实测转速（${speedUnit}）`;
+  r('torqueLegend').textContent = `${feedbackLabel}（${feedbackUnit}）`;
+  r('chart').setAttribute('aria-label', `转速（${speedUnit}）与${feedbackLabel}（${feedbackUnit}）实时曲线`);
+  if (!t) r('chart').removeAttribute('title');
+  getChartIfExists(i)?.setUnits(speedUnit, feedbackUnit);
+  const controllable = canControlChannel(i);
+  r('bind').disabled = !channelsReady || !!t;
+  r('motor').disabled = !channelsReady || !!t;
+  r('unbind').disabled = !channelsReady || !sessionChannels.has(i);
+  for (const role of ['enable', 'zero', 'num', 'slider']) r(role).disabled = !controllable;
 
   /*
    * 数字读数行已于 2026-10-13 移除 —— 曲线已呈现这些量的走势,
@@ -228,6 +452,17 @@ function renderChannel(i) {
   enableBtn.textContent = t && t.enabled ? '停机' : '使能';
 
   /*
+   * 曲线空态占位(2026-10-16 视觉重构)。
+   *
+   * @attention 只切换占位层的 hidden,**绝不隐藏 canvas** ——
+   *   隐藏会让 canvas 塌成 0 高度,chart.js 之后读到 0 尺寸就再也画不出曲线
+   *   (与下方"懒创建实例"同一个坑的两面)。
+   *   有遥测即隐藏占位,断开/解绑(t=null)时回到空态。
+   */
+  const emptyEl = r('chartEmpty');
+  if (emptyEl) emptyEl.hidden = !!t;
+
+  /*
    * 把本次遥测喂给曲线(2026-10-12 新增)。
    *
    * 为什么在 renderChannel 里 push 而不是单独开定时器:
@@ -238,10 +473,12 @@ function renderChannel(i) {
    *   是因为 renderChannel 还会在解绑、断连时以 t=null 被调用,
    *   此时不喂点、只重绘,曲线会自然停住而不是被 0 值拉一条直线到底。
    */
-  if (t) {
+  if (t && boardOnline) {
     const canvas = el.querySelector('[data-role="chart"]');
     if (canvas) {
       const c = ensureChart(i, canvas);
+      c.setUnits(speedUnit, feedbackUnit);
+      canvas.title = `最近遥测：转速 ${fmt(t.speed, 3)} ${speedUnit}；${feedbackLabel} ${fmt(t.torque, 3)} ${feedbackUnit}（曲线按当前滤波设置显示）`;
       /*
        * 把界面上的滤波设置同步到实例。
        *
@@ -389,19 +626,15 @@ function fillMotorOptions() {
      * 用 (kind, canBus, motorId) 三元组而非下标记忆:
      * 下标会随电机增删而漂移,不可靠。
      */
-    let prevKey = null;
-    const prevIdx = Number(sel.value);
-    if (sel.value !== '' && Number.isInteger(prevIdx) && inventory[prevIdx]) {
-      const p = inventory[prevIdx];
-      prevKey = `${p.kind}:${p.canBus}:${p.motorId}`;
-    }
+    const prevKey = sel.selectedOptions[0]?.dataset.motorKey ?? null;
 
     sel.innerHTML = '<option value="">选择电机…</option>';
     let restoredIdx = '';
     inventory.forEach((m, idx) => {
-      const label = `${m.label} · CAN${m.canBus}·ID${m.motorId}`;
+      const label = `${m.label} · CAN${m.canBus}·ID${formatMotorId(m)}`;
       const opt = document.createElement('option');
       opt.value = String(idx);
+      opt.dataset.motorKey = `${m.kind}:${m.canBus}:${m.motorId}`;
       opt.textContent = label;
       sel.appendChild(opt);
       if (prevKey && `${m.kind}:${m.canBus}:${m.motorId}` === prevKey) {
@@ -411,9 +644,18 @@ function fillMotorOptions() {
 
     /* 电机仍在清单里才恢复选中;被删了才回到未选择 */
     sel.value = restoredIdx;
+    if (prevKey && restoredIdx === '') {
+      sessionChannels.delete(i);
+      pendingUnbindChannels.delete(i);
+      telemetryByChannel.delete(i);
+      getChartIfExists(i)?.clear();
+      el.querySelector('[data-role="num"]').value = '0';
+      el.querySelector('[data-role="slider"]').value = '0';
+      renderChannel(i);
+    }
 
     sel.onchange = () => {
-      const m = inventory[Number(sel.value)];
+      const m = sel.value === '' ? null : inventory[Number(sel.value)];
       const spec = m ? MOTOR_SPEC[m.label] : null;
       // 注意:这里复用外层的 el,不要用 const el 重新声明 ——
       // 那会遮蔽外层变量,虽然当前逻辑上取值相同,但极易在后续改动中出错。
@@ -422,6 +664,7 @@ function fillMotorOptions() {
         el.querySelector('[data-role="slider"]').min = String(-spec.range);
         el.querySelector('[data-role="slider"]').max = String(spec.range);
       }
+      renderChannel(i);
     };
   }
 }
@@ -434,7 +677,9 @@ function fillMotorOptions() {
 function currentChannelKind(i) {
   const el = ch(i);
   if (!el) return 0;
-  const idx = Number(el.querySelector('[data-role="motor"]').value);
+  const selection = el.querySelector('[data-role="motor"]').value;
+  if (selection === '') return 0;
+  const idx = Number(selection);
   const m = inventory[idx];
   return m ? m.kind : 0;
 }
@@ -480,7 +725,7 @@ function initPidPanel(i) {
   const el = ch(i);
   if (!el) return;
 
-  const kind = currentChannelKind(i);
+  const kind = canControlChannel(i) ? currentChannelKind(i) : 0;
   const panel = el.querySelector('[data-role="pidPanel"]');
   const msg = el.querySelector('[data-role="pidMsg"]');
 
@@ -499,7 +744,7 @@ function initPidPanel(i) {
     /* 绑定后:填入该型号默认值,并清掉"先绑定"提示。
        improve 不从页面暴露(属于协议细节),沿用默认表里的值。 */
     fillPidForm(i, el.querySelector('[data-role="pidLoop"]').value, kind);
-    if (msg && !msg.textContent.trim()) msg.textContent = '';
+    if (msg && msg.textContent === '先绑定电机后可用') msg.textContent = '';
   } else {
     if (msg) {
       msg.className = 'hint';
@@ -520,16 +765,34 @@ function bindEvents() {
   };
   $('#closePort').onclick = () => send({ type: 'closeSerial' });
   $('#rescan').onclick = () => {
-    inventory.length = 0; // 清掉旧清单,强制重新拉取
-    startInventoryFetch();
+    if (!channelsReady) resetTestChannels();
+    send({ type: 'scanMotors' });
+  };
+
+  $('#openAddMotor').onclick = () => setAddFormOpen($('#addForm').hidden);
+  $('#cancelAddMotor').onclick = () => setAddFormOpen(false);
+  $('#addForm').onkeydown = (event) => {
+    if (event.key === 'Escape') setAddFormOpen(false);
+    if (event.key === 'Enter' && event.target.tagName === 'INPUT') {
+      event.preventDefault();
+      $('#addMotor').click();
+    }
   };
   $('#addMotor').onclick = () => {
     const kind = Number($('#addKind').value);
     const canBus = Number($('#addBus').value);
-    const motorId = Number($('#addId').value);
+    if (pendingMotor) return;
+    const id = readMotorIdInput();
+    if (!id.ok) {
+      showAddMsg(id.msg, true);
+      return;
+    }
+    const motorId = id.value;
 
-    if (!Number.isInteger(motorId) || motorId < MOTOR_ID_MIN || motorId > MOTOR_ID_MAX) {
-      showAddMsg(`ID 需填 ${MOTOR_ID_MIN}~${MOTOR_ID_MAX} 的整数(对应电调拨码开关)`, true);
+    /* DM 的反馈 ID 单独校验(2026-10-17 新增,达妙需要 tx/rx 两个 ID) */
+    const rx = readRxIdInput();
+    if (!rx.ok) {
+      showAddMsg(rx.msg, true);
       return;
     }
 
@@ -552,24 +815,7 @@ function bindEvents() {
     }
 
     showAddMsg('正在添加…', false);
-    addPendingLabel = '添加电机';
-    send({ type: 'addMotor', kind, canBus, motorId });
-
-    /*
-     * 超时兜底:若板子没回应答帧,不能一直卡在"正在添加…"。
-     * 早期版本没这个兜底,一旦板端因任何原因(门闩拒绝、解析失败、
-     * 固件版本旧)不回 0x8A,界面就永久停在"正在添加…",
-     * 让人完全无从判断是板子没收到还是收到了没回。
-     */
-    if (addPendingTimer) clearTimeout(addPendingTimer);
-    addPendingTimer = setTimeout(() => {
-      showAddMsg(
-        `${addPendingLabel} 3 秒内没有收到板子应答。` +
-          '可能原因:固件版本较旧不支持动态添加 / USB 帧未送达。' +
-          '请查看 RTT 是否有 [add] 日志。',
-        true,
-      );
-    }, 3000);
+    sendMotorEdit({ type: 'addMotor', kind, canBus, motorId, rxId: rx.value });
   };
   /*
    * 急停:**单击立即下发,不得有二次确认**(2026-10-14 用户要求)。
@@ -603,11 +849,21 @@ function bindEvents() {
    *
    * @note 同时监听 input 与 change:数字框键盘输入触发 input,
    *   上下箭头/失焦提交在某些浏览器只触发 change。
+   *
+   * @note #addRxId 也在列表里(2026-10-17):达妙的反馈 ID 改一个字
+   *   都要重新校验一遍,免得用户填了个越界值还不知道。
    */
-  for (const id of ['#addKind', '#addBus', '#addId']) {
+  for (const id of ['#addKind', '#addBus', '#addId', '#addRxId']) {
     $(id).oninput = refreshAddHint;
     $(id).onchange = refreshAddHint;
   }
+
+  /* 型号一变,rx_id 输入框的可见性就要跟着变(只有达妙需要它) */
+  $('#addKind').onchange = () => {
+    syncRxIdVisibility();
+    refreshAddHint();
+  };
+  syncRxIdVisibility();
 
   // 页面关闭前尽量通知服务端全停(beforeunload + sendBeacon 兜底)
   window.addEventListener('beforeunload', () => send({ type: 'stopAll' }));
@@ -617,9 +873,15 @@ function bindEvents() {
     const r = (role) => el.querySelector(`[data-role="${role}"]`);
 
     r('bind').onclick = () => {
+      if (!channelsReady) return;
+      if (r('motor').value === '') return alert('请先选择电机');
       const idx = Number(r('motor').value);
       const m = inventory[idx];
       if (!m) return alert('请先选择电机');
+      if ([...sessionChannels].some((id) => id !== i &&
+        ch(id)?.querySelector('[data-role="motor"]').selectedOptions[0]?.dataset.motorKey === `${m.kind}:${m.canBus}:${m.motorId}`)) {
+        return alert('这颗电机已绑定其他通道，请先解绑');
+      }
 
       /*
        * 从鱼骨图读取闭环掩码。
@@ -631,6 +893,7 @@ function bindEvents() {
        *    约束不再由节点位置保证 —— 见 fishbone.js 的 _toggle 注释。)
        */
       const mask = readLoopMask(i);
+      sessionChannels.add(i);
       send({
         type: 'bind',
         channelId: i,
@@ -670,7 +933,9 @@ function bindEvents() {
      *   3. 收到 unbindAck 后才刷新界面 —— 不再"先斩后奏"
      */
     r('unbind').onclick = () => {
+      if (pendingUnbindChannels.has(i)) return;
       if (!confirm('解绑后该通道将不再控制任何电机,需重新绑定。确认继续?')) return;
+      pendingUnbindChannels.add(i);
       /* 先停机:安全动作不依赖解绑帧是否被接受 */
       send({ type: 'enable', channelId: i, enable: false });
       send({ type: 'unbind', channelId: i });
@@ -690,12 +955,13 @@ function bindEvents() {
     };
 
     r('enable').onclick = () => {
+      if (!canControlChannel(i)) return;
       const t = telemetryByChannel.get(i);
       const enable = !(t && t.enabled);
       if (enable && Number(num.value) !== 0) {
         if (!confirm('该通道当前设定值不为 0,使能后电机会立即转动。确认继续?')) return;
       }
-      send({ type: 'enable', channelId: i, enable });
+      send({ type: 'enable', channelId: i, enable, ref: Number(num.value) });
     };
 
     r('zero').onclick = () => {
@@ -800,6 +1066,16 @@ ws.onopen = () => {
 };
 
 ws.onclose = () => {
+  serverSupportsReset = false;
+  serialConnected = false;
+  serialPath = null;
+  clearTimeout(channelResetTimer);
+  channelResetPending = null;
+  clearInterval(inventoryTimer);
+  inventoryTimer = null;
+  clearTestChannels();
+  boardOnline = false;
+  boardLastSeen = null;
   setLink(false, '服务已断开');
 };
 
@@ -859,6 +1135,15 @@ ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
 
   switch (msg.type) {
+    case 'hello': {
+      serverSupportsReset = msg.capabilities?.includes('resetChannels') === true;
+      if (!serverSupportsReset) {
+        channelResetError = '后台版本过旧 · 请重启上位机服务';
+        showRegistryMsg(channelResetError, true);
+        setLink(false, channelResetError);
+      }
+      break;
+    }
     case 'ports': {
       const sel = $('#portSelect');
       sel.innerHTML = '';
@@ -876,13 +1161,29 @@ ws.onmessage = (ev) => {
     }
 
     case 'serial': {
+      const sameConnection = serialConnected && msg.open && serialPath === msg.path;
+      serialConnected = !!msg.open;
+      serialPath = msg.open ? msg.path : null;
+      if (sameConnection) break;
+      clearTimeout(channelResetTimer);
+      channelResetPending = null;
+      boardOnline = false;
+      boardLastSeen = null;
       setLink(msg.open, msg.open ? `串口 ${msg.path ?? ''}` : '串口已关闭');
-      if (msg.open) startInventoryFetch();
+      if (msg.open) {
+        resetTestChannels();
+        startInventoryFetch();
+      } else {
+        clearInterval(inventoryTimer);
+        inventoryTimer = null;
+        clearTestChannels();
+      }
       break;
     }
 
     case 'heartbeat': {
       const d = msg.data;
+      noteBoardResponse();
       setLink(true, 'A 板在线');
       $('#fwText').textContent = `固件 ${d.fwVersion} · ${Math.round(d.uptimeS / 60)} 分钟`;
       // 收到心跳说明板子已在跑,若清单还没拿到就再要一次(见 startInventoryFetch 注释)
@@ -891,6 +1192,7 @@ ws.onmessage = (ev) => {
     }
 
     case 'inventory': {
+      noteBoardResponse();
       // 板端登记的电机清单:界面只能从中选择,不会虚报不存在的电机
       inventory = msg.data.items.map((m) => ({
         ...m,
@@ -921,6 +1223,9 @@ ws.onmessage = (ev) => {
        */
       fillMotorOptions();
 
+      /* 登记列表以板端清单为准,增删成功后自动刷新。 */
+      renderMotorList();
+
       /*
        * 拿到清单后初始化各通道的 PID 面板。
        * @attention 必须在 fillMotorOptions() 之后 —— 该函数才把
@@ -950,38 +1255,55 @@ ws.onmessage = (ev) => {
     }
 
     case 'motorAck': {
-      /*
-       * 板端对"添加/移除电机"的应答。
-       * 失败时必须显示**具体原因**(如 ID 冲突/滤波器耗尽),
-       * 否则用户只会看到"没反应",无从下手。
-       * detail = 该 CAN 总线剩余的过滤器个数,用于提示还能再接几颗。
-       */
       const d = msg.data;
+      if (!pendingMotor || d.kind !== pendingMotor.kind || d.canBus !== pendingMotor.canBus || d.motorId !== pendingMotor.motorId) break;
+      const adding = pendingMotor.type === 'addMotor';
+      pendingMotor = null;
+      clearTimeout(addPendingTimer);
+      addPendingTimer = null;
       const ok = d.result === MBResult.OK;
-
-      // 应答到了,清掉"正在添加…"的计时器
-      if (addPendingTimer) {
-        clearTimeout(addPendingTimer);
-        addPendingTimer = null;
+      const text = ok
+        ? `已${adding ? '添加' : '删除'} ${MotorKindLabel[d.kind]} · CAN${d.canBus} · ID ${formatMotorId(d)}`
+        : MBResultText[d.result] ?? `失败(错误码 ${d.result})`;
+      showRegistryMsg(text, !ok);
+      if (adding) {
+        showAddMsg(text, !ok);
+        if (ok) setAddFormOpen(false);
       }
-
-      const name = MotorKindLabel[d.kind] ?? `类型${d.kind}`;
-      if (ok) {
-        showAddMsg(
-          `已添加 ${name}(CAN${d.canBus} ID${d.motorId})` +
-            (typeof d.detail === 'number' ? `,该总线还剩 ${d.detail} 个位置` : ''),
-          false,
-        );
-        $('#addId').value = Number($('#addId').value) + 1; // 顺手加一,方便连续添加
-      } else {
-        showAddMsg(MBResultText[d.result] ?? `失败(错误码 ${d.result})`, true);
-      }
-      inventory.length = 0;
-      startInventoryFetch(); // 无论成败都重新拉一次清单
+      renderMotorList();
+      send({ type: 'scanMotors' });
       break;
     }
 
     case 'unbindAck': {
+      if (channelResetPending) {
+        const d = msg.data;
+        // Ignore duplicate replies from a retry and replies for other channels.
+        if (d.channelId !== channelResetPending.values().next().value) break;
+        if (d.result !== MBResult.OK && d.result !== MBResult.BAD_PARAM) {
+          clearTimeout(channelResetTimer);
+          channelResetPending = null;
+          channelResetError = '旧通道清理失败 · 点击同步清单重试';
+          showRegistryMsg(channelResetError, true);
+          setLink(false, channelResetError);
+          break;
+        }
+        clearTimeout(channelResetTimer);
+        channelResetPending.delete(d.channelId);
+        channelResetAttempts = 0;
+        if (!channelResetPending.size) {
+          clearTimeout(channelResetTimer);
+          channelResetPending = null;
+          channelResetTimer = null;
+          channelResetError = '';
+          showRegistryMsg('');
+          channelsReady = true;
+          noteBoardResponse();
+          for (let i = 0; i < CHANNEL_COUNT; i++) renderChannel(i);
+          setLink(true, 'A 板在线 · 请重新绑定电机');
+        } else sendResetChannel();
+        break;
+      }
       /*
        * 固件确认解绑完成 —— 这时才清界面状态。
        *
@@ -991,8 +1313,13 @@ ws.onmessage = (ev) => {
        *   改成等应答再清,失败时把真实原因显示出来。
        */
       const d = msg.data;
+      // Reset retries can produce late duplicate ACKs. Only a deliberate
+      // unbind in this page may clear a channel after reset has finished.
+      if (!pendingUnbindChannels.delete(d.channelId)) break;
       if (d.result === MBResult.OK) {
+        sessionChannels.delete(d.channelId);
         telemetryByChannel.delete(d.channelId);
+        getChartIfExists(d.channelId)?.clear();
         const el = ch(d.channelId);
         if (el) {
           /* 下拉回到"选择电机…",滑块归零 —— 此时清状态才是安全的 */
@@ -1011,10 +1338,16 @@ ws.onmessage = (ev) => {
     }
 
     case 'telemetry': {
+      noteBoardResponse();
+      setLink(true, 'A 板在线');
       for (const it of msg.data.items) {
+        if (!channelsReady || !sessionChannels.has(it.channelId)) continue;
+        const first = !telemetryByChannel.has(it.channelId);
         telemetryByChannel.set(it.channelId, it);
+        if (first) initPidPanel(it.channelId);
+        renderChannel(it.channelId);
       }
-      for (let i = 0; i < CHANNEL_COUNT; i++) renderChannel(i);
+      updateWorkspaceStatus();
       break;
     }
 
@@ -1064,6 +1397,15 @@ ws.onmessage = (ev) => {
     }
 
     case 'error': {
+      if (channelResetPending) {
+        clearTimeout(channelResetTimer);
+        channelResetPending = null;
+        channelResetTimer = null;
+        channelResetError = `通道清理失败: ${msg.message}`;
+        showRegistryMsg(channelResetError, true);
+        setLink(false, channelResetError);
+        break;
+      }
       setLink(false, '出错');
       alert(msg.message);
       break;
@@ -1075,8 +1417,21 @@ ws.onmessage = (ev) => {
 };
 
 function setLink(ok, text) {
+  if (text === 'A 板在线' && serialConnected && !channelsReady) {
+    ok = !!channelResetPending;
+    text = channelResetPending ? '正在清理旧测试通道…' : channelResetError || '通道未就绪 · 点击同步清单重试';
+  }
+  document.body.dataset.link = ok ? 'online' : 'offline';
   $('#linkDot').classList.toggle('online', ok);
   $('#linkText').textContent = text;
+  updateWorkspaceStatus();
+}
+
+function updateWorkspaceStatus() {
+  $('#motorCount').textContent = String(inventory.length).padStart(2, '0');
+  const active = [...telemetryByChannel.values()].filter((t) => t.online && t.enabled).length;
+  $('#activeCount').textContent = boardOnline && document.body.dataset.link === 'online'
+    ? String(active).padStart(2, '0') : '--';
 }
 
 /**
@@ -1091,3 +1446,15 @@ function setLink(ok, text) {
  * 尤其是 setRef 之类的帧会被重复下发。
  */
 buildChannels();
+
+renderMotorList();
+
+for (const link of document.querySelectorAll('.rail-link')) {
+  link.addEventListener('click', () => {
+    for (const item of document.querySelectorAll('.rail-link')) {
+      item.classList.toggle('rail-current', item === link);
+      if (item === link) item.setAttribute('aria-current', 'location');
+      else item.removeAttribute('aria-current');
+    }
+  });
+}

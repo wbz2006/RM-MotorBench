@@ -34,7 +34,9 @@ void BSPLogInit();
 /* 无颜色日志输出 */
 #define LOG(format,...) LOG_PROTO("","",format,##__VA_ARGS__)
 
-/* 有颜色格式日志输出,建议使用这些宏来输出日志 */
+/* 有颜色格式日志输出,建议使用这些宏来输出日志。
+ * SEGGER_RTT_printf 不支持浮点格式(%f/%e/%g)。浮点参数未被消费时,
+ * LOG_PROTO 末尾的颜色 %s 会读错地址,触发 HardFault。 */
 // information level
 #define LOGINFO(format,...) LOG_PROTO("I", RTT_CTRL_TEXT_BRIGHT_GREEN , format, ##__VA_ARGS__)
 // warning level

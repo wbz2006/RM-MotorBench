@@ -98,6 +98,8 @@ export class MotorChart {
     this.window = 120; // 实际显示的点数
     this._raf = null;
     this._dpr = 1;
+    this.speedUnit = 'rpm';
+    this.torqueUnit = 'raw';
 
     /*
      * 滤波状态。ref(设定值)不过滤 —— 它是我们自己的指令,
@@ -140,6 +142,13 @@ export class MotorChart {
 
   setWindow(n) {
     this.window = Math.max(10, Math.min(CHART_MAX_POINTS, Number(n) || 120));
+    this.draw();
+  }
+
+  setUnits(speedUnit, torqueUnit) {
+    if (this.speedUnit === speedUnit && this.torqueUnit === torqueUnit) return;
+    this.speedUnit = speedUnit;
+    this.torqueUnit = torqueUnit;
     this.draw();
   }
 
@@ -247,10 +256,15 @@ export class MotorChart {
     const sMax = Math.max(...speedVals, ...refVals, 0);
     const tAbs = Math.max(1, ...torqueVals.map(Math.abs));
 
-    /* 上下各留 10% 余量,曲线贴边不好看 */
-    const sSpan = (sMax - sMin) || 100;
-    const sLo = sMin - sSpan * 0.1;
-    const sHi = sMax + sSpan * 0.1;
+    /* 保留真实反馈,但避免将零速量化噪声放大至整幅图。 */
+    const sSpan = Math.max(sMax - sMin, this.speedUnit === 'rad/s' ? 1 : 10);
+    const sCenter = (sMin + sMax) / 2;
+    const sLo = sCenter - sSpan * 0.6;
+    const sHi = sCenter + sSpan * 0.6;
+    const tickText = (value, step) => {
+      const digits = Math.max(0, Math.min(4, Math.ceil(-Math.log10(step)) + 1));
+      return String(Number(value.toFixed(digits)));
+    };
 
     const yOfSpeed = (v) => padT + plotH - ((v - sLo) / (sHi - sLo)) * plotH;
     const yOfTorque = (v) => padT + plotH / 2 - (v / tAbs) * (plotH / 2);
@@ -268,13 +282,13 @@ export class MotorChart {
       ctx.lineTo(padL + plotW, y);
       ctx.stroke();
 
-      /* 左轴:转速;右轴:电流 */
+      /* 左轴:转速;右轴:电流原始值或转矩,由电机型号决定。 */
       const sv = sHi - ((sHi - sLo) * g) / 4;
       const tv = tAbs - (tAbs * 2 * g) / 4;
       ctx.textAlign = 'right';
-      ctx.fillText(Math.round(sv).toString(), padL - 5, y + 3);
+      ctx.fillText(tickText(sv, (sHi - sLo) / 4), padL - 5, y + 3);
       ctx.textAlign = 'left';
-      ctx.fillText(tv.toFixed(0), padL + plotW + 5, y + 3);
+      ctx.fillText(tickText(tv, tAbs / 2), padL + plotW + 5, y + 3);
     }
 
     /* 零线:转速为 0 时加粗,便于判断正反转 */
@@ -312,10 +326,10 @@ export class MotorChart {
     ctx.fillStyle = this.colors.speed;
     ctx.textAlign = 'left';
     ctx.font = '10px system-ui, sans-serif';
-    ctx.fillText('rpm', 2, padT + 8);
+    ctx.fillText(this.speedUnit, 2, padT + 8);
     ctx.fillStyle = this.colors.torque;
     ctx.textAlign = 'right';
-    ctx.fillText('A', W - 2, padT + 8);
+    ctx.fillText(this.torqueUnit, W - 2, padT + 8);
   }
 
   /**

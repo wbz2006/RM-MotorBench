@@ -4,6 +4,7 @@
 #include "bsp_can.h"
 #include "controller.h"
 #include "motor_def.h"
+#include "daemon.h"
 
 #define DM_MOTOR_CNT 4
 
@@ -50,6 +51,7 @@ typedef struct
     float pid_ref;
     Motor_Working_Type_e stop_flag;
     CANInstance *motor_can_instace;
+    DaemonInstance *daemon;
     uint32_t lost_cnt;
 }DMMotorInstance;
 

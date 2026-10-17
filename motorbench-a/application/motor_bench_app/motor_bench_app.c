@@ -221,26 +221,46 @@ static void BenchBuildDJIConfig(Motor_Init_Config_s *ref, Motor_Type_e type, CAN
 
 /**
  * @brief 生成达妙 DM 电机的初始化配置
+ *
+ * @param rx_id 反馈 ID(接收用)。DM 走 MIT 协议,发送与接收是**两个独立 ID**:
+ *              主机 → 电机 用 tx_id,电机 → 主机 回传感测 用 rx_id,
+ *              主机的 CAN 过滤器按 rx_id 匹配,配错就永远收不到反馈。
+ *
  * @note DM 驱动的速度单位是 rad/s(DM_V_MIN/MAX = ±45),
- *       上位机若要给 rpm,需要在协议层做单位换算,见 motor_bench_app.md
+ *       上位机若要给 rpm,需要在协议层做单位换算
  */
-static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus, uint8_t tx_id)
+static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus, uint8_t tx_id, uint16_t rx_id)
 {
     ref->motor_type = MOTOR_TYPE_NONE; /* DM 不使用该字段 */
     ref->can_init_config.can_handle = bus;
     ref->can_init_config.tx_id = tx_id;
+    /*
+     * @attention 2026-10-17 之前这里**没有设置 rx_id** ——
+     *   结构体虽被 memset 清零,于是 rx_id 恒为 0。
+     *   后果一:CANRegister() 的过滤器按 rx_id=0 匹配,挂多颗 DM 时
+     *           第二颗会因"rx_id 0x00 already used"直接注册失败,
+     *           而 MotorBenchAddMotor 只把它转成 NO_RESOURCE,
+     *           上位机看到的提示是"滤波器已用完",完全指错方向。
+     *   后果二:即使只挂一颗,只要电机的实际反馈 ID 不是 0,
+     *           过滤器也收不到任何反馈,遥测永远是 --。
+     *   现在由上位机显式指定,两个 ID 都可配。
+     */
+    ref->can_init_config.rx_id = rx_id;
 
     ref->controller_setting_init_config.outer_loop_type = SPEED_LOOP;
     ref->controller_setting_init_config.close_loop_type = SPEED_LOOP;
     ref->controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
     ref->controller_setting_init_config.speed_feedback_source = MOTOR_FEED;
 
-    ref->controller_param_init_config.speed_PID.Kp = 5.0f;
+    /* MIT speed-loop output is N*m, not DJI current units. The old Kp=5
+     * and 10 N*m limit cause alternating torque on a bare DM4310 at 500 Hz.
+     * Use a gentle commissioning baseline; tune further for the actual load. */
+    ref->controller_param_init_config.speed_PID.Kp = 0.05f;
     ref->controller_param_init_config.speed_PID.Ki = 0.0f;
     ref->controller_param_init_config.speed_PID.Kd = 0.0f;
-    ref->controller_param_init_config.speed_PID.MaxOut = 10.0f; /* 对应 DM_T_MAX=18 留余量 */
+    ref->controller_param_init_config.speed_PID.MaxOut = 0.5f; /* N*m, initial bench limit */
     ref->controller_param_init_config.speed_PID.Improve = PID_Integral_Limit;
-    ref->controller_param_init_config.speed_PID.IntegralLimit = 8.0f;
+    ref->controller_param_init_config.speed_PID.IntegralLimit = 0.0f;
 
     /*
      * @attention 死区必须显式写 0,与 BenchApplyPid 的理由相同:
@@ -265,10 +285,12 @@ static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus,
  * ============================================================ */
 
 /**
- * @brief 按 (kind, bus, id) 创建一台电机
+ * @brief 按 (kind, bus, motor_id, rx_id) 创建一台电机
+ *
+ * @param rx_id 反馈 ID(接收用)。仅 DM 系使用;DJI 系传 0,驱动内部按规则计算
  * @return MB_OK 成功;MB_ERR_UNSUPPORTED 种类未接入;其它为失败
  */
-static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, void **out_instance)
+static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, uint16_t rx_id, void **out_instance)
 {
     /*
      * @attention 【2026-10-13 修复】必须显式清零。
@@ -317,7 +339,14 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
 
     case MB_MOTOR_DM:
     {
-        BenchBuildDMConfig(&cfg, bus, motor_id);
+        /*
+         * DM:两个 ID 都由上位机给 ——
+         *   motor_id → tx_id(主机发给电机的控制指令 ID)
+         *   rx_id    → 反馈 ID(电机回传的传感数据,过滤器按它匹配)
+         * 2026-10-17 之前 rx_id 从未被设置(恒 0),导致多颗 DM 无法共存、
+         * 单颗也可能收不到反馈。现在由协议显式传入。
+         */
+        BenchBuildDMConfig(&cfg, bus, motor_id, rx_id);
         DMMotorInstance *m = DMMotorInit(&cfg);
         if (!m)
             return MB_ERR_NO_RESOURCE;

@@ -307,13 +307,23 @@ void DJIMotorChangeFeed(DJIMotorInstance *motor, Closeloop_Type_e loop, Feedback
         LOGERROR("[dji_motor] loop type error, check memory access and func param"); // 检查是否传入了正确的LOOP类型,或发生了指针越界
 }
 
+static void DJIMotorResetController(DJIMotorInstance *motor)
+{
+    PIDReset(&motor->motor_controller.angle_PID);
+    PIDReset(&motor->motor_controller.speed_PID);
+    PIDReset(&motor->motor_controller.current_PID);
+}
+
 void DJIMotorStop(DJIMotorInstance *motor)
 {
     motor->stop_flag = MOTOR_STOP;
+    DJIMotorResetController(motor);
 }
 
 void DJIMotorEnable(DJIMotorInstance *motor)
 {
+    if (motor->stop_flag == MOTOR_STOP)
+        DJIMotorResetController(motor);
     motor->stop_flag = MOTOR_ENALBED;
 }
 
@@ -480,6 +490,13 @@ void DJIMotorControl()
     for (size_t i = 0; i < idx; ++i)
     { // 减小访存开销,先保存指针引用
         motor = dji_motor_instance[i];
+        group = motor->sender_group;
+        num = motor->message_num;
+        if (motor->stop_flag == MOTOR_STOP)
+        {
+            memset(sender_assignment[group].tx_buff + 2 * num, 0, sizeof(uint16_t));
+            continue; /* No PID integration or history updates while stopped. */
+        }
         motor_setting = &motor->motor_settings;
         motor_controller = &motor->motor_controller;
         measure = &motor->measure;

@@ -3,77 +3,93 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <title>电机测试台 · Motor Bench</title>
+    <meta name="theme-color" content="#101211" />
+    <title>MOTORBENCH / 电机测试台</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <header class="topbar">
+    <a class="skip-link" href="#channels">跳转到电机通道</a>
+    <aside class="rail" aria-label="工作区导航">
+      <a class="rail-logo" href="#top" aria-label="Motorbench 首页">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 17V7l5 6 4-8 4 8 5-6v10" /></svg>
+      </a>
+      <a class="rail-link" href="#setup" aria-label="设备接入" title="设备接入">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 3v5m8-5v5M6 8h12v4a6 6 0 0 1-12 0V8Zm6 10v4" /></svg>
+        <span>接入</span>
+      </a>
+      <a class="rail-link rail-current" href="#channels" aria-current="location" aria-label="通道控制" title="通道控制">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M2 12h4l3-7 6 14 3-7h4" /></svg>
+        <span>控制</span>
+      </a>
+      <span class="rail-foot" aria-hidden="true">RM / LAB</span>
+    </aside>
+    <header class="topbar" id="top">
       <div class="brand">
-        <span class="dot" id="linkDot"></span>
-        <h1>电机测试台</h1>
+        <span class="brand-word">MOTOR<span>BENCH</span><span class="brand-cursor" aria-hidden="true">_</span></span>
+        <span class="hardware-tag">A-TYPE <span>/</span> USB</span>
       </div>
       <div class="link-state">
-        <span id="linkText">未连接</span>
+        <span class="link-label"><span class="dot" id="linkDot"></span><span id="linkText">未连接</span></span>
         <span class="fw" id="fwText"></span>
       </div>
-      <button id="estop" class="estop" title="立即停止全部电机">急停 ALL STOP</button>
+      <button id="estop" class="estop" title="立即停止全部电机"><span class="stop-square" aria-hidden="true"></span>急停 <span>ALL STOP</span></button>
     </header>
 
-    <!--
-      串口连接与添加电机**合到同一行**(2026-10-14 用户要求)。
+    <div class="workspace">
+      <section class="workspace-head" aria-labelledby="workspaceTitle">
+        <div>
+          <p class="eyebrow"><span aria-hidden="true">//</span> MOTOR CONTROL WORKSPACE</p>
+          <h1 id="workspaceTitle">电机测试台<span class="title-mark" aria-hidden="true">.</span></h1>
+          <p class="workspace-desc">连接硬件，整定控制，观察每一次响应。</p>
+        </div>
+        <div class="workspace-stats" aria-label="工作区状态">
+          <div><span>已登记电机 <small>REGISTERED</small></span><strong id="motorCount">00</strong></div>
+          <div><span>运行中 <small>ACTIVE</small></span><strong id="activeCount">--</strong></div>
+        </div>
+      </section>
 
-      原先两块各占一条整宽横条(各带一条 border-bottom)、上下叠着,但它们其实
-      只服务于同一件事:把一颗电机接上并让板子认它 ——
-      "连上板子" → "告诉板子挂了什么电机"。所以并成一行,中间用一条竖线分隔:
-      左半是连接,右半是登记。
+      <div class="section-heading"><h2><span>01</span> 设备接入</h2><span>DEVICE SETUP</span></div>
 
-      添加电机是**运行期热插拔**入口:板端启动后清单为空,
-      需在此按"实际电调拨码 ID"现场添加 —— 这是"换电机不用重烧固件"的入口。
-
-      @attention 控件 id 一个都不能改(#portSelect / #refreshPorts / #openPort /
-        #closePort / #rescan / #addKind / #addBus / #addId / #addMotor / #addMsg),
-        ui.js 直接按 id 取元素;这里只改布局,不改接线。
-    -->
-    <section class="panel setup">
-      <div class="setup-group">
-        <label>
-          串口
-          <select id="portSelect">
-            <option value="">点击刷新…</option>
-          </select>
+    <section class="panel setup" id="setup" aria-label="设备接入与电机管理">
+      <div class="setup-group" role="group" aria-label="连接 A 板">
+        <div class="group-heading"><span class="group-marker" aria-hidden="true">↳</span><strong>连接控制板</strong><span>SERIAL LINK</span></div>
+        <label>串口
+          <select id="portSelect" title="选择 A 板的 USB 虚拟串口"><option value="">点击刷新…</option></select>
         </label>
-        <button id="refreshPorts">刷新</button>
-        <button id="openPort">打开</button>
-        <button id="closePort" class="ghost">关闭</button>
-        <button id="rescan" class="ghost">重新获取电机清单</button>
+        <button id="refreshPorts" title="重新扫描本机串口">刷新</button>
+        <button id="openPort" class="primary" title="打开所选串口">连接</button>
+        <button id="closePort" class="ghost" title="关闭串口">关闭</button>
+        <button id="rescan" class="ghost" title="从板端同步电机列表">同步清单</button>
       </div>
-
       <span class="setup-sep" aria-hidden="true"></span>
-
-      <div class="setup-group">
-        <span class="panel-title">添加电机</span>
-        <label>
-          型号
-          <select id="addKind">
-            <option value="1">大疆 GM6020</option>
-            <option value="2">大疆 M3508</option>
-            <option value="3">大疆 M2006</option>
-            <option value="4">达妙 DM 系列</option>
-          </select>
-        </label>
-        <label>
-          总线
-          <select id="addBus">
-            <option value="1">CAN1</option>
-            <option value="2">CAN2</option>
-          </select>
-        </label>
-        <label>
-          电调 ID
-          <input id="addId" type="number" min="1" max="8" value="1" />
-        </label>
-        <button id="addMotor">添加</button>
-        <span id="addMsg" class="hint"></span>
+      <div class="motor-registry" role="region" aria-labelledby="registryTitle">
+        <div class="registry-heading">
+          <div><span class="group-marker" aria-hidden="true">≡</span><h3 id="registryTitle">电机列表</h3><span class="registry-count" id="registryCount">00</span></div>
+          <button id="openAddMotor" class="registry-add" aria-label="添加电机" aria-controls="addForm" aria-expanded="false" title="添加电机">＋</button>
+        </div>
+        <div class="registry-empty" id="motorListEmpty"><span aria-hidden="true">[ — ]</span><strong>尚未登记电机</strong><span>点击右上角 ＋ 添加电机</span></div>
+        <ul id="motorList" class="motor-list" aria-label="已登记电机"></ul>
+        <span id="registryMsg" class="hint" role="status" aria-live="polite"></span>
+        <div id="addForm" class="registry-form" role="group" aria-label="添加电机" hidden>
+          <div class="registry-form-heading"><strong>添加电机</strong><span>NEW MOTOR</span></div>
+          <label>型号
+            <select id="addKind" title="电机型号">
+              <option value="1">大疆 GM6020</option><option value="2">大疆 M3508</option>
+              <option value="3">大疆 M2006</option><option value="4">DM4310</option>
+            </select>
+          </label>
+          <label>总线
+            <select id="addBus" title="电机所在 CAN 总线"><option value="1">CAN1</option><option value="2">CAN2</option></select>
+          </label>
+          <label><span id="addIdLabel">电调 ID</span>
+            <span class="id-input"><span id="addIdPrefix" class="id-prefix" hidden>0x</span><input id="addId" type="text" inputmode="numeric" value="1" autocomplete="off" spellcheck="false" aria-label="电调 ID" /></span>
+          </label>
+          <label id="addRxIdWrap" hidden>反馈 ID / RX
+            <span class="id-input"><span class="id-prefix">0x</span><input id="addRxId" type="text" value="" placeholder="302" autocomplete="off" spellcheck="false" aria-label="反馈 ID 十六进制" /></span>
+          </label>
+          <div class="registry-form-actions"><button id="cancelAddMotor" class="ghost">取消</button><button id="addMotor" class="primary">添加电机</button></div>
+          <span id="addMsg" class="hint" role="status" aria-live="polite"></span>
+        </div>
       </div>
     </section>
 
@@ -92,12 +108,13 @@
       **不要因为"首页看不到冲突说明"而把静态面板加回来** —— 要改就改动态文案。
     -->
 
-    <main id="channels" class="channels"></main>
+    <div class="section-heading channels-heading"><h2><span>02</span> 通道控制</h2><span>CONTROL CHANNELS</span></div>
+    <main id="channels" class="channels" aria-label="电机控制通道"></main>
 
     <template id="channelTpl">
-      <article class="channel" data-empty="1">
+      <article class="channel" data-empty="1" data-state="idle">
         <header>
-          <span class="ch-title">通道</span>
+          <span class="channel-index" data-role="channelIndex" aria-hidden="true">00</span><span class="ch-title">通道</span>
           <!--
             绑定 / 解绑 **都在标题行**(2026-10-14 用户指出不对称)。
 
@@ -116,7 +133,7 @@
         </header>
 
         <div class="bind-row">
-          <select data-role="motor" class="motor-select">
+          <select data-role="motor" class="motor-select" aria-label="选择通道电机">
             <option value="">选择电机…</option>
           </select>
           <!--
@@ -156,6 +173,7 @@
             套框会重新产生"卡片里还套着卡片"的层级错觉。
           -->
           <div class="loop-card">
+            <div class="subsection-heading"><span>闭环配置</span><span>CONTROL LOOP</span></div>
             <div class="loop-fishbone" data-role="loopPicker"></div>
 
             <!--
@@ -218,10 +236,10 @@
         -->
         <div class="chart-box">
           <div class="chart-head">
-            <span class="panel-title">实时曲线</span>
+            <span class="panel-title"><span class="scope-dot" aria-hidden="true"></span>实时曲线</span>
             <span class="chart-legend">
-              <i class="lg lg-speed"></i>实测转速
-              <i class="lg lg-torque"></i>电流
+              <i class="lg lg-speed"></i><span data-role="speedLegend">实测转速</span>
+              <i class="lg lg-torque"></i><span data-role="torqueLegend">反馈</span>
               <i class="lg lg-ref"></i>设定值
             </span>
             <!--
@@ -229,14 +247,23 @@
               放曲线里反而占地方。留在这里也免得为它单开一行。
             -->
             <span class="metric-inline">温度 <b data-role="temp">--</b></span>
-            <select data-role="chartWindow" title="曲线显示的时间窗口">
+            <select data-role="chartWindow" title="曲线显示的时间窗口(按采样点数)">
               <option value="50">50 点</option>
               <option value="120" selected>120 点</option>
               <option value="300">300 点</option>
             </select>
-            <button data-role="chartClear" class="ghost" title="清空历史">清空</button>
+            <button data-role="chartClear" class="ghost" title="清空历史采样">清空</button>
           </div>
-          <canvas data-role="chart" width="600" height="170"></canvas>
+          <canvas data-role="chart" width="600" height="170"
+                  role="img" aria-label="转速与电流实时曲线,数值变化见曲线走势"></canvas>
+          <!--
+            空态占位:通道还没收到遥测时曲线是一片纯黑,看上去像坏了。
+            用一行说明替代"看着像故障的空白"。
+            @attention 由 ui.js 的 renderChannel 按是否有遥测切换 hidden;
+              **不要**用隐藏 canvas 的方式做空态 —— 塌成 0 高度后
+              chart.js 读取高度会得到 0,曲线将永远画不出来。
+          -->
+          <div class="chart-empty" data-role="chartEmpty"><svg viewBox="0 0 64 40" fill="none" aria-hidden="true"><path d="M0 20h16l8-14 12 28 9-14h19" /></svg><span>等待遥测数据</span><small>WAITING FOR SIGNAL</small></div>
           <div class="chart-foot">
             <!--
               滤波开关(2026-10-13 用户要求:电流和转速波动太大)。
@@ -265,12 +292,15 @@
         </div>
 
         <div class="control">
-          <input type="range" data-role="slider" min="-6000" max="6000" step="10" value="0" />
+          <div class="subsection-heading"><span>目标设定</span><span>SETPOINT</span></div>
+          <input type="range" data-role="slider" min="-6000" max="6000" step="10" value="0"
+                 title="拖动设定目标转速;松手后下发" aria-label="目标转速" />
           <div class="control-row">
-            <input type="number" data-role="num" step="1" value="0" />
+            <input type="number" data-role="num" step="1" value="0"
+                   title="精确输入目标值,回车后下发" aria-label="目标转速数值" />
             <span class="unit" data-role="unit">rpm</span>
-            <button data-role="enable" class="enable">使能</button>
-            <button data-role="zero" class="ghost">归零</button>
+            <button data-role="enable" class="enable" title="使能后电机才会跟随设定值转动">使能</button>
+            <button data-role="zero" class="ghost" title="把设定值归零并下发">归零</button>
           </div>
         </div>
 
@@ -288,11 +318,12 @@
 
     <footer class="hint">
       <p>
-        安全说明:电机在固件中预先登记,上位机只能选择清单内的电机。
-        <strong>未使能前电机不出力</strong>;约 1 秒收不到上位机心跳,A 板会自动全停;
+        <span class="footer-label">SYS / SAFETY</span> 电机登记并绑定后，需显式使能才会跟随目标。
+        <strong>未使能前电机不出力</strong>;约 1.5 秒收不到上位机心跳,A 板会自动全停;
         关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
       </p>
     </footer>
+    </div>
 
     <script type="module" src="ui.js"></script>
   </body>

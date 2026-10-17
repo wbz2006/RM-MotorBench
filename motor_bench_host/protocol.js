@@ -52,7 +52,7 @@ export const MotorKindLabel = {
   [MotorKind.GM6020]: '大疆 GM6020',
   [MotorKind.M3508]: '大疆 M3508',
   [MotorKind.M2006]: '大疆 M2006',
-  [MotorKind.DM]: '达妙 DM 系列',
+  [MotorKind.DM]: 'DM4310',
   [MotorKind.LK]: 'LK9025',
   [MotorKind.HT]: 'HT04',
 };
@@ -80,6 +80,27 @@ export function usesDjiIdSegment(kind) {
     || kind === MotorKind.M3508
     || kind === MotorKind.M2006;
 }
+
+/**
+ * 该型号是否需要上位机显式指定 rx_id(反馈 ID)
+ *
+ * @note 只有达妙 DM 需要 —— 它走 MIT 协议,发送(tx_id)与接收(rx_id)
+ *   是两个独立 ID。DJI 系是"一拖四"打包协议,rx_id 由驱动内部
+ *   按 0x200+id+1 / 0x204+id+1 算出,上位机传了也会被忽略。
+ *
+ * @returns {boolean} true = 界面上要给 rx_id 输入框
+ */
+export function needsRxId(kind) {
+  return kind === MotorKind.DM;
+}
+
+/**
+ * rx_id 的合法范围(CAN 标准帧 11 位 ID)
+ * @note 达妙电机的反馈 ID 由电调侧配置决定,常见 0x00~0x0F 一小段,
+ *   但协议层不替用户猜范围,只保证不越出 CAN 标准帧上限。
+ */
+export const RX_ID_MIN = 0;
+export const RX_ID_MAX = 0x7ff;
 
 /**
  * 预估某配置算出的反馈 ID(rx_id)
@@ -369,22 +390,24 @@ export function buildInventoryQuery() {
 
 /**
  * 解析电机清单应答
- * 布局:head(1) type(1) len(1) count(1) items[count*4] crc(1) tail(1)
- *       每项:kind(1) can_bus(1) motor_id(1) outer_loop(1)
+ * 固件 1.2:每项 kind(1) can_bus(1) motor_id(1) outer_loop(1) rx_id(2, LE)。
+ * 兼容旧的 4 字节清单项;旧版不包含 DM 的反馈 ID。
  * @param {Buffer} payload 帧负载
  */
 export function parseInventory(payload) {
   if (payload.length < 1) return null;
   const count = payload[0];
+  const itemBytes = count && payload.length === 1 + count * 6 ? 6 : 4;
+  if (payload.length !== 1 + count * itemBytes) return null;
   const items = [];
   for (let i = 0; i < count; i++) {
-    const off = 1 + i * 4;
-    if (off + 4 > payload.length) break;
+    const off = 1 + i * itemBytes;
     items.push({
       kind: payload[off],
       canBus: payload[off + 1],
       motorId: payload[off + 2],
       outerLoop: payload[off + 3],
+      ...(itemBytes === 6 ? { rxId: payload.readUInt16LE(off + 4) } : {}),
     });
   }
   return { count, items };
@@ -417,31 +440,44 @@ export const MBResultText = {
 /**
  * 构造"创建电机"帧
  *
- * 负载布局:kind(1) can_bus(1) motor_id(1) reserved(1)
+ * 负载布局(5 字节):kind(1) can_bus(1) motor_id(1) rx_id(2, 小端)
  *
  * @param {number} kind     MotorKind 枚举
  * @param {number} canBus   1=CAN1 2=CAN2
- * @param {number} motorId  电调拨码 ID
+ * @param {number} motorId  DJI 系 = 电调拨码 ID;DM 系 = 发送用 tx_id
+ * @param {number} [rxId=0] 反馈 ID(接收用)。
+ *   - DM 系:必须传电机实际的反馈 ID(与电调上的拨码/配置一致)
+ *   - DJI 系:必须传 0 —— 驱动的 rx_id 由 0x200+id+1 / 0x204+id+1 内部算出,
+ *     上位机指定无效
+ *
+ * @note rx_id 必须占 2 字节,否则 0x302 会被截成 0x02。需配合固件 1.1。
  */
-export function buildMotorAdd(kind, canBus, motorId) {
-  const b = Buffer.alloc(4);
+export function buildMotorAdd(kind, canBus, motorId, rxId = 0) {
+  if (!Number.isInteger(rxId) || rxId < RX_ID_MIN || rxId > RX_ID_MAX) {
+    throw new RangeError('rxId must be an 11-bit CAN identifier');
+  }
+  const b = Buffer.alloc(5);
   b[0] = kind;
   b[1] = canBus;
   b[2] = motorId;
-  b[3] = 0; // reserved
+  b.writeUInt16LE(rxId, 3);
   return buildFrame(FrameType.MOTOR_ADD, b);
 }
 
 /**
  * 构造"移除电机"帧
- * 负载布局与创建请求相同(复用 MB_MotorAddReq_s)
+ * 负载布局与创建请求相同(复用同一 5 字节结构)
+ * @param rxId 须与添加时一致,否则板端找不到目标
  */
-export function buildMotorRemove(kind, canBus, motorId) {
-  const b = Buffer.alloc(4);
+export function buildMotorRemove(kind, canBus, motorId, rxId = 0) {
+  if (!Number.isInteger(rxId) || rxId < RX_ID_MIN || rxId > RX_ID_MAX) {
+    throw new RangeError('rxId must be an 11-bit CAN identifier');
+  }
+  const b = Buffer.alloc(5);
   b[0] = kind;
   b[1] = canBus;
   b[2] = motorId;
-  b[3] = 0;
+  b.writeUInt16LE(rxId, 3);
   return buildFrame(FrameType.MOTOR_REMOVE, b);
 }
 
@@ -534,9 +570,9 @@ export const PID_DEFAULTS = {
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 0 },
     angle: { Kp: 8, Ki: 0, Kd: 0, MaxOut: 500, IntegralLimit: 100, improve: 5 },
   },
-  // 达妙 DM —— 暂不引入,延用原测试台配置(用户明确要求"达妙暂时不变")
+  // 达妙 MIT 速度环输出为 N*m;空载调试起点,与固件工厂默认值一致。
   [MotorKind.DM]: {
-    speed: { Kp: 5, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 8, improve: 0 },
+    speed: { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 0.5, IntegralLimit: 0, improve: 1 },
     current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
     angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
   },

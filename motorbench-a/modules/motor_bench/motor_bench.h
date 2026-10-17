@@ -7,7 +7,7 @@
  *        1. 本模块不直接调用任何 HAL 函数,只经由 bsp_usart 与既有电机驱动交互;
  *        2. 电机实例由 app 层在 RobotInit() 中创建并登记,模块只持有指针,
  *           不在运行期凭空实例化(CAN 过滤器/DMA 均为有限启动期资源);
- *        3. 所有电机登记后默认停止,只有上位机显式 enable 后才允许写参考值。
+ *        3. 所有电机登记后默认停止,只有上位机显式 enable 后才允许写非零参考值。
  *
  * @copyright Copyright (c) 2026 HNU YueLu EC all rights reserved
  */
@@ -33,7 +33,7 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 0
+#define MB_FW_VERSION_MINOR 2
 
 /** 通道数上限 */
 #define MB_CHANNEL_MAX 8
@@ -63,7 +63,7 @@ typedef enum
     MB_ERR_BAD_PARAM = 1,
     MB_ERR_DUPLICATE = 2,
     MB_ERR_NOT_PROVISIONED = 3, /* 该电机未在固件中登记 */
-    MB_ERR_NOT_ENABLED = 4,     /* 通道未使能,拒绝写参考值 */
+    MB_ERR_NOT_ENABLED = 4,     /* 通道未使能,拒绝非零参考值 */
     MB_ERR_UNSUPPORTED = 5,     /* 该电机种类尚未接入 */
     MB_ERR_NO_RESOURCE = 6,     /* 清单已满 */
 } MB_Result_e;
@@ -142,28 +142,27 @@ typedef struct
 
 #pragma pack(1)
 
-/** 对外暴露的清单项,4 字节 */
+/** 对外暴露的清单项,6 字节(固件 1.2 起包含反馈 ID) */
 typedef struct
 {
     uint8_t kind;       /* MB_MotorKind_e */
     uint8_t can_bus;    /* 1=CAN1 2=CAN2 */
     uint8_t motor_id;   /* 电调 ID */
     uint8_t outer_loop; /* Closeloop_Type_e */
+    uint16_t rx_id;     /* DM 反馈 ID;DJI 为 0,小端 */
 } MB_InventoryItemPublic_s;
 
 /**
- * 动态建电机请求体,4 字节(与清单项同布局)
- *
- * @note 上位机按实际电调拨码 ID 下发这 4 字节,板端运行期创建电机实例。
- *       字段顺序与 MB_InventoryItemPublic_s 完全一致,
- *       这样"想加什么电机"就等于"清单里长什么样",两边心智统一。
+ * 动态建/拆电机请求体,5 字节。
+ * rx_id 为小端 uint16_t,支持完整的 11 位标准 CAN ID(如 0x302)。
+ * 旧版 4 字节请求会被拒绝;上位机和固件须配套更新。
  */
 typedef struct
 {
-    uint8_t kind;     /* MB_MotorKind_e:1=6020 2=3508 3=2006 4=DM */
-    uint8_t can_bus;  /* 1=CAN1 2=CAN2 */
-    uint8_t motor_id; /* 电调拨码 ID,1~8 */
-    uint8_t reserved; /* 保留,必须填 0 */
+    uint8_t kind;    /* MB_MotorKind_e:1=6020 2=3508 3=2006 4=DM */
+    uint8_t can_bus; /* 1=CAN1 2=CAN2 */
+    uint8_t motor_id;/* 电调拨码 ID(DJI 系 1~8;DM 系即 tx_id) */
+    uint16_t rx_id;  /* 反馈 ID(接收用),小端。DJI 系必须填 0 */
 } MB_MotorAddReq_s;
 
 /**
@@ -366,8 +365,10 @@ _Static_assert(offsetof(MB_TelemetryItem_s, measure_torque) == 12, "item torque 
 _Static_assert(offsetof(MB_TelemetryItem_s, measure_angle) == 16, "item angle @16");
 _Static_assert(offsetof(MB_TelemetryItem_s, temperature) == 20, "item temp @20");
 
-_Static_assert(sizeof(MB_InventoryItemPublic_s) == 4, "inventory item must be 4 bytes");
-_Static_assert(sizeof(MB_MotorAddReq_s) == 4, "motor add req must be 4 bytes");
+_Static_assert(sizeof(MB_InventoryItemPublic_s) == 6, "inventory item must be 6 bytes");
+_Static_assert(offsetof(MB_InventoryItemPublic_s, rx_id) == 4, "inventory rx_id @4");
+_Static_assert(sizeof(MB_MotorAddReq_s) == 5, "motor add req must be 5 bytes");
+_Static_assert(offsetof(MB_MotorAddReq_s, rx_id) == 3, "addreq rx_id @3");
 _Static_assert(sizeof(MB_MotorAddAck_s) == 6, "motor add ack must be 6 bytes");
 _Static_assert(offsetof(MB_MotorAddReq_s, kind) == 0, "addreq kind @0");
 _Static_assert(offsetof(MB_MotorAddReq_s, can_bus) == 1, "addreq can_bus @1");
@@ -492,10 +493,14 @@ uint8_t MotorBenchGetLinkType(void);
  *
  * @param kind     电机种类(MB_MotorKind_e)
  * @param can_bus  1=CAN1 2=CAN2
- * @param motor_id 电调拨码 ID
+ * @param motor_id 电调拨码 ID(DJI 系 1~8;DM 系即发送用 tx_id)
+ * @param rx_id    反馈 ID(接收用)。DJI 系必须传 0 —— 驱动内部按规则计算;
+ *                 DM 系传用户指定的接收 ID,不能为 0
  * @param out_ch   输出:该电机占用的通道号
- * @return MB_OK / MB_ERR_DUPLICATE(同总线同 rx_id) / MB_ERR_UNSUPPORTED(种类未接入)
- *         / MB_ERR_NO_RESOURCE(该总线过滤器耗尽或清单已满)
+ * @return MB_OK / MB_ERR_BAD_PARAM(rx_id 与该型号不符) /
+ *         MB_ERR_DUPLICATE(同总线同 ID 或 rx_id 冲突) /
+ *         MB_ERR_UNSUPPORTED(种类未接入) /
+ *         MB_ERR_NO_RESOURCE(该总线过滤器耗尽或清单已满)
  *
  * @note 这是测试台"换电机不用重烧"的核心接口。
  *       原设计要求改配置表重新烧录,正是本项目要消除的痛点。
@@ -503,7 +508,7 @@ uint8_t MotorBenchGetLinkType(void);
  * @warning 必须由上层应用在**任务上下文**中调用(如 motor_bench_app 的命令处理),
  *          不宜在 CAN 接收中断里调用 —— 内部会 malloc 并重配过滤器。
  */
-uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, uint8_t *out_ch);
+uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, uint16_t rx_id, uint8_t *out_ch);
 
 /**
  * @brief 运行期移除一颗电机并释放其 CAN 过滤器
@@ -511,12 +516,13 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
  * @param kind     电机种类
  * @param can_bus  1=CAN1 2=CAN2
  * @param motor_id 电调拨码 ID
+ * @param rx_id    反馈 ID,须与添加时一致(否则返回 NOT_PROVISIONED)
  * @return MB_OK / MB_ERR_NOT_PROVISIONED(该电机不存在)
  *
  * @attention 移除前会先停止该电机输出。移除后其占用的通道被释放,
  *            界面需重新拉取清单(发送 INVENTORY_QUERY)。
  */
-uint8_t MotorBenchRemoveMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id);
+uint8_t MotorBenchRemoveMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, uint16_t rx_id);
 
 /**
  * @brief 某条 CAN 总线上剩余可用的过滤器个数
@@ -527,7 +533,9 @@ uint8_t MotorBenchGetFilterFree(uint8_t can_bus);
 /**
  * @brief 注册"创建/销毁电机"的工厂回调
  *
- * @param factory  按 (kind, bus, id) 创建电机实例,成功时 *out_instance 有效并返回 MB_OK
+ * @param factory  按 (kind, bus, motor_id, rx_id) 创建电机实例,
+ *                 成功时 *out_instance 有效并返回 MB_OK。
+ *                 rx_id 只对 DM 系有意义;DJI 系收到 0 时应忽略它
  * @param destroy  销毁实例并释放其 CAN 过滤器
  *
  * @note 按框架分层规范,motor_bench 属于 module 层,不能直接实例化
@@ -535,7 +543,7 @@ uint8_t MotorBenchGetFilterFree(uint8_t can_bus);
  *       因此动态建电机的具体动作由 application/motor_bench_app 注册进来。
  *       若不注册,MotorBenchAddMotor() 返回 MB_ERR_UNSUPPORTED。
  */
-typedef uint8_t (*MB_MotorFactory_t)(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, void **out_instance);
+typedef uint8_t (*MB_MotorFactory_t)(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, uint16_t rx_id, void **out_instance);
 typedef void (*MB_MotorDestroy_t)(MB_MotorKind_e kind, void *instance);
 
 void MotorBenchSetMotorFactory(MB_MotorFactory_t factory, MB_MotorDestroy_t destroy);
@@ -546,6 +554,7 @@ void MotorBenchSetMotorFactory(MB_MotorFactory_t factory, MB_MotorDestroy_t dest
  * @param kind       电机种类
  * @param can_bus    1=CAN1 2=CAN2
  * @param motor_id   电调 ID(DJI 系 1~8,达妙 1~4)
+ * @param rx_id      反馈 ID。DJI 系必须传 0(驱动内部算);DM 系传接收 ID
  * @param outer_loop 外层闭环。**位掩码,可叠加**:
  *                    OPEN_LOOP(0) / CURRENT_LOOP(1) / SPEED_LOOP(2) / ANGLE_LOOP(4)
  *                    组合值:SPEED_AND_CURRENT_LOOP(3,速度外环+电流内环)
@@ -561,7 +570,7 @@ void MotorBenchSetMotorFactory(MB_MotorFactory_t factory, MB_MotorDestroy_t dest
  * @note  登记后该电机立即被置为停止状态,须由上位机 enable 才会输出。
  *        同一总线上不允许重复登记相同 ID。
  */
-uint8_t MotorBenchRegisterMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, Closeloop_Type_e outer_loop, void *instance);
+uint8_t MotorBenchRegisterMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, uint16_t rx_id, Closeloop_Type_e outer_loop, void *instance);
 
 /**
  * @brief 已登记电机数量
@@ -604,7 +613,7 @@ uint8_t MotorBenchUnbind(uint8_t channel_id);
  * @brief 使能/停止某通道
  *
  * @param channel_id 通道号
- * @param enable     1=使能 0=停止(停止是把 CAN 输出电流置零,而不是把 ref 设 0)
+ * @param enable     1=使能 0=停止。停止及重新使能时清零目标值。
  */
 uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable);
 
@@ -613,9 +622,9 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable);
  *
  * @param channel_id 通道号
  * @param ref        速度环:rpm;电流环:A;角度环:deg
- * @return MB_OK 成功;MB_ERR_NOT_ENABLED 表示通道未使能(已拒绝写入)
+ * @return MB_OK 成功;MB_ERR_NOT_ENABLED 表示通道未使能且拒绝了非零值
  *
- * @attention 未使能时拒绝写入,防止上电瞬间意外转动;值会被限幅到 ±MB_REF_LIMIT_*
+ * @attention 未使能时只接受零值;非零值须先使能,再显式下发。值限幅到 ±MB_REF_LIMIT_*。
  */
 uint8_t MotorBenchSetRef(uint8_t channel_id, float ref);
 
