@@ -145,6 +145,9 @@ static const BenchPidSet_s bench_dji_current_pid[BENCH_PID_TABLE_SIZE] = {
 };
 
 static const BenchPidSet_s bench_dji_angle_pid[BENCH_PID_TABLE_SIZE] = {
+    /* deg -> deg/s; bounded commissioning settings for rotor position. */
+    [M3508] = {4.0f, 0.0f, 0.0f, 600.0f, 0.0f, PID_Integral_Limit},
+    [M2006] = {4.0f, 0.0f, 0.0f, 600.0f, 0.0f, PID_Integral_Limit},
     [GM6020] = {8.0f, 0.0f, 0.0f, 500.0f, 100.0f,
                 PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement},
 };
@@ -215,7 +218,7 @@ static void BenchBuildDJIConfig(Motor_Init_Config_s *ref, Motor_Type_e type, CAN
 
     BenchApplyPid(&ref->controller_param_init_config.speed_PID, &bench_dji_speed_pid[type]);
     BenchApplyPid(&ref->controller_param_init_config.current_PID, &bench_dji_current_pid[type]);
-    /* 位置环参数仅 GM6020 有实参;其余型号为零值(未指定,由上层整定) */
+    /* 各型号使用非零的位置环初始参数，按实际负载继续整定。 */
     BenchApplyPid(&ref->controller_param_init_config.angle_PID, &bench_dji_angle_pid[type]);
 }
 
@@ -261,6 +264,10 @@ static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus,
     ref->controller_param_init_config.speed_PID.MaxOut = 0.5f; /* N*m, initial bench limit */
     ref->controller_param_init_config.speed_PID.Improve = PID_Integral_Limit;
     ref->controller_param_init_config.speed_PID.IntegralLimit = 0.0f;
+    /* Position targets and feedback are degrees; output is speed in rad/s. */
+    ref->controller_param_init_config.angle_PID.Kp = 0.1f;
+    ref->controller_param_init_config.angle_PID.MaxOut = 2.0f;
+    ref->controller_param_init_config.angle_PID.Improve = PID_Integral_Limit;
 
     /*
      * @attention 死区必须显式写 0,与 BenchApplyPid 的理由相同:
@@ -338,6 +345,7 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
     }
 
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
     {
         /*
          * DM:两个 ID 都由上位机给 ——
@@ -347,7 +355,20 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
          * 单颗也可能收不到反馈。现在由协议显式传入。
          */
         BenchBuildDMConfig(&cfg, bus, motor_id, rx_id);
-        DMMotorInstance *m = DMMotorInit(&cfg);
+        /* Model-specific, user-confirmed speed PID defaults. MaxOut is
+         * an output ceiling, not a constant torque command. */
+        if (kind == MB_MOTOR_DM)
+        {
+            cfg.controller_param_init_config.speed_PID.Kp = 0.65f;
+            cfg.controller_param_init_config.speed_PID.Ki = 12.0f;
+            cfg.controller_param_init_config.speed_PID.Kd = 0.0f;
+            cfg.controller_param_init_config.speed_PID.MaxOut = 15.0f;
+            cfg.controller_param_init_config.speed_PID.IntegralLimit = 1000.0f;
+        }
+        else if (kind == MB_MOTOR_DM8009P)
+            cfg.controller_param_init_config.speed_PID.MaxOut = 10.0f;
+        DMMotorInstance *m = DMMotorInitWithModel(&cfg,
+            kind == MB_MOTOR_DM8009P ? DM_MODEL_8009P : DM_MODEL_4310);
         if (!m)
             return MB_ERR_NO_RESOURCE;
         *out_instance = m;
@@ -372,20 +393,10 @@ static void BenchMotorDestroy(MB_MotorKind_e kind, void *instance)
     if (!instance)
         return;
 
-    if (kind == MB_MOTOR_DM)
-    {
-        DMMotorInstance *m = (DMMotorInstance *)instance;
-        DMMotorStop(m);
-        CANUnregister(m->motor_can_instace);
-        free(m);
-    }
+    if (MotorBenchIsDMKind(kind))
+        DMMotorDestroy((DMMotorInstance *)instance);
     else
-    {
-        DJIMotorInstance *m = (DJIMotorInstance *)instance;
-        DJIMotorStop(m);
-        CANUnregister(m->motor_can_instance);
-        free(m);
-    }
+        DJIMotorDestroy((DJIMotorInstance *)instance);
 }
 
 void MotorBenchAppInit(void)

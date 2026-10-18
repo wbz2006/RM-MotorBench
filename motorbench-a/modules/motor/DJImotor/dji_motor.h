@@ -108,6 +108,8 @@ typedef struct
  * @return DJIMotorInstance*
  */
 DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config);
+/** Stop and remove the instance from control, CAN and daemon registries. */
+void DJIMotorDestroy(DJIMotorInstance *motor);
 
 /**
  * @brief 被application层的应用调用,给电机设定参考值.

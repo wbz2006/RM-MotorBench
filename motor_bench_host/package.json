@@ -7,8 +7,11 @@
   "scripts": {
     "start": "node server.js",
     "test": "node selftest.js",
+    "test:http": "node --test http_test.js",
     "test:integration": "node integration_test.js",
-    "test:motor-state": "node motor_state_test.js"
+    "test:motor-state": "node motor_state_test.js",
+    "test:setpoint": "node --test setpoint_test.js",
+    "test:calculator": "node --test calculator_test.js"
   },
   "dependencies": {
     "serialport": "^12.0.0",

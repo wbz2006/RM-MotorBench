@@ -10,14 +10,12 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { firmwareRoot } from './firmware_test_paths.js';
 import { crc8, buildFrame, buildBind, buildSetRef, buildEnable, MotorKind, LoopType } from './protocol.js';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Cross-check the CMake firmware used for current builds.
 const firmwareCrc = path.join(
-  repoRoot,
-  'motorbench-a',
+  firmwareRoot,
   'modules',
   'algorithm',
   'crc8.c',

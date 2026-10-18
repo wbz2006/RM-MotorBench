@@ -33,7 +33,7 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 2
+#define MB_FW_VERSION_MINOR 10
 
 /** 通道数上限 */
 #define MB_CHANNEL_MAX 8
@@ -49,8 +49,8 @@
 /** 串口接收缓冲区大小 */
 #define MB_RX_BUFF_SIZE (MB_PAYLOAD_MAX * 2 + 16)
 
-/** 心跳应答负载长度(fw_major 起共 9 字节) */
-#define MB_HEARTBEAT_ACK_CRC_LEN 9
+/** 心跳应答负载长度:major/minor/inventory/flags(4) + uptime(2) + seq(2) */
+#define MB_HEARTBEAT_ACK_CRC_LEN 8
 
 /** 参考值安全限幅,防止误输入打飞电机 */
 #define MB_REF_LIMIT_POS 12000.0f
@@ -93,12 +93,14 @@ typedef enum
     MB_FRAME_PID_SET = 0x0A,   /* 运行期写入单通道单环 PID 参数 */
     MB_FRAME_PID_QUERY = 0x0B, /* 请求上报单通道三套 PID 参数 */
     MB_FRAME_MOTOR_UNBIND = 0x0C, /* 解绑通道(释放 is_used,否则无法改绑) */
+    MB_FRAME_LOOP_SET = 0x0D,     /* channel_id, loop_mask; stop and change bound channel */
     MB_FRAME_TELEMETRY = 0x81,    /* 板端遥测上报(仅板端发出) */
     MB_FRAME_INVENTORY_REPORT = 0x82, /* 电机清单应答(仅板端发出) */
     MB_FRAME_MOTOR_ADD_ACK = 0x8A,   /* 建电机结果应答(仅板端发出) */
     MB_FRAME_PID_REPORT = 0x8B,      /* PID 参数应答(仅板端发出) */
     MB_FRAME_PID_SET_ACK = 0x8C,     /* PID 写入结果应答(仅板端发出) */
     MB_FRAME_UNBIND_ACK = 0x8D,      /* 解绑结果应答(仅板端发出) */
+    MB_FRAME_LOOP_SET_ACK = 0x8E,    /* channel_id, requested loop_mask, result */
 } MB_FrameType_e;
 
 /** 支持的电机种类,与 motor_def.h / 各驱动一一对应 */
@@ -108,10 +110,16 @@ typedef enum
     MB_MOTOR_GM6020 = 1,
     MB_MOTOR_M3508 = 2,
     MB_MOTOR_M2006 = 3,
-    MB_MOTOR_DM = 4, /* 达妙系列 DM-4310 等 */
+    MB_MOTOR_DM = 4, /* DM4310; preserve the existing protocol value */
     MB_MOTOR_LK = 5, /* LK9025 */
     MB_MOTOR_HT = 6, /* HT04 */
+    MB_MOTOR_DM8009P = 7,
 } MB_MotorKind_e;
+
+static inline uint8_t MotorBenchIsDMKind(MB_MotorKind_e kind)
+{
+    return kind == MB_MOTOR_DM || kind == MB_MOTOR_DM8009P;
+}
 
 /* ============================================================
  * 内部结构
@@ -130,6 +138,7 @@ typedef struct
     Closeloop_Type_e outer_loop;
     uint8_t status_bit_enable;  /* 1=该通道已使能 */
     float ref_cmd;              /* 最近一次下发的参考值,用于上报 */
+    float position_zero;        /* Position origin in degrees, captured on each enable. */
 } MB_MotorChannel_s;
 
 /* ============================================================
@@ -204,7 +213,7 @@ typedef enum
 } MB_PidLoop_e;
 
 /**
- * 设置 PID 请求体,21 字节(4 头 + 17 体)
+ * 设置 PID 请求体,20 字节
  *
  * @note 定点方案 —— 为什么大小不一:
  *   Kp/Ki/Kd 是小系数,用 u16×100 保留两位小数;
@@ -214,12 +223,13 @@ typedef enum
  *   Buffer.writeUInt16LE 直接抛 ERR_OUT_OF_RANGE。
  *   (这是迁移当天实际踩到的坑,不是假想风险)
  *   故:小系数 u16×100,大限幅 s32 整数原值,混合布局。
+ *   固件 1.3 起 reserved bit0=1 时，限幅按 s32×1000 编码，供 DM 保留三位小数。
  *
  * 布局:
  *   channel_id(1) loop(1) improve_flags(1) reserved(1)
  *   Kp(2) Ki(2) Kd(2)                     u16×100
  *   MaxOut(4) IntegralLimit(4)            s32 整数值
- *   reserved(4)
+ *   tail_pad(2)
  */
 typedef struct __attribute__((packed))
 {
@@ -235,7 +245,7 @@ typedef struct __attribute__((packed))
     uint8_t channel_id;    /* 目标通道 @0 */
     uint8_t loop;          /* MB_PidLoop_e @1 */
     uint8_t improve_flags; /* PID_Improvement_e 低 8 位 @2 */
-    uint8_t reserved;      /* 填 0 @3(占 improve 的高字节) */
+    uint8_t reserved;      /* @3: bit0=MaxOut/IntegralLimit encoded x1000 (DM) */
     uint16_t kp_x100;      /* round(Kp * 100) @4 */
     uint16_t ki_x100;      /* round(Ki * 100) @6 */
     uint16_t kd_x100;      /* round(Kd * 100) @8 */
@@ -252,7 +262,7 @@ typedef struct
 } MB_PidQueryReq_s;
 
 /**
- * PID 上报体,43 字节
+ * PID 上报体,49 字节
  *
  * 布局(与 protocol.js parsePidReport 逐字节对应):
  *   channel_id(1) kind(1) reserved(2)
@@ -264,7 +274,7 @@ typedef struct
  *   improve[3] u8          → @46
  *
  * @note MaxOut/IntegralLimit 用 s32 而非 u16,原因见 MB_PidSetReq_s 注释
- *       (15000×100 会超出 u16)。这里存整数值不放大,所以 4 字节足够。
+ *       (15000×100 会超出 u16)。DJI 不放大；DM 的 reserved[0] bit0=1，限幅乘 1000。
  */
 typedef struct __attribute__((packed))
 {
@@ -301,7 +311,7 @@ typedef struct
     uint8_t tail;
 } MB_TelemetryFrame_s;
 
-/** 心跳应答帧:body = fw_major fw_minor inventory flags uptime(2) seq(2) = 9 字节 */
+/** 心跳应答帧:body = fw_major fw_minor inventory flags uptime(2) seq(2) = 8 字节 */
 typedef struct
 {
     uint8_t head;
@@ -452,6 +462,9 @@ _Static_assert(offsetof(MB_HeartbeatAck_s, motor_inventory_count) == 5, "ack inv
 _Static_assert(offsetof(MB_HeartbeatAck_s, board_flags) == 6, "ack flags @6");
 _Static_assert(offsetof(MB_HeartbeatAck_s, uptime_s) == 7, "ack uptime @7");
 _Static_assert(offsetof(MB_HeartbeatAck_s, seq) == 9, "ack seq @9");
+_Static_assert(offsetof(MB_HeartbeatAck_s, crc) == 3 + MB_HEARTBEAT_ACK_CRC_LEN, "heartbeat CRC must follow the declared payload");
+_Static_assert(offsetof(MB_HeartbeatAck_s, tail) == 4 + MB_HEARTBEAT_ACK_CRC_LEN, "heartbeat tail must follow CRC");
+_Static_assert(sizeof(MB_HeartbeatAck_s) == 5 + MB_HEARTBEAT_ACK_CRC_LEN, "heartbeat frame length must match its header");
 #endif
 
 /* ============================================================
@@ -616,6 +629,9 @@ uint8_t MotorBenchUnbind(uint8_t channel_id);
  * @param enable     1=使能 0=停止。停止及重新使能时清零目标值。
  */
 uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable);
+
+/** Stop and switch a bound channel without releasing its motor or PID parameters. */
+uint8_t MotorBenchSetLoop(uint8_t channel_id, Closeloop_Type_e loop);
 
 /**
  * @brief 设置某通道参考值

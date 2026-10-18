@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101211" />
     <title>MOTORBENCH / 电机测试台</title>
-    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="style.css?v=20261018-pid-context" />
   </head>
   <body>
     <a class="skip-link" href="#channels">跳转到电机通道</a>
@@ -21,6 +21,10 @@
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M2 12h4l3-7 6 14 3-7h4" /></svg>
         <span>控制</span>
       </a>
+      <a class="rail-link" href="#channels" data-open-calculator aria-label="计算器" title="计算器">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M8 6h8M8 11h2m4 0h2m-8 4h2m4 0h2m-8 4h2m4 0h2"/></svg>
+        <span>计算</span>
+      </a>
       <span class="rail-foot" aria-hidden="true">RM / LAB</span>
     </aside>
     <header class="topbar" id="top">
@@ -32,7 +36,7 @@
         <span class="link-label"><span class="dot" id="linkDot"></span><span id="linkText">未连接</span></span>
         <span class="fw" id="fwText"></span>
       </div>
-      <button id="estop" class="estop" title="立即停止全部电机"><span class="stop-square" aria-hidden="true"></span>急停 <span>ALL STOP</span></button>
+      <button id="estop" class="estop" title="立即停止全部电机（快捷键：空格，页面需处于焦点）" aria-keyshortcuts="Space"><span class="stop-square" aria-hidden="true"></span>急停 <span>ALL STOP · SPACE</span></button>
     </header>
 
     <div class="workspace">
@@ -76,6 +80,7 @@
             <select id="addKind" title="电机型号">
               <option value="1">大疆 GM6020</option><option value="2">大疆 M3508</option>
               <option value="3">大疆 M2006</option><option value="4">DM4310</option>
+              <option value="7">DM8009P</option>
             </select>
           </label>
           <label>总线
@@ -108,8 +113,55 @@
       **不要因为"首页看不到冲突说明"而把静态面板加回来** —— 要改就改动态文案。
     -->
 
+
     <div class="section-heading channels-heading"><h2><span>02</span> 通道控制</h2><span>CONTROL CHANNELS</span></div>
     <main id="channels" class="channels" aria-label="电机控制通道"></main>
+    <p id="channelsEmpty" class="registry-empty">尚未登记电机。添加电机后将自动生成对应数量的通道。</p>
+
+    <template id="calculatorTpl">
+      <div class="calculator-body">
+        <div class="calculator-diagram" role="region" aria-label="射频换算流程，按 01 至 04 顺序填写">
+          <ol class="calculator-flow">
+            <li class="calculator-node">
+              <span class="calculator-step">01 / INPUT</span>
+              <label data-calc-for="calcRate">目标射频 <span>发/秒</span></label>
+              <input data-calc="calcRate" type="number" min="0" step="any" value="8" />
+              <span class="calculator-caption">每秒发射的弹丸数量</span>
+            </li>
+            <li class="calculator-node">
+              <span class="calculator-step">02 / FEEDER</span>
+              <label data-calc-for="calcPerTurn">拨盘每圈发数 <span>发/圈</span></label>
+              <input data-calc="calcPerTurn" type="number" min="1" step="1" placeholder="按实际拨盘填写" />
+              <div class="calculator-inline">拨盘 <output data-calc="calcDiskRpm">—</output><span>rpm</span></div>
+            </li>
+            <li class="calculator-node">
+              <span class="calculator-step">03 / DRIVE</span>
+              <label data-calc-for="calcDrive">传动方式</label>
+              <select data-calc="calcDrive"><option value="direct">直驱 · 1:1</option><option value="reduction">减速传动</option></select>
+              <div data-calc="calcRatioWrap" hidden>
+                <label data-calc-for="calcRatio">总减速比 <span>转子 : 拨盘</span></label>
+                <input data-calc="calcRatio" type="number" min="0" step="any" value="36" disabled />
+              </div>
+              <span class="calculator-caption" data-calc="calcDriveNote">直驱：电机与拨盘同速</span>
+            </li>
+            <li class="calculator-node calculator-result" aria-live="polite" aria-atomic="true">
+              <span class="calculator-step">04 / MOTOR</span>
+              <div class="calculator-result-header">
+                <span class="calculator-result-title">电机转子目标转速</span>
+                <button type="button" class="calculator-sign" data-calc="calcSign" aria-label="最终输出取负值" aria-pressed="false" title="点击切换最终输出正负">+ 正值</button>
+              </div>
+              <div class="calculator-result-value"><output data-calc="calcRpm">—</output><span>rpm</span></div>
+              <div class="calculator-result-value calculator-secondary"><output data-calc="calcRad">—</output><span>rad/s</span></div>
+              <span class="calculator-caption">rpm 对应 DJI · rad/s 对应 DM</span>
+            </li>
+          </ol>
+        </div>
+        <p data-calc="calcPrompt" class="calculator-note" role="status">请先填写拨盘每圈发数。</p>
+        <p data-calc="calcError" class="calculator-error" role="status" hidden></p>
+        <p class="calculator-note">转子 rpm = 射频 × 60 ÷ 每圈发数 × 减速比。直驱时减速比为 1；减速传动参考：M2006 为 36，M3508 为 19，外部传动也需计入。</p>
+        <p class="calculator-note">结果为理论目标转速。点击结果旁的正负按钮切换 rpm 与 rad/s 的符号，并自动填入上方转速框；按 Enter 下发，未使能时点击使能执行该目标。</p>
+      </div>
+    </template>
 
     <template id="channelTpl">
       <article class="channel" data-empty="1" data-state="idle">
@@ -175,29 +227,24 @@
           <div class="loop-card">
             <div class="subsection-heading"><span>闭环配置</span><span>CONTROL LOOP</span></div>
             <div class="loop-fishbone" data-role="loopPicker"></div>
+            <p class="hint error" data-role="loopStatus" role="status" hidden></p>
 
             <!--
               PID 整定 —— 常驻显示(未绑定电机时各控件为 disabled)。
 
-              交互契约:点击鱼骨图上的环节点 → 切换该环启用状态,
-                同时把本段的 pidLoop 切到对应环并填入该型号默认值。
+              交互契约:左键切换环启用状态，右键选择该环的 PID 参数。
             -->
-            <div class="pid-panel" data-role="pidPanel">
+            <div class="pid-panel" data-role="pidPanel" data-loop="0">
               <div class="pid-head">
-                <span class="panel-title" data-role="pidTitle">PID 整定</span>
-                <select data-role="pidLoop" disabled>
-                  <option value="0">速度环</option>
-                  <option value="1">电流环</option>
-                  <option value="2">位置环</option>
-                </select>
+                <span class="panel-title" data-role="pidTitle">速度环 PID</span>
                 <button data-role="pidQuery" class="ghost" disabled title="从板端读回当前生效参数">读回</button>
               </div>
               <div class="pid-grid">
                 <label>Kp<input data-role="pKp" type="number" step="0.01" min="0" value="0" disabled /></label>
                 <label>Ki<input data-role="pKi" type="number" step="0.01" min="0" value="0" disabled /></label>
                 <label>Kd<input data-role="pKd" type="number" step="0.01" min="0" value="0" disabled /></label>
-                <label>输出限幅<input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
-                <label>积分限幅<input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
+                <label><span>输出限幅 <span data-role="pMaxOutUnit"></span></span><input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
+                <label><span>积分限幅 <span data-role="pIntLimUnit"></span></span><input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
               </div>
               <!--
                 动作行:**状态消息与「应用到电机」同一行**(2026-10-14 用户要求)。
@@ -207,7 +254,7 @@
                 @attention 不要把 pidMsg 移到 .pid-head 或 panel 末尾当"说明段"。
               -->
               <div class="pid-actions">
-                <button data-role="pidApply" disabled>应用到电机</button>
+                <button data-role="pidApply" disabled title="参数确认成功后，自动以零目标使能本通道">应用到电机</button>
                 <button data-role="pidReset" class="ghost" disabled>恢复默认值</button>
                 <span data-role="pidMsg" class="hint">先绑定电机后可用</span>
               </div>
@@ -292,7 +339,7 @@
         </div>
 
         <div class="control">
-          <div class="subsection-heading"><span>目标设定</span><span>SETPOINT</span></div>
+          <div class="subsection-heading"><span data-role="targetTitle">目标设定</span><span>SETPOINT</span></div>
           <input type="range" data-role="slider" min="-6000" max="6000" step="10" value="0"
                  title="拖动设定目标转速;松手后下发" aria-label="目标转速" />
           <div class="control-row">
@@ -301,6 +348,47 @@
             <span class="unit" data-role="unit">rpm</span>
             <button data-role="enable" class="enable" title="使能后电机才会跟随设定值转动">使能</button>
             <button data-role="zero" class="ghost" title="把设定值归零并下发">归零</button>
+          </div>
+          <div class="channel-tools">
+            <div class="tool-tabs" role="tablist" aria-label="通道工具">
+              <button data-role="presetTab" role="tab" aria-selected="true">自动输出</button>
+              <button data-role="calculatorTab" role="tab" aria-selected="false" tabindex="-1">计算器</button>
+            </div>
+            <div class="setpoint-program" data-role="presetPanel" role="tabpanel">
+              <div class="preset-content" data-role="presetContent">
+              <div class="preset-toolbar">
+                <select data-role="presetMode" aria-label="自动输出类型">
+                  <option value="sine">∿ 正弦输出</option>
+                  <option value="steps">⌁ 阶梯输出</option>
+                </select>
+                <label>循环次数<input data-role="presetCycles" type="number" min="1" max="1000" step="1" value="1" /></label>
+              </div>
+              <div class="preset-fields" data-role="presetSine">
+                <label>幅值 <span data-role="presetUnit">rpm</span><input data-role="presetAmplitude" type="number" min="0" step="any" value="500" /></label>
+                <label>偏置 <span data-role="presetUnit">rpm</span><input data-role="presetOffset" type="number" step="any" value="0" /></label>
+                <label>周期 / s<input data-role="presetPeriod" type="number" min="0.5" max="3600" step="0.1" value="4" /></label>
+              </div>
+              <div class="preset-fields preset-steps" data-role="presetSteps" hidden>
+                <label>目标序列 <span data-role="presetUnit">rpm</span><input data-role="presetValues" type="text" value="0, 500, 1000, 500, 0" placeholder="用逗号分隔，如 0, 500, 1000, 0" /></label>
+                <label>每级保持 / s<input data-role="presetDwell" type="number" min="0.1" max="3600" step="0.1" value="2" /></label>
+              </div>
+              <div class="preset-actions">
+                <button data-role="presetStart" class="ghost" disabled>▶ 启动预设</button>
+                <button data-role="presetStop" class="ghost" disabled>停止并归零</button>
+              </div>
+              <p data-role="presetStatus" class="preset-status" role="status">先绑定并使能速度环电机 · 完成后归零</p>
+              </div>
+              <div class="preset-blocker" data-role="presetBlocker" role="status" hidden>
+                <strong>当前处于位置环</strong>
+                <span>自动输出仅支持转速，当前无法直接输出。</span>
+                <small>请在上方切换为速度环，再重新使能。</small>
+              </div>
+            </div>
+            <div class="channel-calculator" data-role="calculatorPanel" role="tabpanel" hidden>
+              <label class="calculator-picker">计算器类型<select data-role="calculatorType"><option value="loader">射频 → 转速</option></select></label>
+              <div data-role="calculatorContent"></div>
+              <p data-role="calculatorWriteStatus" class="preset-status" role="status"></p>
+            </div>
           </div>
         </div>
 
@@ -318,13 +406,13 @@
 
     <footer class="hint">
       <p>
-        <span class="footer-label">SYS / SAFETY</span> 电机登记并绑定后，需显式使能才会跟随目标。
+        <span class="footer-label">SYS / SAFETY · UI 20261018-pid-context</span> 电机登记并绑定后，需显式使能才会跟随目标。
         <strong>未使能前电机不出力</strong>;约 1.5 秒收不到上位机心跳,A 板会自动全停;
-        关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
+        页面处于焦点时，按空格立即全停（输入框内同样有效）；关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
       </p>
     </footer>
     </div>
 
-    <script type="module" src="ui.js"></script>
+    <script type="module" src="ui.js?v=20261018-pid-context"></script>
   </body>
 </html>

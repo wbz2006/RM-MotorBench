@@ -57,7 +57,7 @@
  * @attention 顺序只是渲染顺序。所有判定都按 **bit** 走,不按数组下标走:
  *   - 外层环 = 掩码中最高位的亮节点(bit > outerBit,与位置无关)
  *   - 联动约束 = 按 bit 值特判(bit === 0b0100 / 0b0010)
- *   - PID 卡片切环 = onFocusLoop 上报 bit,ui.js 用 bit→option 映射
+ *   - PID 卡片切环 = 右键 onFocusLoop 上报 bit,ui.js 映射到 PID 环编号
  *   所以对调数组不改变任何行为,改的只有视觉。
  *
  * @param {number} bit   close_loop_type 中的位
@@ -107,7 +107,7 @@ export class LoopFishbone {
     this.mask = 0b0011; // 默认 电流+速度
     this.onChange = null; // 外部回调(mask) => void
     /*
-     * 焦点回调:用户悬停/点击了某个环节点。
+     * PID 选择回调:用户右键了某个环节点。
      *   onFocusLoop(bit, nodeEl) —— 请求外部把 PID 卡片切到对应环
      */
     this.onFocusLoop = null;
@@ -149,7 +149,7 @@ export class LoopFishbone {
       node.dataset.bit = String(n.bit);
       if (n.locked) {
         node.classList.add('is-locked');
-        node.disabled = true; /* 常亮节点不接受点击 */
+        /* _toggle keeps this loop on; right-click may still select its PID. */
       }
       /*
        * title(悬停提示)**统一由 _apply() 写**,这里不写。
@@ -162,25 +162,11 @@ export class LoopFishbone {
         `<span class="fb-node-bit">0b${n.bit.toString(2).padStart(3, '0')}</span>`;
       node.onclick = () => {
         this._toggle(n);
-        /*
-         * 点击后也切一次卡片。
-         * @attention 必须放在 _toggle **之后**:
-         *   用户点节点是为了改变启用状态,顺带把 PID 卡片切到这个环 ——
-         *   若放在之前,卡片会按"点击前"的状态切换,与实际点亮结果不符。
-         */
+      };
+      node.oncontextmenu = event => {
+        event.preventDefault();
         this.onFocusLoop?.(n.bit, node);
       };
-
-      /*
-       * 悬停/聚焦时请求外部打开 PID 浮空卡片(2026-10-13 用户要求:
-       * "某个环被点亮后显示卡片可以调整参数")。
-       *
-       * @attention 只"请求",不自己管显示 —— 卡片在 ui.js 里,
-       *   鱼骨图只负责上报"用户现在关注哪个环"(bit)与节点位置。
-       *   这样鱼骨图不需要知道 PID 面板的任何内部结构。
-       */
-      node.onmouseenter = () => this.onFocusLoop?.(n.bit, node);
-      node.onfocus = () => this.onFocusLoop?.(n.bit, node);
 
       spine.appendChild(node);
     }
@@ -267,20 +253,26 @@ export class LoopFishbone {
      *
      * @attention 主脊箭头已不代表信号方向,note 是**唯一**讲清
      *   "这一级输出交给谁"的地方,所以每条 note 都必须写明去向。
-     *   常亮节点也写:它 disabled 不接受点击,但悬停仍能看到 title。
+       *   常亮节点不接受关闭，但仍可右键选择 PID。
      */
     for (const el of nodes) {
       const bit = Number(el.dataset.bit);
       const n = NODES.find((x) => x.bit === bit);
       const state = el.classList.contains('is-locked')
         ? '常亮,不可关闭'
-        : `点击${this.mask & bit ? '关闭' : '启用'}`;
-      el.title = `${n.name} — ${state}。${n.note}`;
+        : `左键${this.mask & bit ? '关闭' : '启用'}`;
+      el.title = `${n.name} — ${state}；右键设置 PID。${n.note}`;
     }
   }
 
   /** 读取当前掩码 */
   getMask() {
     return this.mask;
+  }
+
+  /** Restore a confirmed mode without firing another change request. */
+  setMask(mask) {
+    this.mask = mask;
+    this._apply();
   }
 }

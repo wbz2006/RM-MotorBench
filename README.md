@@ -37,6 +37,7 @@
 | 目录 | 说明 |
 |---|---|
 | [`motorbench-a`](motorbench-a) | **固件主工程**。CubeMX + CMake/Ninja，电机测试台、USB CDC 与动态建电机 |
+| [`motorbench-c`](motorbench-c) | **C 型开发板阶段性快照**。2026-10-18 从 A 板工作区固件 1.6 迁入，STM32F407IGH6，仅 USB；不自动同步 A 板后续开发 |
 | [`basic_framework_atype_usb-master`](basic_framework_atype_usb-master) | 保留的旧 Makefile 工程，作为已验证可用的参考版本 |
 | [`motor_bench_host`](motor_bench_host) | **上位机**。Node 服务（WebSocket 桥接串口）+ 原生 Web UI |
 | `电机测试台方案.md` | 完整方案文档（设计推导、协议定义、排查记录） |
@@ -70,6 +71,11 @@ cmake --build --preset Debug --parallel
 
 产物在 `motorbench-a/build/Debug/basic_framework_ATYPE.{elf,hex,bin}`。
 详见 [固件工程说明](motorbench-a/README.md)。
+
+**使用 C 型开发板时**，在 VS Code 中打开 `motorbench-c`，选择
+`STM32Cube: MotorBench C ST-Link` 或 `STM32Cube: MotorBench C J-Link`。
+C 板产物为 `motorbench-c/build/Debug/basic_framework.{elf,hex,bin}`，
+上位机仍使用下述同一套服务。详见 [C 板迁移与验证说明](motorbench-c/README.md)。
 
 ### 2. 启动上位机
 

@@ -1,4 +1,5 @@
 #include "dji_motor.h"
+#include "string.h"
 #include "general_def.h"
 #include "bsp_dwt.h"
 #include "bsp_log.h"
@@ -236,7 +237,11 @@ static void DJIMotorLostCallback(void *motor_ptr)
 // 电机初始化,返回一个电机实例
 DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config)
 {
+    if (idx >= DJI_MOTOR_CNT)
+        return NULL;
     DJIMotorInstance *instance = (DJIMotorInstance *)malloc(sizeof(DJIMotorInstance));
+    if (!instance)
+        return NULL;
     memset(instance, 0, sizeof(DJIMotorInstance));
 
     // motor basic setting 电机基本设置
@@ -290,10 +295,41 @@ DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config)
 #endif
     };
     instance->daemon = DaemonRegister(&daemon_config);
+    if (!instance->daemon)
+    {
+        CANUnregister(instance->motor_can_instance);
+        free(instance);
+        return NULL;
+    }
 
     DJIMotorEnable(instance);
     dji_motor_instance[idx++] = instance;
     return instance;
+}
+
+void DJIMotorDestroy(DJIMotorInstance *motor)
+{
+    if (!motor)
+        return;
+    for (uint8_t i = 0; i < idx; i++)
+    {
+        if (dji_motor_instance[i] != motor)
+            continue;
+        DJIMotorStop(motor);
+        uint8_t group = motor->sender_group;
+        memset(sender_assignment[group].tx_buff + 2 * motor->message_num, 0, sizeof(uint16_t));
+        CANTransmit(&sender_assignment[group], 1); /* Clear only this slot; retain peers. */
+        memmove(&dji_motor_instance[i], &dji_motor_instance[i + 1], (idx - i - 1) * sizeof(dji_motor_instance[0]));
+        dji_motor_instance[--idx] = NULL;
+        sender_enable_flag[group] = 0;
+        for (uint8_t j = 0; j < idx; j++)
+            if (dji_motor_instance[j]->sender_group == group)
+                sender_enable_flag[group] = 1;
+        CANUnregister(motor->motor_can_instance);
+        DaemonUnregister(motor->daemon);
+        free(motor);
+        return;
+    }
 }
 
 /* 电流只能通过电机自带传感器监测,后续考虑加入力矩传感器应变片等 */
@@ -492,6 +528,12 @@ void DJIMotorControl()
         motor = dji_motor_instance[i];
         group = motor->sender_group;
         num = motor->message_num;
+        if (motor->stop_flag != MOTOR_STOP && (!motor->daemon || !DaemonIsOnline(motor->daemon)))
+        {
+            /* Feedback recovery must never resume a previous test target. */
+            DJIMotorStop(motor);
+            motor->motor_controller.pid_ref = 0.0f;
+        }
         if (motor->stop_flag == MOTOR_STOP)
         {
             memset(sender_assignment[group].tx_buff + 2 * num, 0, sizeof(uint16_t));
@@ -500,13 +542,19 @@ void DJIMotorControl()
         motor_setting = &motor->motor_settings;
         motor_controller = &motor->motor_controller;
         measure = &motor->measure;
+        if ((motor_setting->outer_loop_type & ANGLE_LOOP) && (!motor->daemon || !DaemonIsOnline(motor->daemon)))
+        {
+            DJIMotorResetController(motor);
+            memset(sender_assignment[group].tx_buff + 2 * num, 0, sizeof(uint16_t));
+            continue;
+        }
         pid_ref = motor_controller->pid_ref; // 保存设定值,防止motor_controller->pid_ref在计算过程中被修改
         if (motor_setting->motor_reverse_flag == MOTOR_DIRECTION_REVERSE)
             pid_ref *= -1; // 设置反转
 
         // pid_ref会顺次通过被启用的闭环充当数据的载体
         // 计算位置环,只有启用位置环且外层闭环为位置时会计算速度环输出
-        if ((motor_setting->close_loop_type & ANGLE_LOOP) && motor_setting->outer_loop_type == ANGLE_LOOP)
+        if ((motor_setting->close_loop_type & ANGLE_LOOP) && (motor_setting->outer_loop_type & ANGLE_LOOP))
         {
             if (motor_setting->angle_feedback_source == OTHER_FEED)
                 pid_measure = *motor_controller->other_angle_feedback_ptr;

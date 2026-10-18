@@ -2,6 +2,8 @@
 #include "bsp_dwt.h" // 后续通过定时器来计时?
 #include "stdlib.h"
 #include "memory.h"
+#include "string.h"
+#include "cmsis_os.h"
 
 // 用于保存所有的daemon instance
 static DaemonInstance *daemon_instances[DAEMON_MX_CNT] = {NULL};
@@ -9,7 +11,11 @@ static uint8_t idx; // 用于记录当前的daemon instance数量,配合回调�
 
 DaemonInstance *DaemonRegister(Daemon_Init_Config_s *config)
 {
+    if (idx >= DAEMON_MX_CNT)
+        return NULL;
     DaemonInstance *instance = (DaemonInstance *)malloc(sizeof(DaemonInstance));
+    if (!instance)
+        return NULL;
     memset(instance, 0, sizeof(DaemonInstance));
 
     instance->owner_id = config->owner_id;
@@ -18,6 +24,23 @@ DaemonInstance *DaemonRegister(Daemon_Init_Config_s *config)
 
     daemon_instances[idx++] = instance;
     return instance;
+}
+
+void DaemonUnregister(DaemonInstance *instance)
+{
+    if (!instance)
+        return;
+    vTaskSuspendAll();
+    for (uint8_t i = 0; i < idx; i++)
+    {
+        if (daemon_instances[i] != instance)
+            continue;
+        memmove(&daemon_instances[i], &daemon_instances[i + 1], (idx - i - 1) * sizeof(daemon_instances[0]));
+        daemon_instances[--idx] = NULL;
+        free(instance);
+        break;
+    }
+    xTaskResumeAll();
 }
 
 /* "喂狗"函数 */
@@ -33,6 +56,8 @@ uint8_t DaemonIsOnline(DaemonInstance *instance)
 
 void DaemonTask()
 {
+    /* Callbacks may use their owners; deletion must not preempt this traversal. */
+    vTaskSuspendAll();
     DaemonInstance *dins; // 提高可读性同时降低访存开销
     for (size_t i = 0; i < idx; ++i)
     {
@@ -44,6 +69,7 @@ void DaemonTask()
             dins->callback(dins->owner_id); // module内可以将owner_id强制类型转换成自身类型从而调用特定module的offline callback
         }
     }
+    xTaskResumeAll();
 }
 // (需要id的原因是什么?) 下面是copilot的回答!
 // 需要id的原因是因为有些module可能有多个实例,而我们需要知道具体是哪个实例offline

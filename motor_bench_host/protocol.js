@@ -29,12 +29,14 @@ export const FrameType = {
   PID_SET: 0x0a,
   PID_QUERY: 0x0b,
   MOTOR_UNBIND: 0x0c,
+  LOOP_SET: 0x0d,
   TELEMETRY: 0x81,
   INVENTORY_REPORT: 0x82,
   MOTOR_ADD_ACK: 0x8a,
   PID_REPORT: 0x8b,
   PID_SET_ACK: 0x8c,
   UNBIND_ACK: 0x8d,
+  LOOP_SET_ACK: 0x8e,
 };
 
 /** 电机种类,需与固件 MB_MotorKind_e 一致 */
@@ -46,6 +48,7 @@ export const MotorKind = {
   DM: 4,
   LK: 5,
   HT: 6,
+  DM8009P: 7,
 };
 
 export const MotorKindLabel = {
@@ -53,6 +56,7 @@ export const MotorKindLabel = {
   [MotorKind.M3508]: '大疆 M3508',
   [MotorKind.M2006]: '大疆 M2006',
   [MotorKind.DM]: 'DM4310',
+  [MotorKind.DM8009P]: 'DM8009P',
   [MotorKind.LK]: 'LK9025',
   [MotorKind.HT]: 'HT04',
 };
@@ -91,7 +95,7 @@ export function usesDjiIdSegment(kind) {
  * @returns {boolean} true = 界面上要给 rx_id 输入框
  */
 export function needsRxId(kind) {
-  return kind === MotorKind.DM;
+  return kind === MotorKind.DM || kind === MotorKind.DM8009P;
 }
 
 /**
@@ -427,13 +431,13 @@ export const MBResult = {
 /** 返回码 → 给人看的原因(直接用于界面提示) */
 export const MBResultText = {
   [MBResult.OK]: '成功',
-  [MBResult.BAD_PARAM]: '参数不合法(总线只能填 1 或 2,ID 不能为 0)',
+  [MBResult.BAD_PARAM]: '参数无效、超出允许范围或通道未就绪',
   [MBResult.DUPLICATE]:
     '冲突:该总线上已有电机占用同一 ID。' +
     '注意 6020 用 0x204+ID、3508/2006 用 0x200+ID,两者区间重叠,必须分开挂在不同 CAN 总线上',
   [MBResult.NOT_PROVISIONED]: '板端没有这颗电机,请先刷新清单',
   [MBResult.NOT_ENABLED]: '通道未使能',
-  [MBResult.UNSUPPORTED]: '该电机种类尚未接入测试台',
+  [MBResult.UNSUPPORTED]: '当前固件不支持该操作、电机类型或控制环',
   [MBResult.NO_RESOURCE]: '资源不足:该 CAN 总线的滤波器已用完(每条总线最多 14 颗)',
 };
 
@@ -556,13 +560,13 @@ export const PID_DEFAULTS = {
   [MotorKind.M3508]: {
     speed: { Kp: 3, Ki: 0, Kd: 0, MaxOut: 15000, IntegralLimit: 10000, improve: 0 },
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 15000, IntegralLimit: 10000, improve: 0 },
-    angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+    angle: { Kp: 4, Ki: 0, Kd: 0, MaxOut: 600, IntegralLimit: 0, improve: 1 },
   },
   // 大疆 M2006
   [MotorKind.M2006]: {
     speed: { Kp: 2, Ki: 0, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
-    angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+    angle: { Kp: 4, Ki: 0, Kd: 0, MaxOut: 600, IntegralLimit: 0, improve: 1 },
   },
   // 大疆 GM6020
   [MotorKind.GM6020]: {
@@ -570,11 +574,17 @@ export const PID_DEFAULTS = {
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 0 },
     angle: { Kp: 8, Ki: 0, Kd: 0, MaxOut: 500, IntegralLimit: 100, improve: 5 },
   },
-  // 达妙 MIT 速度环输出为 N*m;空载调试起点,与固件工厂默认值一致。
+  // DM4310 用户指定速度环默认值；MIT 速度环输出为 N*m，与固件工厂一致。
   [MotorKind.DM]: {
-    speed: { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 0.5, IntegralLimit: 0, improve: 1 },
+    speed: { Kp: 0.65, Ki: 12, Kd: 0, MaxOut: 15, IntegralLimit: 1000, improve: 1 },
     current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
-    angle: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+    angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
+  },
+  // User-confirmed commissioning ceiling; keep gains gentle, tune for load.
+  [MotorKind.DM8009P]: {
+    speed: { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 0, improve: 1 },
+    current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+    angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
   },
 };
 
@@ -584,12 +594,12 @@ export const PID_DEFAULTS = {
  * 负载布局(20 字节):
  *   channel_id(1) loop(1) improve_flags(1) reserved(1)
  *   Kp(2) Ki(2) Kd(2)              u16 LE 定点 x100
- *   MaxOut(4) IntegralLimit(4)     s32 LE 整数值
+ *   MaxOut(4) IntegralLimit(4)     s32 LE，reserved bit0=1 时按 x1000 编码
  *   tail_pad(2)
  *
  * @param {number} channelId 通道号
  * @param {number} loop       PidLoop 枚举
- * @param {{Kp:number,Ki:number,Kd:number,MaxOut:number,IntegralLimit:number,improve?:number}} pid
+ * @param {{Kp:number,Ki:number,Kd:number,MaxOut:number,IntegralLimit:number,improve?:number,scaledLimits?:boolean}} pid
  * @returns {Buffer}
  */
 export function buildSetPid(channelId, loop, pid) {
@@ -610,12 +620,13 @@ export function buildSetPid(channelId, loop, pid) {
   b[0] = channelId & 0xff;
   b[1] = loop & 0xff;
   b[2] = (pid.improve ?? 0) & 0xff;  /* improve 只用低 8 位 */
-  b[3] = 0;                           /* reserved */
+  const limitScale = pid.scaledLimits ? 1000 : 1;
+  b[3] = pid.scaledLimits ? 1 : 0;
   b.writeUInt16LE(Math.round((pid.Kp ?? 0) * 100), 4);
   b.writeUInt16LE(Math.round((pid.Ki ?? 0) * 100), 6);
   b.writeUInt16LE(Math.round((pid.Kd ?? 0) * 100), 8);
-  b.writeInt32LE(Math.round(pid.MaxOut ?? 0), 10);
-  b.writeInt32LE(Math.round(pid.IntegralLimit ?? 0), 14);
+  b.writeInt32LE(Math.round((pid.MaxOut ?? 0) * limitScale), 10);
+  b.writeInt32LE(Math.round((pid.IntegralLimit ?? 0) * limitScale), 14);
   b.fill(0, 18); // tail_pad
 
   return buildFrame(FrameType.PID_SET, b);
@@ -657,7 +668,8 @@ export function parsePidReport(payload) {
 
   // 数组基址:kp@4, ki@10, kd@16(各 6 字节), maxout@22, intlim@34(各 12 字节), improve@46
   const q16 = (arr, li) => payload.readUInt16LE(4 + arr * 6 + li * 2) / 100;
-  const q32 = (arr, li) => payload.readInt32LE(22 + arr * 12 + li * 4);
+  const limitScale = (payload[2] & 1) ? 1000 : 1;
+  const q32 = (arr, li) => payload.readInt32LE(22 + arr * 12 + li * 4) / limitScale;
   const imp = (li) => payload[46 + li];
 
   return {
@@ -711,6 +723,15 @@ export function parseUnbindAck(payload) {
   return { channelId: payload[0], result: payload[1] };
 }
 
+export function buildSetLoop(channelId, mask) {
+  return buildFrame(FrameType.LOOP_SET, Buffer.from([channelId, mask]));
+}
+
+export function parseLoopSetAck(payload) {
+  if (payload.length < 3) return null;
+  return { channelId: payload[0], mask: payload[1], result: payload[2] };
+}
+
 /* ---------------- 上报帧构造(用于自测与上位机模拟) ---------------- */
 
 /**
@@ -718,13 +739,13 @@ export function parseUnbindAck(payload) {
  *
  * @note 与固件 MB_HeartbeatAck_s 一致的统一格式:
  *         head type len body(len) crc tail
- *       body = fw_major fw_minor inventory flags uptime(2) seq(2) = 9 字节
+ *       body = fw_major fw_minor inventory flags uptime(2) seq(2) = 8 字节
  *
  * @param {{fwMajor?:number,fwMinor?:number,inventory?:number,flags?:number,uptime?:number,seq?:number}} f
  * @returns {Buffer}
  */
 export function buildHeartbeatAck(f = {}) {
-  const body = Buffer.alloc(9);
+  const body = Buffer.alloc(8);
   body[0] = f.fwMajor ?? 1;
   body[1] = f.fwMinor ?? 0;
   body[2] = f.inventory ?? 0;
@@ -768,12 +789,12 @@ export function buildTelemetry(items, seq = 0) {
 
 /**
  * 心跳应答解析
- * 布局:head(1) type(1) len(1) body(9) crc(1) tail(1)
+ * 布局:head(1) type(1) len(1) body(8) crc(1) tail(1)
  *       body = fw_major fw_minor inventory flags uptime(2) seq(2)
  * @param {Buffer} payload 帧负载(由 FrameParser 给出)
  */
 export function parseHeartbeatAck(payload) {
-  if (payload.length < 9) return null;
+  if (payload.length < 8) return null;
   return {
     fwVersion: `${payload[0]}.${payload[1]}`,
     inventoryCount: payload[2],

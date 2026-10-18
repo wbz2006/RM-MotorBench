@@ -33,6 +33,8 @@ typedef struct
  * @return DaemonInstance* 返回实例指针
  */
 DaemonInstance *DaemonRegister(Daemon_Init_Config_s *config);
+/** Remove a task-owned instance before freeing its owner. */
+void DaemonUnregister(DaemonInstance *instance);
 
 /**
  * @brief 当模块收到新的数据或进行其他动作时,调用该函数重载temp_count,相当于"喂狗"

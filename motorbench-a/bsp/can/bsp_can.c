@@ -10,25 +10,47 @@
 // @todo: 后续为每个CAN总线单独添加一个can_instance指针数组,提高回调查找的性能
 static CANInstance *can_instance[CAN_MX_REGISTER_CNT] = {NULL};
 static uint8_t idx; // 全局CAN实例索引,每次有新的模块注册会自增
+static uint32_t can_tx_started[2][3];
+static uint8_t can_tx_tracked[2];
 
-/*
- * filter bank 索引池(CAN1: 0-13, CAN2: 14-27,共 28 个)
- *
- * @attention 这两个计数原先是 CANAddFilter() 内的 static 局部变量,
- *            只能递增、无法回收,导致电机反复增删会很快耗尽过滤器。
- *            现提升为文件作用域,配合 CANUnregister() 回收,
- *            以支持运行期动态创建/销毁电机(测试台按电调实际 ID 现场配置)。
- */
-static uint8_t can1_filter_idx = 0;
-static uint8_t can2_filter_idx = 14;
+static void CANExpireTx(CAN_HandleTypeDef *handle)
+{
+    uint8_t bus = handle == &hcan1 ? 0 : 1;
+    uint32_t now = HAL_GetTick();
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        uint32_t mailbox = CAN_TX_MAILBOX0 << i;
+        if (!(can_tx_tracked[bus] & mailbox))
+            continue;
+        if (!HAL_CAN_IsTxMessagePending(handle, mailbox))
+            can_tx_tracked[bus] &= ~mailbox;
+        else if ((uint32_t)(now - can_tx_started[bus][i]) >= 10u)
+        {
+            /* No peer ACK: never replay an old test output after reconnect. */
+            HAL_CAN_AbortTxRequest(handle, mailbox);
+            can_tx_tracked[bus] &= ~mailbox;
+        }
+    }
+}
+
+void CANServiceTask(void)
+{
+    if (!idx)
+        return;
+    CANExpireTx(&hcan1);
+    CANExpireTx(&hcan2);
+}
+
+/* Track occupied banks, so deleting a middle motor cannot overwrite a peer's filter. */
+static uint16_t can_filter_used[2];
 
 /** CAN1/CAN2 各自可用的 filter bank 总数(F427 双 CAN 共享 28 个,各 14 个) */
 #define CAN_FILTER_BANK_TOTAL 14u
 
 /** 取该总线的过滤器索引池指针 */
-static uint8_t *CANFilterIdxPtr(CAN_HandleTypeDef *handle)
+static uint16_t *CANFilterMaskPtr(CAN_HandleTypeDef *handle)
 {
-    return (handle == &hcan1) ? &can1_filter_idx : &can2_filter_idx;
+    return &can_filter_used[handle == &hcan1 ? 0 : 1];
 }
 
 /** 取该总线索引池的起始 bank 号(CAN1 从 0,CAN2 从 14) */
@@ -39,7 +61,14 @@ static uint8_t CANFilterBankBase(CAN_HandleTypeDef *handle)
 
 uint8_t CANGetFilterUsed(CAN_HandleTypeDef *can_handle)
 {
-    return (uint8_t)(*CANFilterIdxPtr(can_handle) - CANFilterBankBase(can_handle));
+    uint16_t mask = *CANFilterMaskPtr(can_handle);
+    uint8_t count = 0;
+    while (mask)
+    {
+        count += mask & 1u;
+        mask >>= 1;
+    }
+    return count;
 }
 
 uint8_t CANGetFilterFree(CAN_HandleTypeDef *can_handle)
@@ -61,9 +90,7 @@ static void CANReleaseFilter(CAN_HandleTypeDef *handle, uint8_t bank)
     f.FilterActivation = CAN_FILTER_DISABLE; // 禁用即释放
     HAL_CAN_ConfigFilter(handle, &f);
 
-    uint8_t *pool = CANFilterIdxPtr(handle);
-    if (*pool > CANFilterBankBase(handle))
-        (*pool)--;
+    *CANFilterMaskPtr(handle) &= ~(1u << (bank - CANFilterBankBase(handle)));
 }
 
 /**
@@ -71,13 +98,15 @@ static void CANReleaseFilter(CAN_HandleTypeDef *handle, uint8_t bank)
  *
  * @note 配合 CANRegister() 支持运行期动态增删电机。
  *       调用前务必先让对应电机停止输出(如 DJIMotorStop/DMMotorStop),
- *       并等待至少一个控制周期,使 motor_task 不再访问该实例。
+ *       从电机控制注册表中移除后，由同一个 motor_task 调用。
  */
 uint8_t CANUnregister(CANInstance *_instance)
 {
     if (!_instance)
         return 1;
 
+    uint32_t irq_state = __get_PRIMASK();
+    __disable_irq(); /* CAN RX interrupts traverse this registry. */
     for (size_t i = 0; i < idx; i++)
     {
         if (can_instance[i] == _instance)
@@ -91,9 +120,11 @@ uint8_t CANUnregister(CANInstance *_instance)
             idx--;
 
             free(_instance); // 释放 malloc 出来的空间
+            __set_PRIMASK(irq_state);
             return 0;
         }
     }
+    __set_PRIMASK(irq_state);
     return 1; // 未找到
 }
 
@@ -114,15 +145,19 @@ uint8_t CANUnregister(CANInstance *_instance)
  */
 static void CANAddFilter(CANInstance *_instance)
 {
-    CAN_FilterTypeDef can_filter_conf;
-    uint8_t *pool = CANFilterIdxPtr(_instance->can_handle);
+    CAN_FilterTypeDef can_filter_conf = {0};
+    uint16_t *mask = CANFilterMaskPtr(_instance->can_handle);
+    uint8_t slot = 0;
+    while (*mask & (1u << slot))
+        slot++;
+    *mask |= 1u << slot;
 
     can_filter_conf.FilterMode = CAN_FILTERMODE_IDLIST;  //使用id list模式,即只有将rxid添加到过滤器中才会接收到,其他报文会被过滤
     can_filter_conf.FilterScale = CAN_FILTERSCALE_16BIT; //使用16位id模式,即只有低16位有效
     can_filter_conf.FilterFIFOAssignment = (_instance->tx_id & 1) ? CAN_RX_FIFO0 : CAN_RX_FIFO1; //奇数id的模块会被分配到FIFO0,偶数id的模块会被分配到FIFO1
     can_filter_conf.SlaveStartFilterBank = 14; // 从第14个过滤器开始配置从机过滤器(在STM32的BxCAN控制器中CAN2是CAN1的从机)
     can_filter_conf.FilterIdLow = _instance->rx_id << 5; // 过滤器寄存器的低16位,因为使用STDID,所以只有低11位有效,高5位要填0
-    can_filter_conf.FilterBank = (*pool)++; // 使用文件作用域的索引池,便于 CANUnregister() 回收
+    can_filter_conf.FilterBank = CANFilterBankBase(_instance->can_handle) + slot;
     can_filter_conf.FilterActivation = CAN_FILTER_ENABLE; // 启用过滤器
 
     /* 记录本实例占用的 bank,供 CANUnregister() 精确禁用 */
@@ -216,17 +251,33 @@ CANInstance *CANRegister(CAN_Init_Config_s *config)
 /* 如果让CANinstance保存txbuff,会增加一次复制的开销 */
 uint8_t CANTransmit(CANInstance *_instance,uint8_t timeout)
 {
-    float dwt_start = DWT_GetTimeline_ms();
-    while (HAL_CAN_GetTxMailboxesFreeLevel(_instance->can_handle) == 0) // 等待邮箱空闲
-    {    
-        if (DWT_GetTimeline_ms() - dwt_start > timeout) // 超时
-        {
+    CANExpireTx(_instance->can_handle);
+    uint8_t bus = _instance->can_handle == &hcan1 ? 0 : 1;
+    if (!HAL_CAN_GetTxMailboxesFreeLevel(_instance->can_handle))
+    {
+        /* A healthy 1 Mbps bus can have three fresh frames queued. Give it
+         * at most 250 us so later motors are not starved by fixed send order.
+         * Old pending frames indicate an unavailable bus: do not wait there. */
+        if (!timeout)
             return 0;
-        }
+        for (uint8_t i = 0; i < 3; i++)
+            if ((can_tx_tracked[bus] & (CAN_TX_MAILBOX0 << i)) &&
+                (uint32_t)(HAL_GetTick() - can_tx_started[bus][i]) >= 2u)
+                return 0;
+        float start = DWT_GetTimeline_ms();
+        while (!HAL_CAN_GetTxMailboxesFreeLevel(_instance->can_handle))
+            if (DWT_GetTimeline_ms() - start >= 0.25f)
+                return 0;
     }
-    // tx_mailbox会保存实际填入了这一帧消息的邮箱,但是知道是哪个邮箱发的似乎也没啥用
-    HAL_CAN_AddTxMessage(_instance->can_handle, &_instance->txconf, _instance->tx_buff, &_instance->tx_mailbox);
-    return 1; // 发送成功
+    if (HAL_CAN_AddTxMessage(_instance->can_handle, &_instance->txconf, _instance->tx_buff, &_instance->tx_mailbox) != HAL_OK)
+        return 0;
+    for (uint8_t i = 0; i < 3; i++)
+        if (_instance->tx_mailbox & (CAN_TX_MAILBOX0 << i))
+        {
+            can_tx_started[bus][i] = HAL_GetTick();
+            can_tx_tracked[bus] |= CAN_TX_MAILBOX0 << i;
+        }
+    return 1; /* Queued, not proof of a motor reply. */
 }
 
 void CANSetDLC(CANInstance *_instance, uint8_t length)

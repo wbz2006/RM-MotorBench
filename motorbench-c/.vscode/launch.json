@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: MotorBench C ST-Link",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "deviceName": "STM32F407IGH6",
+            "deviceCore": "Cortex-M4",
+            "runEntry": "main",
+            "serverInterface": "SWD",
+            "imagesAndSymbols": [
+                {"imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"}
+            ]
+        },
+        {
+            "type": "jlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: MotorBench C J-Link",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "deviceName": "STM32F407IGH6",
+            "deviceCore": "Cortex-M4",
+            "serverDevice": "STM32F407IG",
+            "runEntry": "main",
+            "serverInterface": "SWD",
+            "imagesAndSymbols": [
+                {"imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"}
+            ]
+        }
+    ]
+}

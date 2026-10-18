@@ -31,6 +31,12 @@ motorbench-a/.vscode/*
 !motorbench-a/.vscode/extensions.json
 !motorbench-a/.vscode/tasks.json
 !motorbench-a/.vscode/launch.json
+!motorbench-c/.vscode/
+motorbench-c/.vscode/*
+!motorbench-c/.vscode/settings.json
+!motorbench-c/.vscode/extensions.json
+!motorbench-c/.vscode/tasks.json
+!motorbench-c/.vscode/launch.json
 CMakeUserPresets.json
 *.su
 

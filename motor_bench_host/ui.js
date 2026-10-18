@@ -23,15 +23,8 @@ import {
 } from './protocol.js';
 import { ensureChart, getChartIfExists, dropChart } from './chart.js';
 import { LoopFishbone } from './fishbone.js';
-
-/**
- * 当前渲染的通道卡片数
- *
- * @note 早期是常量 4,导致板上只有 1 颗电机时页面上仍有 3 张空卡片
- *       (未绑定、读数全是 --),既占地方又容易被误认为功能异常。
- *       现在改为跟随板端清单动态调整,由 buildChannels(count) 赋值。
- */
-let CHANNEL_COUNT = 1;
+import { createSetpointProgram, sampleSetpoint } from './setpoint.js';
+import { initCalculator } from './calculator-ui.js';
 
 /** 各电机种类的参考值限幅与单位(与固件 MB_REF_LIMIT_* 及驱动量程对应) */
 const MOTOR_SPEC = {
@@ -39,6 +32,7 @@ const MOTOR_SPEC = {
   [MotorKindLabel[2]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M3508
   [MotorKindLabel[3]]: { unit: 'rpm', range: 7000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M2006
   [MotorKindLabel[4]]: { unit: 'rad/s', range: 40, feedbackLabel: '转矩', feedbackUnit: 'N·m' }, // DM4310
+  [MotorKindLabel[MotorKind.DM8009P]]: { unit: 'rad/s', range: 40, feedbackLabel: '转矩', feedbackUnit: 'N·m' },
   [MotorKindLabel[5]]: { unit: 'rad/s', range: 40 }, // LK
   [MotorKindLabel[6]]: { unit: 'rad/s', range: 40 }, // HT
 };
@@ -62,17 +56,39 @@ let channelResetPending = null;
 let channelResetTimer = null;
 let channelResetAttempts = 0;
 let serverSupportsReset = false;
+let serverSupportsLoop = false;
+let firmwareSupportsLoop = false;
+let firmwareVersion = null;
 let channelResetError = '';
 // A fresh page must never adopt telemetry from an earlier test session.
 const sessionChannels = new Set();
 const pendingUnbindChannels = new Set();
+const setpointPrograms = new Map();
+const boundLoopMasks = new Map();
+const pendingLoopChanges = new Map();
+const pendingPidApplies = new Map();
+const channelCalculators = new Map();
+
+function cancelPidResume(i) {
+  const pending = pendingPidApplies.get(i);
+  if (pending) pending.resume = false;
+}
+
+function clearPendingPid(i) {
+  clearTimeout(pendingPidApplies.get(i)?.timer);
+  pendingPidApplies.delete(i);
+}
 
 function clearTestChannels() {
+  stopAllPrograms('测试通道已清空');
+  for (const i of pendingPidApplies.keys()) clearPendingPid(i);
+  for (const i of pendingLoopChanges.keys()) clearPendingLoop(i);
+  boundLoopMasks.clear();
   channelsReady = false;
   sessionChannels.clear();
   pendingUnbindChannels.clear();
   telemetryByChannel.clear();
-  for (let i = 0; i < CHANNEL_COUNT; i++) {
+  for (const i of channelIds()) {
     const el = ch(i);
     if (!el) continue;
     el.querySelector('[data-role="motor"]').value = '';
@@ -119,7 +135,12 @@ function sendResetChannel(start = false) {
 }
 
 function canControlChannel(i) {
-  return channelsReady && sessionChannels.has(i) && telemetryByChannel.has(i);
+  return channelsReady && sessionChannels.has(i) && telemetryByChannel.has(i) && !pendingLoopChanges.has(i);
+}
+
+function clearPendingLoop(i) {
+  clearTimeout(pendingLoopChanges.get(i)?.timer);
+  pendingLoopChanges.delete(i);
 }
 
 function noteBoardResponse() {
@@ -131,8 +152,9 @@ function noteBoardResponse() {
 setInterval(() => {
   if (!boardOnline || boardLastSeen === null || Date.now() - boardLastSeen < 2000) return;
   boardOnline = false;
+  for (const i of pendingPidApplies.keys()) cancelPidResume(i);
   setLink(false, 'A 板无响应 · 数据已中断');
-  for (let i = 0; i < CHANNEL_COUNT; i++) renderChannel(i);
+  for (const i of channelIds()) renderChannel(i);
 }, 500);
 
 /** 在"添加电机"面板上显示一行结果提示 */
@@ -142,7 +164,7 @@ function showAddMsg(text, isError) {
   el.classList.toggle('error', !!isError);
 }
 
-/** DM4310 IDs are entered and displayed as hexadecimal; wire values remain numbers. */
+/** Damiao IDs are entered and displayed as hexadecimal; wire values remain numbers. */
 function readHexId(value, max, label) {
   const raw = value.trim().replace(/^0x/i, '');
   if (!/^[0-9a-f]+$/i.test(raw)) return { ok: false, value: 0, msg: `${label} 请填写十六进制 ID` };
@@ -307,6 +329,10 @@ function sendMotorEdit(command) {
 function removeRegisteredMotor(m) {
   if (pendingMotor) return;
   if (!confirm(`确定删除 ${m.label} · CAN${m.canBus} · ID ${formatMotorId(m)}？已绑定的通道将停机并解绑。`)) return;
+  for (const i of [...setpointPrograms.keys()]) {
+    const selectedKey = ch(i)?.querySelector('[data-role="motor"]').selectedOptions[0]?.dataset.motorKey;
+    if (selectedKey === `${m.kind}:${m.canBus}:${m.motorId}`) stopProgram(i, '电机删除 · 自动输出已停止');
+  }
   const rxId = m.rxId ?? 0;
   showRegistryMsg('正在删除…');
   sendMotorEdit({ type: 'removeMotor', kind: m.kind, canBus: m.canBus, motorId: m.motorId, rxId });
@@ -314,65 +340,62 @@ function removeRegisteredMotor(m) {
 
 /* ---------------- 建卡片 ---------------- */
 
-/**
- * 按板上实际电机数量生成通道卡片
- *
- * @note 早期固定生成 4 张卡片,导致板上只有 1 颗电机时,
- *   另外 3 张全是空卡片(未绑定、全是 --),既占地方又让人误以为功能异常。
- *
- * @attention 【重要·2026-10-12 修复】卡片数曾跟随"电机数"变化,
- *   导致三个实测故障:
- *     1. 添加第二颗电机后,通道 0 的电机下拉选择被清空(要重新选),
- *        但通道 0 控制的其实还是原来那颗;
- *     2. 设好的 rpm 值自动归零;
- *     3. 先 6020 后 3508 时,两个通道被一起清空,且之后无法二次绑定。
- *   根因是 buildChannels() 里那行 `host.innerHTML = ''` ——
- *   它把**所有**卡片连同已选下拉值、rpm 滑块值一起销毁。
- *   而触发重建的条件 `CHANNEL_COUNT !== inventory.length`
- *   本身就建立在错误假设上:"电机数 == 通道数"。
- *   实际上通道是独立的控制位(最多 MB_CHANNEL_MAX = 8),
- *   一颗电机绑到哪个通道都行,与电机总数无关。
- *
- *   正确做法:卡片数**只增不减**,且只在"用户明显需要更多通道"时增长
- *   (即电机数超过当前卡片数),增长时**保留既有卡片的全部状态**。
- *   这样加电机不会碰已有通道的任何界面状态。
- */
-function buildChannels(count = null) {
+/** Match the motor inventory while retaining surviving cards and firmware IDs. */
+function buildChannels(count = inventory.length) {
   const host = $('#channels');
   const tpl = $('#channelTpl');
-
-  /*
-   * 只增不减:目标数量取"当前已有"与"新请求"的较大者。
-   * @note 传 null 表示"按现有电机数补足",但绝不缩回 ——
-   *       删掉一张用户正在用的卡片,等于凭空丢失该通道的绑定与参数。
-   */
-  const want = Number.isInteger(count) && count > 0 ? count : 0;
-  const have = host.querySelectorAll('.channel').length;
-  const n = Math.max(have, want, 1);
-
-  if (have === n) {
-    CHANNEL_COUNT = n;
-    return; /* 数量没变,不要碰 DOM —— 碰了就会丢用户已填的状态 */
+  const cards = [...host.querySelectorAll('.channel')];
+  const n = Math.min(8, Math.max(0, count));
+  const validKeys = new Set(inventory.map(m => `${m.kind}:${m.canBus}:${m.motorId}`));
+  const priority = node => {
+    const key = node.querySelector('[data-role="motor"]').selectedOptions[0]?.dataset.motorKey;
+    return validKeys.has(key) ? (sessionChannels.has(Number(node.dataset.ch)) ? 3 : 2) : (key ? 0 : 1);
+  };
+  // Drop removed motors first, then unused cards. Never renumber a live channel.
+  const surplus = cards.sort((a, b) => priority(a) - priority(b) || Number(b.dataset.ch) - Number(a.dataset.ch)).slice(0, Math.max(0, cards.length - n));
+  for (const node of surplus) {
+    const i = Number(node.dataset.ch);
+    clearPendingPid(i);
+    clearPendingLoop(i);
+    stopProgram(i, '电机已删除');
+    sessionChannels.delete(i);
+    pendingUnbindChannels.delete(i);
+    boundLoopMasks.delete(i);
+    telemetryByChannel.delete(i);
+    pidStateByChannel.delete(i);
+    channelCalculators.delete(i);
+    dropChart(i);
+    dropFishbone(i);
+    node.remove();
   }
-
-  for (let i = have; i < n; i++) {
+  const added = [];
+  while (host.querySelectorAll('.channel').length < n) {
+    const used = new Set(channelIds());
+    let i = 0;
+    while (used.has(i)) i++;
     const node = tpl.content.firstElementChild.cloneNode(true);
     node.dataset.ch = String(i);
     node.querySelector('[data-role="channelIndex"]').textContent = String(i).padStart(2, '0');
     node.querySelector('.ch-title').textContent = `通道 ${i}`;
-    host.appendChild(node);
+    const next = [...host.children].find(card => Number(card.dataset.ch) > i);
+    host.insertBefore(node, next ?? null);
+    const r = role => node.querySelector(`[data-role="${role}"]`);
+    for (const name of ['preset', 'calculator']) {
+      r(`${name}Tab`).id = `ch${i}-${name}-tab`;
+      r(`${name}Panel`).id = `ch${i}-${name}-panel`;
+      r(`${name}Tab`).setAttribute('aria-controls', r(`${name}Panel`).id);
+      r(`${name}Panel`).setAttribute('aria-labelledby', r(`${name}Tab`).id);
+    }
+    channelCalculators.set(i, initCalculator(r('calculatorContent'), `ch${i}`, (result, write) => fillCalculatedTarget(i, result, write)));
+    added.push(i);
   }
-  CHANNEL_COUNT = n;
-
-  /*
-   * @attention 只给**新增**的卡片绑事件,不要重新绑定全部。
-   *   bindEvents() 内部是 `for (let i = 0; i < CHANNEL_COUNT; i++)`,
-   *   会把已有卡片的 onclick 也重写一遍。
-   *   用 onclick 赋值(而非 addEventListener)所以不会叠加,
-   *   但重写时闭包捕获的 i 若与实际通道不一致,就会出现"点通道1发的是通道0"。
-   */
+  $('#channelsEmpty').hidden = n !== 0;
   bindEvents();
-  for (let i = have; i < n; i++) renderChannel(i);
+  for (const i of added) renderChannel(i);
+}
+
+function channelIds() {
+  return [...document.querySelectorAll('#channels > .channel')].map(node => Number(node.dataset.ch));
 }
 
 function ch(i) {
@@ -382,9 +405,202 @@ function ch(i) {
 /* ---------------- 指令发送 ---------------- */
 
 function send(obj) {
+  if (obj.type === 'stopAll' || obj.type === 'resetChannels' || obj.type === 'closeSerial') {
+    for (const i of pendingPidApplies.keys()) cancelPidResume(i);
+  }
+  if (obj.type === 'unbind' || obj.type === 'setLoop' || obj.type === 'removeMotor' ||
+      (obj.type === 'enable' && !obj.enable)) {
+    if (obj.type === 'removeMotor') {
+      for (const i of pendingPidApplies.keys()) cancelPidResume(i);
+    } else cancelPidResume(obj.channelId);
+  }
+  if (pendingPidApplies.has(obj.channelId) &&
+      (obj.type === 'setRef' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
+  if (pendingLoopChanges.has(obj.channelId) &&
+      (obj.type === 'setRef' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
+  // Cancel timers before issuing a stop, so later ticks cannot restore a target.
+  if (obj.type === 'stopAll' || obj.type === 'resetChannels') stopAllPrograms('已停止');
+  if (obj.type === 'unbind' || (obj.type === 'enable' && !obj.enable)) stopProgram(obj.channelId, '已停机');
+  if (obj.type === 'pidSet') stopProgram(obj.channelId, 'PID 整定 · 自动输出已停止');
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
   else alert('与服务端未建立连接');
 }
+
+/* ---------------- 自动转速输出 ---------------- */
+
+function canRunProgram(i) {
+  const t = telemetryByChannel.get(i);
+  const mask = boundLoopMasks.get(i) || 0;
+  return canControlChannel(i) && serialConnected && boardOnline && ws.readyState === 1 &&
+    t?.online && t.enabled && performance.now() - t.receivedAt < 500 &&
+    !!(mask & LoopType.SPEED_LOOP) && !(mask & LoopType.ANGLE_LOOP) &&
+    !pendingUnbindChannels.has(i) && !pendingPidApplies.has(i) && !document.hidden;
+}
+
+function programMessage(i, message, error = false) {
+  const el = ch(i)?.querySelector('[data-role="presetStatus"]');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.toggle('error', error);
+}
+
+function setDisplayedRef(i, value) {
+  const el = ch(i);
+  if (!el) return;
+  el.querySelector('[data-role="num"]').value = String(Number(value.toFixed(3)));
+  el.querySelector('[data-role="slider"]').value = String(value);
+}
+
+function fillCalculatedTarget(i, result, write) {
+  const el = ch(i);
+  const status = el.querySelector('[data-role="calculatorWriteStatus"]');
+  status.classList.remove('error');
+  if (!result) { status.textContent = ''; return; }
+  const spec = MOTOR_SPEC[MotorKindLabel[currentChannelKind(i)]];
+  const mask = boundLoopMasks.get(i) ?? readLoopMask(i);
+  if (!spec) { status.textContent = '选择电机后，计算结果可自动填入上方转速框'; return; }
+  if (!(mask & LoopType.SPEED_LOOP) || (mask & LoopType.ANGLE_LOOP)) {
+    status.textContent = '当前为位置或电流模式，仅显示计算结果'; return;
+  }
+  if (setpointPrograms.has(i)) { status.textContent = '自动输出运行中，暂停写入转速框'; return; }
+  const value = spec.unit === 'rad/s' ? result.rotorRad : result.rotorRpm;
+  if (Math.abs(value) > spec.range) {
+    status.textContent = `计算结果超出 ${spec.range} ${spec.unit} 限幅，未写入`;
+    status.classList.add('error');
+    return;
+  }
+  if (write) setDisplayedRef(i, value);
+  const displayed = Number(el.querySelector('[data-role="num"]').value);
+  status.textContent = Math.abs(displayed - value) < 0.00051
+    ? `已填入上方转速框：${displayed} ${spec.unit} · 按 Enter 下发，或点击使能执行`
+    : '修改计算参数，结果将自动填入上方转速框';
+}
+
+function selectChannelTool(i, name) {
+  const el = ch(i);
+  el.dataset.tool = name;
+  renderChannel(i);
+  if (name === 'calculator') channelCalculators.get(i)?.fill();
+}
+
+function renderChannelTools(i, positionMode) {
+  const el = ch(i);
+  const selected = el.dataset.tool || 'preset';
+  for (const name of ['preset', 'calculator']) {
+    const tab = el.querySelector(`[data-role="${name}Tab"]`);
+    tab.setAttribute('aria-selected', String(selected === name));
+    tab.tabIndex = selected === name ? 0 : -1;
+    el.querySelector(`[data-role="${name}Panel"]`).hidden = selected !== name;
+  }
+  el.querySelector('[data-role="presetBlocker"]').hidden = !positionMode;
+  el.querySelector('[data-role="presetContent"]').inert = positionMode;
+  channelCalculators.get(i)?.refresh();
+}
+
+function renderProgram(i) {
+  const el = ch(i);
+  if (!el) return;
+  const running = setpointPrograms.has(i);
+  const positionMode = !!((boundLoopMasks.get(i) ?? readLoopMask(i)) & LoopType.ANGLE_LOOP);
+  const mode = el.querySelector('[data-role="presetMode"]').value;
+  el.querySelector('[data-role="presetPanel"]').dataset.running = String(running);
+  el.querySelector('[data-role="presetSine"]').hidden = mode !== 'sine';
+  el.querySelector('[data-role="presetSteps"]').hidden = mode !== 'steps';
+  for (const input of el.querySelectorAll('.setpoint-program input, .setpoint-program select')) input.disabled = running || positionMode;
+  el.querySelector('[data-role="presetStart"]').disabled = running || !canRunProgram(i);
+  el.querySelector('[data-role="presetStart"]').textContent = running ? '正在输出…' : '▶ 启动预设';
+  el.querySelector('[data-role="presetStop"]').disabled = !running;
+  for (const role of ['num', 'slider']) el.querySelector(`[data-role="${role}"]`).disabled = running || !canControlChannel(i) || pendingPidApplies.has(i);
+}
+
+function stopProgram(i, message, zero = false) {
+  const state = setpointPrograms.get(i);
+  if (!state) return;
+  clearInterval(state.timer);
+  setpointPrograms.delete(i);
+  setDisplayedRef(i, 0);
+  if (zero && ws.readyState === 1 && canControlChannel(i)) send({ type: 'setRef', channelId: i, ref: 0 });
+  programMessage(i, message);
+  renderProgram(i);
+}
+
+function stopAllPrograms(message, disable = false) {
+  for (const i of [...setpointPrograms.keys()]) {
+    stopProgram(i, message);
+    if (disable && ws.readyState === 1) send({ type: 'enable', channelId: i, enable: false });
+  }
+}
+
+function tickProgram(i) {
+  const state = setpointPrograms.get(i);
+  if (!state) return;
+  const now = performance.now();
+  if (!canRunProgram(i) || now - state.lastTick > 250 || (ws.bufferedAmount || 0) > 1024) {
+    stopProgram(i, '输出已中止 · 请检查连接与电机状态后重新启动');
+    if (ws.readyState === 1) send({ type: 'enable', channelId: i, enable: false });
+    return;
+  }
+  state.lastTick = now;
+  const elapsed = (now - state.startedAt) / 1000;
+  const point = sampleSetpoint(state.program, elapsed);
+  if (point.done) return stopProgram(i, '预设已完成 · 目标已归零', true);
+  // Steps only need a new command at a transition; sine is sampled at 20 Hz.
+  if (state.lastRef === undefined || state.program.mode === 'sine' || point.ref !== state.lastRef) {
+    send({ type: 'setRef', channelId: i, ref: point.ref });
+    state.lastRef = point.ref;
+    setDisplayedRef(i, point.ref);
+  }
+  const step = point.step ? ` · 第 ${point.step}/${state.program.steps.length} 级` : '';
+  programMessage(i, `第 ${point.cycle}/${state.program.cycles} 轮${step} · ${elapsed.toFixed(1)} / ${state.program.duration.toFixed(1)} s`);
+}
+
+function startProgram(i) {
+  if (setpointPrograms.has(i)) return;
+  if (!canRunProgram(i)) return programMessage(i, '请先绑定并使能速度环电机，等待最新反馈', true);
+  const el = ch(i);
+  const r = (role) => el.querySelector(`[data-role="${role}"]`);
+  const spec = MOTOR_SPEC[MotorKindLabel[currentChannelKind(i)]];
+  try {
+    const program = createSetpointProgram({
+      mode: r('presetMode').value,
+      cycles: r('presetCycles').valueAsNumber,
+      amplitude: r('presetAmplitude').valueAsNumber,
+      offset: r('presetOffset').valueAsNumber,
+      period: r('presetPeriod').valueAsNumber,
+      steps: r('presetValues').value,
+      dwell: r('presetDwell').valueAsNumber,
+    }, spec.range);
+    const now = performance.now();
+    const state = { program, startedAt: now, lastTick: now, timer: null };
+    setpointPrograms.set(i, state);
+    state.timer = setInterval(() => tickProgram(i), 50);
+    renderProgram(i);
+    tickProgram(i);
+  } catch (error) {
+    programMessage(i, error.message, true);
+  }
+}
+
+// Browsers throttle background timers. End the test instead of extending a step.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    for (const i of pendingPidApplies.keys()) cancelPidResume(i);
+    stopAllPrograms('页面已转入后台 · 自动输出已停止', true);
+  }
+});
+
+// Capture Space even in inputs; suppress button activation on both key edges.
+document.addEventListener('keydown', event => {
+  if (event.code !== 'Space') return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (!event.repeat) send({ type: 'stopAll' });
+}, true);
+document.addEventListener('keyup', event => {
+  if (event.code !== 'Space') return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}, true);
 
 /* ---------------- 渲染 ---------------- */
 
@@ -407,7 +623,7 @@ function renderChannel(i) {
     badge.textContent = '数据中断';
     badge.className = 'badge offline';
   } else if (!t.online) {
-    badge.textContent = '离线';
+    badge.textContent = '离线 · 自动重连中';
     badge.className = 'badge offline';
   } else if (t.enabled) {
     badge.textContent = '运行中';
@@ -419,12 +635,24 @@ function renderChannel(i) {
 
   const r = (role) => el.querySelector(`[data-role="${role}"]`);
   const spec = MOTOR_SPEC[MotorKindLabel[currentChannelKind(i)]];
-  const speedUnit = spec?.unit || 'rpm';
+  const positionMode = !!((boundLoopMasks.get(i) ?? readLoopMask(i)) & LoopType.ANGLE_LOOP);
+  const speedUnit = positionMode ? 'deg' : (spec?.unit || 'rpm');
+  const primaryLabel = positionMode ? '实测位置' : '实测转速';
   const feedbackLabel = spec?.feedbackLabel || '反馈';
   const feedbackUnit = spec?.feedbackUnit || 'raw';
-  r('speedLegend').textContent = `实测转速（${speedUnit}）`;
+  r('speedLegend').textContent = `${primaryLabel}（${speedUnit}）`;
   r('torqueLegend').textContent = `${feedbackLabel}（${feedbackUnit}）`;
-  r('chart').setAttribute('aria-label', `转速（${speedUnit}）与${feedbackLabel}（${feedbackUnit}）实时曲线`);
+  r('chart').setAttribute('aria-label', `${primaryLabel}（${speedUnit}）与${feedbackLabel}（${feedbackUnit}）实时曲线`);
+  r('targetTitle').textContent = positionMode ? '目标位置 · 每次使能时当前位置为 0°' : '目标设定';
+  r('unit').textContent = speedUnit;
+  r('slider').min = String(positionMode ? -360 : -(spec?.range || 6000));
+  r('slider').max = String(positionMode ? 360 : (spec?.range || 6000));
+  r('slider').step = positionMode ? '0.1' : '0.001';
+  r('num').step = positionMode ? '0.1' : '0.001';
+  r('num').title = positionMode ? '相对本次使能零点的转子角度（deg），范围 ±360°' : '精确输入目标转速后下发';
+  r('num').setAttribute('aria-label', positionMode ? '目标位置角度' : '目标转速数值');
+  r('slider').setAttribute('aria-label', positionMode ? '目标位置角度' : '目标转速');
+  renderChannelTools(i, positionMode);
   if (!t) r('chart').removeAttribute('title');
   getChartIfExists(i)?.setUnits(speedUnit, feedbackUnit);
   const controllable = canControlChannel(i);
@@ -432,6 +660,31 @@ function renderChannel(i) {
   r('motor').disabled = !channelsReady || !!t;
   r('unbind').disabled = !channelsReady || !sessionChannels.has(i);
   for (const role of ['enable', 'zero', 'num', 'slider']) r(role).disabled = !controllable;
+  const loopLockReason = pendingLoopChanges.has(i) ? '正在确认闭环切换；超时后请解绑重试' :
+    pendingUnbindChannels.has(i) ? '正在解绑，等待板端确认' :
+    !sessionChannels.has(i) ? '' :
+    !channelsReady ? '测试通道未就绪，请等待清理完成或重新连接' :
+    !serverSupportsLoop ? '后台未支持闭环切换，请重启 Node 服务后刷新网页' :
+    !firmwareSupportsLoop ? (firmwareVersion ? `当前固件 ${firmwareVersion} 不支持绑定后切换，请更新到 1.6` :
+      '未收到有效固件心跳，闭环切换暂不可用；请确认已烧录 1.6 并重连') : '';
+  r('loopStatus').textContent = loopLockReason;
+  r('loopStatus').hidden = !loopLockReason;
+  for (const node of el.querySelectorAll('.fb-node:not(.is-locked)')) {
+    const locked = !!loopLockReason;
+    if (locked && !node.disabled) node.dataset.unboundTitle = node.title;
+    node.disabled = locked;
+    if (locked) node.title = loopLockReason;
+    else if (node.dataset.unboundTitle) {
+      node.title = node.dataset.unboundTitle;
+      delete node.dataset.unboundTitle;
+    }
+  }
+  for (const role of ['pidApply', 'pidQuery', 'pidReset', 'pKp', 'pKi', 'pKd', 'pMaxOut', 'pIntLim'])
+    r(role).disabled = !controllable;
+  r('pidApply').disabled = !controllable || pendingPidApplies.has(i);
+  r('pidQuery').disabled = !controllable || pendingPidApplies.has(i);
+  r('enable').disabled = !controllable || !t?.online || (pendingPidApplies.has(i) && !t?.enabled);
+  renderProgram(i);
 
   /*
    * 数字读数行已于 2026-10-13 移除 —— 曲线已呈现这些量的走势,
@@ -473,12 +726,14 @@ function renderChannel(i) {
    *   是因为 renderChannel 还会在解绑、断连时以 t=null 被调用,
    *   此时不喂点、只重绘,曲线会自然停住而不是被 0 值拉一条直线到底。
    */
-  if (t && boardOnline) {
+  if (t?.online && boardOnline) {
     const canvas = el.querySelector('[data-role="chart"]');
     if (canvas) {
       const c = ensureChart(i, canvas);
       c.setUnits(speedUnit, feedbackUnit);
-      canvas.title = `最近遥测：转速 ${fmt(t.speed, 3)} ${speedUnit}；${feedbackLabel} ${fmt(t.torque, 3)} ${feedbackUnit}（曲线按当前滤波设置显示）`;
+      canvas.title = positionMode
+        ? `最近遥测：位置 ${fmt(t.angle, 3)} deg；转速 ${fmt(t.speed, 3)} ${spec?.unit || 'rpm'}；${feedbackLabel} ${fmt(t.torque, 3)} ${feedbackUnit}`
+        : `最近遥测：转速 ${fmt(t.speed, 3)} ${speedUnit}；${feedbackLabel} ${fmt(t.torque, 3)} ${feedbackUnit}（曲线按当前滤波设置显示）`;
       /*
        * 把界面上的滤波设置同步到实例。
        *
@@ -493,7 +748,8 @@ function renderChannel(i) {
       if (fOn) c.setFilter(fOn.checked);
       if (fAlpha) c.setFilterAlpha(fAlpha.value);
 
-      c.push(t.speed, t.torque, t.ref);
+      if (positionMode) c.push(t.angle, t.torque, t.ref);
+      else c.push(t.speed, t.torque, t.ref);
     }
   }
 }
@@ -520,9 +776,46 @@ function ensureFishbone(i) {
   if (!host) return null;
 
   const fb = new LoopFishbone(host);
+  fb.onChange = mask => {
+    if (sessionChannels.has(i)) {
+      if (!canControlChannel(i) || !serverSupportsLoop || !firmwareSupportsLoop) {
+        fb.setMask(boundLoopMasks.get(i));
+        return;
+      }
+      // DM MIT needs the host speed cascade to produce torque.
+      if (needsRxId(currentChannelKind(i)) && !(mask & LoopType.SPEED_LOOP)) {
+        fb.setMask(boundLoopMasks.get(i));
+        const msg = ch(i).querySelector('[data-role="pidMsg"]');
+        msg.className = 'hint error';
+        msg.textContent = `${MotorKindLabel[currentChannelKind(i)]} 需保留速度环；可切换速度控制或位置＋速度串级`;
+        return;
+      }
+      stopProgram(i, '闭环切换 · 自动输出已停止');
+      send({ type: 'enable', channelId: i, enable: false });
+      const timer = setTimeout(() => {
+        if (!pendingLoopChanges.has(i)) return;
+        const msg = ch(i)?.querySelector('[data-role="pidMsg"]');
+        if (msg) {
+          msg.className = 'hint error';
+          msg.textContent = '闭环切换未确认，控制已锁定；请解绑重试或重新连接';
+        }
+      }, 2000);
+      pendingLoopChanges.set(i, { mask, timer });
+      setDisplayedRef(i, 0);
+      const msg = ch(i).querySelector('[data-role="pidMsg"]');
+      msg.className = 'hint';
+      msg.textContent = '正在停机并切换闭环…';
+      renderChannel(i);
+      send({ type: 'setLoop', channelId: i, mask });
+      return;
+    }
+    setDisplayedRef(i, 0);
+    getChartIfExists(i)?.clear();
+    renderChannel(i);
+  };
 
   /*
-   * 悬停/聚焦/点击某个环 → 把下方 PID 卡片切到该环。
+   * 右键某个环 → 把下方 PID 卡片切到该环，不改变闭环状态。
    *
    * @note 只切环,不管开合 —— 卡片是内嵌常驻的,不需要显示/隐藏逻辑。
    *   曾经做成浮空(延时开合),在多层嵌套的卡片里定位失控,已回退。
@@ -559,10 +852,10 @@ function readLoopMask(i) {
 }
 
 /*
- * 闭环位 → PID 环选择器下标的映射。
+ * 闭环位 → PID 协议环编号的映射。
  *
- * @attention 位掩码与 pidLoop 的 <option value> 是两套编号,必须显式对应:
- *   <option value="0">速度环 / "1">电流环 / "2">位置环
+ * @attention 位掩码与 PID 协议环编号是两套编号,必须显式对应:
+ *   0=速度环 / 1=电流环 / 2=位置环
  *   而位掩码里 电流=0b0001、速度=0b0010、位置=0b0100。
  *   不映射的话,"点亮位置环"会打开速度环的参数 —— 调错环且毫无提示。
  */
@@ -584,21 +877,16 @@ const BIT_TO_PID_LOOP = {
 function focusPidLoop(i, bit) {
   const el = ch(i);
   if (!el) return;
+  if (needsRxId(currentChannelKind(i)) && bit === LoopType.CURRENT_LOOP) return;
 
   const loopVal = BIT_TO_PID_LOOP[bit];
-  const sel = el.querySelector('[data-role="pidLoop"]');
-  if (loopVal === undefined || !sel) return;
+  const panel = el.querySelector('[data-role="pidPanel"]');
+  if (loopVal === undefined || !panel) return;
 
-  sel.value = loopVal;
+  if (panel.dataset.loop === loopVal && pidStateByChannel.get(i)?.loop === Number(loopVal)) return;
+
   /* 切环后把该环的默认值填进输入框 */
   fillPidForm(i, loopVal);
-
-  /* 标题写明当前是哪个环,避免"调了半天不知道在调哪个" */
-  const title = el.querySelector('[data-role="pidTitle"]');
-  if (title) {
-    const name = { 0b0100: '位置环', 0b0010: '速度环', 0b0001: '电流环' }[bit];
-    title.textContent = name ? `${name} PID` : 'PID 整定';
-  }
 }
 
 /* ---------------- 电机下拉(固件清单) ---------------- */
@@ -609,7 +897,7 @@ function focusPidLoop(i, bit) {
  *       避免上位机下发固件里根本不存在的电机配置。
  */
 function fillMotorOptions() {
-  for (let i = 0; i < CHANNEL_COUNT; i++) {
+  for (const i of channelIds()) {
     const el = ch(i);
     if (!el) continue; // 卡片数量可能刚被重建过,跳过已不存在的卡片
     const sel = el.querySelector('[data-role="motor"]');
@@ -645,10 +933,14 @@ function fillMotorOptions() {
     /* 电机仍在清单里才恢复选中;被删了才回到未选择 */
     sel.value = restoredIdx;
     if (prevKey && restoredIdx === '') {
+      clearPendingPid(i);
+      clearPendingLoop(i);
+      stopProgram(i, '电机已删除');
       sessionChannels.delete(i);
       pendingUnbindChannels.delete(i);
       telemetryByChannel.delete(i);
       getChartIfExists(i)?.clear();
+      boundLoopMasks.delete(i);
       el.querySelector('[data-role="num"]').value = '0';
       el.querySelector('[data-role="slider"]').value = '0';
       renderChannel(i);
@@ -663,6 +955,11 @@ function fillMotorOptions() {
         el.querySelector('[data-role="unit"]').textContent = spec.unit;
         el.querySelector('[data-role="slider"]').min = String(-spec.range);
         el.querySelector('[data-role="slider"]').max = String(spec.range);
+        for (const unit of el.querySelectorAll('[data-role="presetUnit"]')) unit.textContent = spec.unit;
+        const amplitude = spec.unit === 'rad/s' ? 1 : 500;
+        el.querySelector('[data-role="presetAmplitude"]').value = String(amplitude);
+        el.querySelector('[data-role="presetOffset"]').value = '0';
+        el.querySelector('[data-role="presetValues"]').value = `0, ${amplitude}, ${amplitude * 2}, ${amplitude}, 0`;
       }
       renderChannel(i);
     };
@@ -684,10 +981,33 @@ function currentChannelKind(i) {
   return m ? m.kind : 0;
 }
 
+function pidOutputSpec(kind, loop) {
+  if (needsRxId(kind)) {
+    if (loop === 0) return { unit: 'N·m', max: kind === MotorKind.DM8009P ? 54 : 18 };
+    if (loop === 2) return { unit: 'rad/s', max: 45 }; // dmmotor.h: DM_V_MAX
+    return { unit: '', max: null };
+  }
+  return { unit: kind ? (loop === 2 ? 'deg/s' : 'raw') : '', max: null };
+}
+
+function updatePidUnits(i, kind, loop) {
+  const el = ch(i);
+  const spec = pidOutputSpec(kind, loop);
+  for (const role of ['pMaxOut', 'pIntLim']) {
+    el.querySelector(`[data-role="${role}Unit"]`).textContent = spec.unit;
+    el.querySelector(`[data-role="${role}"]`).step = needsRxId(kind) ? '0.001' : '1';
+  }
+  const output = el.querySelector('[data-role="pMaxOut"]');
+  if (spec.max === null) output.removeAttribute('max');
+  else output.max = String(spec.max);
+  output.title = spec.max === null ? `PID 输出的绝对值上限${spec.unit ? `（${spec.unit}）` : ''}`
+    : `允许范围 0～${spec.max} ${spec.unit}（当前 MIT 协议量程上限，非建议工作值）`;
+}
+
 /**
  * 把某 kind + 某环的 PID 填入输入框
  * @param i           通道号
- * @param loopStr     环选择器的值('0'速度 '1'电流 '2'位置)
+ * @param loopStr     PID 协议环编号('0'速度 '1'电流 '2'位置)
  * @param kindOverride 可选,指定 kind(默认取该通道绑定的电机)
  */
 function fillPidForm(i, loopStr, kindOverride) {
@@ -697,6 +1017,8 @@ function fillPidForm(i, loopStr, kindOverride) {
   const r = (role) => el.querySelector(`[data-role="${role}"]`);
 
   const preset = PID_DEFAULTS[kind];
+  r('pidPanel').dataset.loop = String(loopStr);
+  r('pidTitle').textContent = `${['速度环', '电流环', '位置环'][Number(loopStr)]} PID`;
   const loopName = ['speed', 'current', 'angle'][Number(loopStr)] || 'speed';
   const p = preset ? preset[loopName] : null;
 
@@ -705,6 +1027,7 @@ function fillPidForm(i, loopStr, kindOverride) {
   r('pKd').value = p ? p.Kd : 0;
   r('pMaxOut').value = p ? p.MaxOut : 0;
   r('pIntLim').value = p ? p.IntegralLimit : 0;
+  updatePidUnits(i, kind, Number(loopStr));
 
   // 记录当前环,便于收到 PID 报表时知道该往哪个输入框填
   pidStateByChannel.set(i, { loop: Number(loopStr), kind });
@@ -725,25 +1048,28 @@ function initPidPanel(i) {
   const el = ch(i);
   if (!el) return;
 
-  const kind = canControlChannel(i) ? currentChannelKind(i) : 0;
+  const kind = channelsReady && sessionChannels.has(i) && telemetryByChannel.has(i) ? currentChannelKind(i) : 0;
   const panel = el.querySelector('[data-role="pidPanel"]');
   const msg = el.querySelector('[data-role="pidMsg"]');
+  if (needsRxId(kind) && panel.dataset.loop === '1') panel.dataset.loop = '0';
+  updatePidUnits(i, kind, Number(panel.dataset.loop));
 
-  /* 需要联动开关的控件:输入框、环选择器、两个下发/读回按钮。
-     收起按钮保持可用 —— 未绑定时也能折叠面板。 */
+  /* 未绑定或闭环切换待确认时，禁止编辑和下发。 */
   const ctrls = [
-    'pidLoop', 'pKp', 'pKi', 'pKd', 'pMaxOut', 'pIntLim',
+    'pKp', 'pKi', 'pKd', 'pMaxOut', 'pIntLim',
     'pidApply', 'pidQuery', 'pidReset',
   ].map((role) => el.querySelector(`[data-role="${role}"]`));
 
   for (const c of ctrls) {
-    if (c) c.disabled = !kind;
+    if (c) c.disabled = !kind || pendingLoopChanges.has(i);
   }
+  for (const role of ['pidApply', 'pidQuery'])
+    el.querySelector(`[data-role="${role}"]`).disabled ||= pendingPidApplies.has(i);
 
   if (kind) {
-    /* 绑定后:填入该型号默认值,并清掉"先绑定"提示。
-       improve 不从页面暴露(属于协议细节),沿用默认表里的值。 */
-    fillPidForm(i, el.querySelector('[data-role="pidLoop"]').value, kind);
+    const previous = pidStateByChannel.get(i);
+    if (previous?.kind !== kind || previous.loop !== Number(panel.dataset.loop))
+      fillPidForm(i, panel.dataset.loop, kind);
     if (msg && msg.textContent === '先绑定电机后可用') msg.textContent = '';
   } else {
     if (msg) {
@@ -782,6 +1108,13 @@ function bindEvents() {
     const kind = Number($('#addKind').value);
     const canBus = Number($('#addBus').value);
     if (pendingMotor) return;
+    if (kind === MotorKind.DM8009P) {
+      const [major, minor] = String(firmwareVersion ?? '').split('.').map(Number);
+      if (!(major > 1 || (major === 1 && minor >= 7))) {
+        showAddMsg('DM8009P 需要固件 1.7 或更新版本，请先烧录并重新连接', true);
+        return;
+      }
+    }
     const id = readMotorIdInput();
     if (!id.ok) {
       showAddMsg(id.msg, true);
@@ -866,9 +1199,9 @@ function bindEvents() {
   syncRxIdVisibility();
 
   // 页面关闭前尽量通知服务端全停(beforeunload + sendBeacon 兜底)
-  window.addEventListener('beforeunload', () => send({ type: 'stopAll' }));
+  window.onbeforeunload = () => send({ type: 'stopAll' });
 
-  for (let i = 0; i < CHANNEL_COUNT; i++) {
+  for (const i of channelIds()) {
     const el = ch(i);
     const r = (role) => el.querySelector(`[data-role="${role}"]`);
 
@@ -893,6 +1226,7 @@ function bindEvents() {
        *    约束不再由节点位置保证 —— 见 fishbone.js 的 _toggle 注释。)
        */
       const mask = readLoopMask(i);
+      boundLoopMasks.set(i, mask);
       sessionChannels.add(i);
       send({
         type: 'bind',
@@ -944,6 +1278,21 @@ function bindEvents() {
 
     const slider = r('slider');
     const num = r('num');
+    for (const name of ['preset', 'calculator']) {
+      const tab = r(`${name}Tab`);
+      tab.onclick = () => selectChannelTool(i, name);
+      tab.onkeydown = event => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const next = event.key === 'Home' ? 'preset' : event.key === 'End' ? 'calculator' : (name === 'preset' ? 'calculator' : 'preset');
+        if (r(`${next}Tab`).disabled) return;
+        selectChannelTool(i, next);
+        r(`${next}Tab`).focus();
+      };
+    }
+    r('presetMode').onchange = () => renderProgram(i);
+    r('presetStart').onclick = () => startProgram(i);
+    r('presetStop').onclick = () => stopProgram(i, '已停止 · 目标已归零', true);
     slider.oninput = () => {
       num.value = slider.value;
     };
@@ -952,6 +1301,11 @@ function bindEvents() {
     num.onchange = () => {
       slider.value = num.value;
       send({ type: 'setRef', channelId: i, ref: Number(num.value) });
+    };
+    num.onkeydown = event => {
+      if (event.key !== 'Enter' || !canControlChannel(i) || setpointPrograms.has(i)) return;
+      event.preventDefault();
+      num.onchange();
     };
 
     r('enable').onclick = () => {
@@ -965,6 +1319,8 @@ function bindEvents() {
     };
 
     r('zero').onclick = () => {
+      cancelPidResume(i);
+      stopProgram(i, '已停止 · 目标已归零');
       slider.value = '0';
       num.value = '0';
       send({ type: 'setRef', channelId: i, ref: 0 });
@@ -1008,26 +1364,30 @@ function bindEvents() {
     };
 
     /* ---------------- PID 整定 ---------------- */
-    const pidLoop = r('pidLoop');
     const pidPanel = r('pidPanel');
     const pidMsg = r('pidMsg');
 
-    // 切环时刷新输入框为上一环 / 该型号默认值
-    pidLoop.onchange = () => {
-      fillPidForm(i, pidLoop.value);
-      pidMsg.textContent = '';
+    const stopForPidEdit = () => {
+      if (!canControlChannel(i)) return;
+      send({ type: 'enable', channelId: i, enable: false });
+      setDisplayedRef(i, 0);
+      send({ type: 'setRef', channelId: i, ref: 0 });
+      pidMsg.className = 'hint';
+      pidMsg.textContent = pendingPidApplies.has(i)
+        ? '参数再次修改，保持停机；本次回执不再自动使能，请确认后重新应用'
+        : '已请求停机 · 目标已归零';
     };
+    for (const role of ['pKp', 'pKi', 'pKd', 'pMaxOut', 'pIntLim'])
+      r(role).oninput = stopForPidEdit;
 
-    /*
-     * 卡片已改为内嵌常驻,不再有"关闭"按钮 —— 显示即展开,无需折叠态。
-     * 切换要调的环:点鱼骨图节点,或用上面的 pidLoop 下拉。
-     */
+    // 右键鱼骨图节点选择要整定的环，左键仅改变闭环状态。
 
     r('pidReset').onclick = () => {
       const kind = currentChannelKind(i);
-      fillPidForm(i, pidLoop.value, kind);
+      fillPidForm(i, pidPanel.dataset.loop, kind);
+      stopForPidEdit();
       pidMsg.className = 'hint';
-      pidMsg.textContent = kind ? '已填入该型号默认值,点"应用到电机"下发' : '请先绑定电机';
+      pidMsg.textContent = kind ? '已恢复默认值 · 已请求停机归零' : '请先绑定电机';
     };
 
     r('pidQuery').onclick = () => {
@@ -1037,23 +1397,55 @@ function bindEvents() {
     };
 
     r('pidApply').onclick = () => {
+      if (!canControlChannel(i) || pendingUnbindChannels.has(i) || pendingPidApplies.has(i)) return;
       const kind = currentChannelKind(i);
       if (!kind) {
         pidMsg.className = 'hint error';
         pidMsg.textContent = '请先绑定电机';
         return;
       }
-      const Kp = Number(r('pKp').value) || 0;
-      const Ki = Number(r('pKi').value) || 0;
-      const Kd = Number(r('pKd').value) || 0;
-      const MaxOut = Number(r('pMaxOut').value) || 0;
-      const IntegralLimit = Number(r('pIntLim').value) || 0;
-      if (Kp < 0 || Ki < 0 || Kd < 0) {
+      stopForPidEdit();
+      const Kp = r('pKp').valueAsNumber;
+      const Ki = r('pKi').valueAsNumber;
+      const Kd = r('pKd').valueAsNumber;
+      const MaxOut = r('pMaxOut').valueAsNumber;
+      const IntegralLimit = r('pIntLim').valueAsNumber;
+      if (![Kp, Ki, Kd, MaxOut, IntegralLimit].every(value => Number.isFinite(value) && value >= 0)) {
         pidMsg.className = 'hint error';
-        pidMsg.textContent = 'Kp/Ki/Kd 不能为负';
+        pidMsg.textContent = 'PID 参数及限幅必须为非负有限数值，不能留空';
         return;
       }
-      send({ type: 'pidSet', channelId: i, loop: Number(pidLoop.value), pid: { Kp, Ki, Kd, MaxOut, IntegralLimit } });
+      if ([Kp, Ki, Kd].some(value => value > 655.35)) {
+        pidMsg.className = 'hint error';
+        pidMsg.textContent = 'Kp/Ki/Kd 不能超过协议上限 655.35';
+        return;
+      }
+      const loop = Number(pidPanel.dataset.loop);
+      const spec = pidOutputSpec(kind, loop);
+      if (needsRxId(kind) && loop === 1) {
+        pidMsg.className = 'hint error';
+        pidMsg.textContent = `${MotorKindLabel[kind]} 电流环由电调内部控制，测试台仅支持速度环和位置环 PID`;
+        return;
+      }
+      if (spec.max !== null && MaxOut > spec.max) {
+        pidMsg.className = 'hint error';
+        pidMsg.textContent = `${MotorKindLabel[kind]} ${loop === 0 ? '速度' : '位置'}环输出限幅须为 0～${spec.max} ${spec.unit}；当前填写 ${MaxOut} ${spec.unit}，未下发`;
+        return;
+      }
+      send({ type: 'pidSet', channelId: i, loop, pid: { Kp, Ki, Kd, MaxOut, IntegralLimit, scaledLimits: needsRxId(kind) } });
+      if (ws.readyState !== 1 || !serialConnected || !boardOnline) return;
+      const pending = { loop, resume: true, timer: null };
+      pending.timer = setTimeout(() => {
+        if (pendingPidApplies.get(i) !== pending) return;
+        pending.resume = false;
+        pidMsg.className = 'hint error';
+        pidMsg.textContent = 'PID 应用未收到确认，保持停机；请等待回执或解绑重连后重试';
+        send({ type: 'enable', channelId: i, enable: false });
+      }, 2000);
+      pendingPidApplies.set(i, pending);
+      pidMsg.className = 'hint';
+      pidMsg.textContent = '正在应用 PID；确认成功后自动零目标使能…';
+      renderChannel(i);
     };
   }
 }
@@ -1067,6 +1459,9 @@ ws.onopen = () => {
 
 ws.onclose = () => {
   serverSupportsReset = false;
+  serverSupportsLoop = false;
+  firmwareSupportsLoop = false;
+  firmwareVersion = null;
   serialConnected = false;
   serialPath = null;
   clearTimeout(channelResetTimer);
@@ -1137,6 +1532,7 @@ ws.onmessage = (ev) => {
   switch (msg.type) {
     case 'hello': {
       serverSupportsReset = msg.capabilities?.includes('resetChannels') === true;
+      serverSupportsLoop = msg.capabilities?.includes('setLoop') === true;
       if (!serverSupportsReset) {
         channelResetError = '后台版本过旧 · 请重启上位机服务';
         showRegistryMsg(channelResetError, true);
@@ -1165,6 +1561,8 @@ ws.onmessage = (ev) => {
       serialConnected = !!msg.open;
       serialPath = msg.open ? msg.path : null;
       if (sameConnection) break;
+      firmwareSupportsLoop = false;
+      firmwareVersion = null;
       clearTimeout(channelResetTimer);
       channelResetPending = null;
       boardOnline = false;
@@ -1183,7 +1581,13 @@ ws.onmessage = (ev) => {
 
     case 'heartbeat': {
       const d = msg.data;
+      firmwareVersion = d.fwVersion;
+      const [major, minor] = String(d.fwVersion).split('.').map(Number);
+      const supported = major > 1 || (major === 1 && minor >= 5);
+      const changed = firmwareSupportsLoop !== supported;
+      firmwareSupportsLoop = supported;
       noteBoardResponse();
+      if (changed) for (const i of channelIds()) renderChannel(i);
       setLink(true, 'A 板在线');
       $('#fwText').textContent = `固件 ${d.fwVersion} · ${Math.round(d.uptimeS / 60)} 分钟`;
       // 收到心跳说明板子已在跑,若清单还没拿到就再要一次(见 startInventoryFetch 注释)
@@ -1199,20 +1603,7 @@ ws.onmessage = (ev) => {
         label: MotorKindLabel[m.kind] ?? `未知类型(${m.kind})`,
       }));
 
-      /*
-       * 通道卡片数量:**只增不减**,且只在"电机数超过当前卡片数"时才增长。
-       *
-       * @attention 【2026-10-12 修复】原判断是
-       *   `CHANNEL_COUNT !== inventory.length` —— 任何数量变化都重建卡片。
-       *   它建立在错误假设上:"电机数 == 通道数"。
-       *   实际通道是独立的控制位(固件 MB_CHANNEL_MAX = 8),
-       *   两颗电机完全可以只用一个通道,或者一颗电机换通道。
-       *   于是"加一颗电机"这种纯后台操作会摧毁用户正在用的界面状态:
-       *   已选电机、已设 rpm 全部归零,多通道时还会一起清空。
-       *
-       * 现在:数量够就不动 DOM,只在不够时补卡(buildChannels 内部只增不减)。
-       * 加电机不再触碰任何已有卡片。
-       */
+      // Resize only the surplus/new cards; surviving firmware channel IDs stay fixed.
       buildChannels(inventory.length);
 
       /*
@@ -1232,7 +1623,7 @@ ws.onmessage = (ev) => {
        *   下拉框的 value 设成实际电机索引,currentChannelKind() 靠它取 kind。
        *   顺序反了会读不到 kind,PID 面板被隐藏。
        */
-      for (let i = 0; i < CHANNEL_COUNT; i++) initPidPanel(i);
+      for (const i of channelIds()) initPidPanel(i);
 
       /*
        * 拿到清单即视为握手完成。
@@ -1299,7 +1690,7 @@ ws.onmessage = (ev) => {
           showRegistryMsg('');
           channelsReady = true;
           noteBoardResponse();
-          for (let i = 0; i < CHANNEL_COUNT; i++) renderChannel(i);
+          for (const i of channelIds()) renderChannel(i);
           setLink(true, 'A 板在线 · 请重新绑定电机');
         } else sendResetChannel();
         break;
@@ -1317,7 +1708,9 @@ ws.onmessage = (ev) => {
       // unbind in this page may clear a channel after reset has finished.
       if (!pendingUnbindChannels.delete(d.channelId)) break;
       if (d.result === MBResult.OK) {
+        clearPendingLoop(d.channelId);
         sessionChannels.delete(d.channelId);
+        boundLoopMasks.delete(d.channelId);
         telemetryByChannel.delete(d.channelId);
         getChartIfExists(d.channelId)?.clear();
         const el = ch(d.channelId);
@@ -1337,13 +1730,49 @@ ws.onmessage = (ev) => {
       break;
     }
 
+    case 'loopAck': {
+      const d = msg.data;
+      const pending = pendingLoopChanges.get(d.channelId);
+      if (!pending || pending.mask !== d.mask || pendingUnbindChannels.has(d.channelId)) break;
+      clearPendingLoop(d.channelId);
+      const el = ch(d.channelId);
+      if (!el) break;
+      const ok = d.result === MBResult.OK;
+      if (ok) {
+        boundLoopMasks.set(d.channelId, d.mask);
+        setDisplayedRef(d.channelId, 0);
+        const t = telemetryByChannel.get(d.channelId);
+        if (t) telemetryByChannel.set(d.channelId, { ...t, enabled: false, ref: 0 });
+        getChartIfExists(d.channelId)?.clear();
+      }
+      for (const node of el.querySelectorAll('.fb-node')) delete node.dataset.unboundTitle;
+      fishbones.get(d.channelId)?.setMask(boundLoopMasks.get(d.channelId));
+      renderChannel(d.channelId);
+      const status = el.querySelector('[data-role="pidMsg"]');
+      status.className = ok ? 'hint ok' : 'hint error';
+      status.textContent = ok ? '闭环已切换，目标已归零；请重新使能' :
+        `闭环切换失败：${MBResultText[d.result] ?? d.result}`;
+      if (ok) send({ type: 'pidQuery', channelId: d.channelId });
+      break;
+    }
+
     case 'telemetry': {
       noteBoardResponse();
       setLink(true, 'A 板在线');
       for (const it of msg.data.items) {
         if (!channelsReady || !sessionChannels.has(it.channelId)) continue;
-        const first = !telemetryByChannel.has(it.channelId);
-        telemetryByChannel.set(it.channelId, it);
+        const previous = telemetryByChannel.get(it.channelId);
+        const first = !previous;
+        telemetryByChannel.set(it.channelId, { ...it, receivedAt: performance.now() });
+        if (!it.online) {
+          cancelPidResume(it.channelId);
+          stopProgram(it.channelId, '电机离线 · 自动重连中，恢复后请手动使能');
+          setDisplayedRef(it.channelId, 0);
+        } else if (previous && !previous.online) {
+          setDisplayedRef(it.channelId, 0);
+          getChartIfExists(it.channelId)?.clear();
+          programMessage(it.channelId, '电机已重连 · 目标已归零，请手动使能');
+        }
         if (first) initPidPanel(it.channelId);
         renderChannel(it.channelId);
       }
@@ -1386,17 +1815,41 @@ ws.onmessage = (ev) => {
       const el = ch(d.channelId);
       if (!el) break;
       const m = el.querySelector('[data-role="pidMsg"]');
+      const pending = pendingPidApplies.get(d.channelId);
+      if (pending && pending.loop !== d.loop) break;
+      clearPendingPid(d.channelId);
       if (d.result === MBResult.OK) {
         m.className = 'hint ok';
-        m.textContent = '已应用到电机';
+        const t = telemetryByChannel.get(d.channelId);
+        const resume = pending?.resume && canControlChannel(d.channelId) &&
+          !pendingUnbindChannels.has(d.channelId) && serialConnected && boardOnline &&
+          ws.readyState === 1 && !document.hidden && t?.online && performance.now() - t.receivedAt < 500;
+        if (resume) {
+          setDisplayedRef(d.channelId, 0);
+          send({ type: 'enable', channelId: d.channelId, enable: true, ref: 0 });
+        }
+        m.textContent = resume ? 'PID 已应用；已自动下发零目标使能' : 'PID 已应用；保持停机，未自动使能';
       } else {
         m.className = 'hint error';
-        m.textContent = MBResultText[d.result] ?? `下发失败(错误码 ${d.result})`;
+        const kind = currentChannelKind(d.channelId);
+        const spec = pidOutputSpec(kind, d.loop);
+        if (d.result === MBResult.UNSUPPORTED) {
+          m.textContent = needsRxId(kind) && d.loop === 1
+            ? `${MotorKindLabel[kind]} 电流环由电调内部控制，测试台仅支持速度环和位置环 PID`
+            : `板端拒绝该 PID 环或参数范围${spec.max === null ? '' : `；输出限幅须为 0～${spec.max} ${spec.unit}`}，请检查参数与固件支持`;
+        } else if (d.result === MBResult.BAD_PARAM) {
+          m.textContent = `PID 参数无效、超出范围或通道未就绪${spec.max === null ? '' : `；输出限幅须为 0～${spec.max} ${spec.unit}`}`;
+        } else {
+          m.textContent = MBResultText[d.result] ?? `下发失败(错误码 ${d.result})`;
+        }
       }
+      renderChannel(d.channelId);
       break;
     }
 
     case 'error': {
+      for (const i of pendingPidApplies.keys()) cancelPidResume(i);
+      stopAllPrograms('通信出错 · 自动输出已停止', true);
       if (channelResetPending) {
         clearTimeout(channelResetTimer);
         channelResetPending = null;
@@ -1440,14 +1893,15 @@ function updateWorkspaceStatus() {
  *       给出每一项的具体配置,界面据此列出可绑定的电机。
  */
 
-/*
- * 初始只建卡片即可 —— buildChannels() 内部已经会调用 bindEvents(),
- * 外面再调一次会导致所有事件被绑定两遍(同一按钮触发两次指令)。
- * 尤其是 setRef 之类的帧会被重复下发。
- */
+// No motors means no cards; buildChannels also initializes global controls.
 buildChannels();
 
 renderMotorList();
+
+document.querySelector('[data-open-calculator]').addEventListener('click', () => {
+  const first = channelIds()[0];
+  if (first !== undefined) selectChannelTool(first, 'calculator');
+});
 
 for (const link of document.querySelectorAll('.rail-link')) {
   link.addEventListener('click', () => {

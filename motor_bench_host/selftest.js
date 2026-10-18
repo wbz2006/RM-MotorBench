@@ -52,6 +52,7 @@ import {
 } from './protocol.js';
 import { LowPass } from './chart.js';
 import { readFileSync } from 'node:fs';
+import { firmwareRelativeRoot, firmwareSourceDir } from './firmware_test_paths.js';
 
 let failures = 0;
 function check(name, cond, detail = '') {
@@ -139,6 +140,8 @@ const ackFrame = buildHeartbeatAck({ fwMajor: 1, fwMinor: 0, inventory: 4, flags
 const pAck = new FrameParser();
 const ackOut = pAck.push(ackFrame);
 check('heartbeat ack parsed', ackOut.length === 1, `got ${ackOut.length}`);
+check('heartbeat body is eight bytes and full frame is thirteen', ackFrame[2] === 8 && ackFrame.length === 13);
+check('truncated heartbeat payload is rejected', parseHeartbeatAck(Buffer.alloc(7)) === null);
 const ack = parseHeartbeatAck(ackOut[0].payload);
 check('fw version 1.0', ack.fwVersion === '1.0', `got ${ack.fwVersion}`);
 check('inventory count 4', ack.inventoryCount === 4, `got ${ack.inventoryCount}`);
@@ -411,7 +414,7 @@ console.log('\n== 10. link gate allow-list covers all read-only frame types ==')
    * 以后再加新帧类型时,忘了加白名单会立刻被这条测试抓到。
    */
   const cPath = new URL(
-    '../motorbench-a/modules/motor_bench/motor_bench.c',
+    `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
     import.meta.url,
   );
   let src;
@@ -480,7 +483,7 @@ console.log('\n== 11. USB TX must not share a reusable staging buffer ==');
    * 必须直接把环形队列的连续内存交给 CDC_Transmit_FS()。
    */
   const fwPath = new URL(
-    '../motorbench-a/modules/motor_bench/motor_bench.c',
+    `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
     import.meta.url,
   );
   let c;
@@ -528,7 +531,7 @@ console.log('\n== 12. RTT diagnostic logs stay ASCII ==');
    * 诊断日志应使用纯 ASCII(网页 UI 里的中文不受影响,那是浏览器渲染)。
    */
   const fwPath = new URL(
-    '../motorbench-a/modules/motor_bench/motor_bench.c',
+    `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
     import.meta.url,
   );
   let c;
@@ -561,7 +564,7 @@ console.log('\n== 13. USB RX callback must stay interrupt-safe ==');
    * 因此规则是:中断只负责把字节搬进环形队列,解析必须在任务上下文。
    */
   const fwPath = new URL(
-    '../motorbench-a/modules/motor_bench/motor_bench.c',
+    `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
     import.meta.url,
   );
   let c;
@@ -627,7 +630,7 @@ console.log('\n== 14. firmware variable-length frames must not use fixed-size ar
    * 固件的清单/遥测发送函数是按字节拼装的,且发送长度由实际数量决定。
    */
   const fwPath = new URL(
-    '../motorbench-a/modules/motor_bench/motor_bench.c',
+    `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
     import.meta.url,
   );
   let c;
@@ -697,7 +700,7 @@ console.log('\n== 15. link timeout must outlast the host heartbeat interval ==')
   let fwPeriodMs = null;
   try {
     const fw = readFileSync(new URL(
-      '../motorbench-a/modules/motor_bench/motor_bench.c',
+      `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
       import.meta.url,
     ), 'utf8');
     const m = fw.match(/#define\s+MB_LINK_TIMEOUT_COUNT\s+(\d+)/);
@@ -707,7 +710,7 @@ console.log('\n== 15. link timeout must outlast the host heartbeat interval ==')
   // daemon 周期:freertos.c 里 StartDAEMONTASK 的 osDelay(10)
   try {
     const fr = readFileSync(new URL(
-      '../motorbench-a/Core/Src/freertos.c',
+      `${firmwareRelativeRoot}${firmwareSourceDir}/freertos.c`,
       import.meta.url,
     ), 'utf8');
     const m = fr.match(/StartDAEMONTASK[\s\S]{0,300}?osDelay\((\d+)\)/);
@@ -756,7 +759,7 @@ console.log('\n== 16. stream parser minimum-frame check must accept empty payloa
   let fw;
   try {
     fw = readFileSync(new URL(
-      '../motorbench-a/modules/motor_bench/motor_bench.c',
+      `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
       import.meta.url,
     ), 'utf8');
   } catch {
@@ -807,10 +810,10 @@ console.log('\n== 17. new channel cards must get their handlers bound ==');
    * 【2026-10-12 更新】本组原断言"buildChannels 必须清空容器"已作废:
    *   正是那行 innerHTML='' 导致加第二颗电机时,通道 0 的已选电机与 rpm
    *   全部被清空(第 20 组记录了三个由此派生的实测故障)。
-   *   现在 buildChannels 只增不减,不清空已有卡片。
+   *   现在增删只处理新增/多余卡片,不清空保留的卡片。
    *
    * 但"新增卡片必须绑上事件"这条依然成立,而且更重要 ——
-   *   只增不减意味着旧卡片保留自己的 onclick,新卡片若漏绑就是死按钮。
+   *   保留的卡片维持自己的 onclick,新卡片若漏绑就是死按钮。
    */
   let ui;
   try {
@@ -976,15 +979,17 @@ console.log('\n== 18. PID protocol: frame layout, fixed-point, defaults ==');
   check('达妙 MIT 不叠加 DJI 电流环',
     PID_DEFAULTS[MotorKind.DM].current.Kp === 0);
   {
-    const app = readFileSync(new URL('../motorbench-a/application/motor_bench_app/motor_bench_app.c', import.meta.url), 'utf8');
-    const dm = app.match(/static void BenchBuildDMConfig\([\s\S]*?\n\}/)?.[0] ?? '';
+    const app = readFileSync(new URL(`${firmwareRelativeRoot}application/motor_bench_app/motor_bench_app.c`, import.meta.url), 'utf8');
+    const factory = app.match(/static uint8_t BenchMotorFactory\([\s\S]*?\n\}/)?.[0] ?? '';
+    const dm = factory.match(/if \(kind == MB_MOTOR_DM\)\s*\{([^}]+)\}/)?.[1] ?? '';
     const defaults = PID_DEFAULTS[MotorKind.DM].speed;
     for (const key of ['Kp', 'Ki', 'Kd', 'MaxOut', 'IntegralLimit']) {
       const value = dm.match(new RegExp(`speed_PID\\.${key} = ([0-9.]+)f`))?.[1];
       check(`DM ${key} matches the real firmware default`, value !== undefined && Number(value) === defaults[key]);
     }
-    check('DM MIT 默认速度增益适用于低扭矩起步', defaults.Kp > 0 && defaults.Kp <= 0.05);
-    check('DM MIT 默认扭矩限幅不超过 0.5 N*m', defaults.MaxOut > 0 && defaults.MaxOut <= 0.5);
+    check('DM4310 默认速度环采用用户指定五参数',
+      defaults.Kp === 0.65 && defaults.Ki === 12 && defaults.Kd === 0 &&
+      defaults.MaxOut === 15 && defaults.IntegralLimit === 1000 && defaults.improve === 1);
   }
 
   /*
@@ -1030,7 +1035,7 @@ console.log('\n== 18. PID protocol: frame layout, fixed-point, defaults ==');
   let fwApp;
   try {
     fwApp = readFileSync(new URL(
-      '../motorbench-a/application/motor_bench_app/motor_bench_app.c',
+      `${firmwareRelativeRoot}application/motor_bench_app/motor_bench_app.c`,
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench_app.c not reachable'); }
@@ -1155,7 +1160,7 @@ console.log('\n== 20. telemetry frame must be split to fit the 64B USB limit =='
   let fw;
   try {
     fw = readFileSync(new URL(
-      '../motorbench-a/modules/motor_bench/motor_bench.c', import.meta.url,
+      `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`, import.meta.url,
     ), 'utf8');
   } catch {
     console.log('  SKIP  firmware motor_bench.c not reachable');
@@ -1260,12 +1265,11 @@ console.log('\n== 21. adding a motor must not destroy channel UI state ==');
    *   (a) `CHANNEL_COUNT !== inventory.length` → 任何数量变化都重建卡片,
    *       而 buildChannels() 里的 `host.innerHTML=''` 会销毁所有卡片状态;
    *   (b) `fillMotorOptions()` 无条件重建 <option>,把已选值打回 "";
-   *   两者都建立在"电机数 == 通道数"这个错误前提上 ——
-   *   实际通道是独立控制位(固件 MB_CHANNEL_MAX = 8),与电机总数无关。
+   *   现在按用户要求让卡片数量匹配电机数量，但增删必须保留其余卡片及板端通道号。
    *
    * 判据(对着源码断言,因为这些是"不该再犯"的结构性约束):
    *   1. buildChannels 里不得再出现 host.innerHTML = ''
-   *   2. buildChannels 必须只增不减(Math.max(have, ...))
+   *   2. 增删的行为由浏览器回归覆盖，包括保留高编号绑定与释放已删除卡片状态
    *   3. fillMotorOptions 必须在重建 option 前记住三元组、重建后恢复
    *   4. 清单处理器不得再以 CHANNEL_COUNT !== inventory.length 为重建条件
    *   5. startInventoryFetch 重入时必须先清旧定时器(否则拉取会静默停摆)
@@ -1289,14 +1293,6 @@ console.log('\n== 21. adding a motor must not destroy channel UI state ==');
       check('buildChannels does NOT wipe the container',
         !/host\.innerHTML\s*=\s*''/.test(bcode),
         'innerHTML="" destroys every channel card and all user state');
-      check('buildChannels is additive (never shrinks)',
-        /Math\.max\(/.test(bcode),
-        'cards must only grow; shrinking deletes a channel the user is using');
-      check('buildChannels appends from the existing count',
-        /for\s*\(\s*let i\s*=\s*have\s*;/.test(bcode));
-      check('buildChannels returns early when the count is unchanged',
-        /have\s*===\s*n/.test(bcode),
-        'touching the DOM when nothing changed still loses input state');
     }
 
     /* --- fillMotorOptions --- */
@@ -1331,10 +1327,6 @@ console.log('\n== 21. adding a motor must not destroy channel UI state ==');
         !/if\s*\(inventoryTimer\)\s*return/.test(scode));
     }
 
-    /* --- 端到端语义:通道数与电机数解耦 --- */
-    check('CHANNEL_COUNT is not derived from inventory length',
-      !/CHANNEL_COUNT\s*=\s*inventory\.length/.test(code),
-      'channels and motors are independent; MB_CHANNEL_MAX is 8 either way');
   }
 }
 
@@ -1366,8 +1358,8 @@ console.log('\n== 22. "unbind" must really unbind, not just stop ==');
     const b = new URL('./', import.meta.url);
     ui = readFileSync(new URL('ui.js', b), 'utf8');
     srv = readFileSync(new URL('server.js', b), 'utf8');
-    fwC = readFileSync(new URL('../motorbench-a/modules/motor_bench/motor_bench.c', b), 'utf8');
-    fwH = readFileSync(new URL('../motorbench-a/modules/motor_bench/motor_bench.h', b), 'utf8');
+    fwC = readFileSync(new URL(`${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`, b), 'utf8');
+    fwH = readFileSync(new URL(`${firmwareRelativeRoot}modules/motor_bench/motor_bench.h`, b), 'utf8');
   } catch {
     console.log('  SKIP  source files not reachable');
   }
@@ -1675,7 +1667,7 @@ console.log('\n== 26. CAN rx_id collision rules (see CAN_ID冲突说明.md) ==')
      *   这正是最危险的一种测试状态:跳过伪装成通过。
      *   所以下面额外断言两个文件确实读到了内容。
      */
-    const fwBase = '../motorbench-a/';
+    const fwBase = `${firmwareRelativeRoot}`;
     fwDji = readFileSync(new URL(`${fwBase}modules/motor/DJImotor/dji_motor.c`, import.meta.url), 'utf8');
     fwBench = readFileSync(new URL(`${fwBase}modules/motor_bench/motor_bench.c`, import.meta.url), 'utf8');
   } catch (e) { console.log('  SKIP  firmware sources not reachable:', e.message); }
@@ -1736,7 +1728,7 @@ console.log('\n== 23. unbind must clear the motor instance residual ref ==');
   let fwC;
   try {
     fwC = readFileSync(new URL(
-      '../motorbench-a/modules/motor_bench/motor_bench.c',
+      `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench.c not reachable'); }
@@ -2165,7 +2157,7 @@ console.log('\n== 25. anti-aliasing: average at the sample source, not just on d
   let fwC;
   try {
     fwC = readFileSync(new URL(
-      '../motorbench-a/modules/motor_bench/motor_bench.c',
+      `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench.c not reachable'); }
@@ -2307,7 +2299,7 @@ console.log('\n== 28. smoothing coefficient semantics must match the formula =='
 
   let djiH, djiC, lkH, lkC, htH, htC;
   try {
-    const base = new URL('../motorbench-a/modules/motor/', import.meta.url);
+    const base = new URL(`${firmwareRelativeRoot}modules/motor/`, import.meta.url);
     djiH = readFileSync(new URL('DJImotor/dji_motor.h', base), 'utf8');
     djiC = readFileSync(new URL('DJImotor/dji_motor.c', base), 'utf8');
     lkH = readFileSync(new URL('LKmotor/LK9025.h', base), 'utf8');
@@ -2383,7 +2375,7 @@ console.log('\n== 29. motor init config must be zeroed and DeadBand set explicit
   let app;
   try {
     app = readFileSync(new URL(
-      '../motorbench-a/application/motor_bench_app/motor_bench_app.c',
+      `${firmwareRelativeRoot}application/motor_bench_app/motor_bench_app.c`,
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench_app.c not reachable'); }
@@ -2493,11 +2485,11 @@ console.log('\n== 31. cascade loops: combos must be selectable end to end ==');
   let fw, fwH;
   try {
     fw = readFileSync(new URL(
-      '../motorbench-a/modules/motor/DJImotor/dji_motor.c',
+      `${firmwareRelativeRoot}modules/motor/DJImotor/dji_motor.c`,
       import.meta.url,
     ), 'utf8');
     fwH = readFileSync(new URL(
-      '../motorbench-a/modules/motor/motor_def.h',
+      `${firmwareRelativeRoot}modules/motor/motor_def.h`,
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  firmware sources not reachable'); }
@@ -2559,7 +2551,7 @@ console.log('\n== 31. cascade loops: combos must be selectable end to end ==');
   let mb;
   try {
     mb = readFileSync(new URL(
-      '../motorbench-a/modules/motor_bench/motor_bench.c',
+      `${firmwareRelativeRoot}modules/motor_bench/motor_bench.c`,
       import.meta.url,
     ), 'utf8');
   } catch { console.log('  SKIP  motor_bench.c not reachable'); }
@@ -2668,7 +2660,7 @@ console.log('\n== 32. loop fishbone: topology must enforce the cascade constrain
 
     /* --- 暗/亮态 --- */
     check('nodes toggle an is-on class', /classList\.toggle\('is-on'/.test(code));
-    check('locked nodes are not clickable', /node\.disabled = true/.test(code));
+    check('locked current loop cannot toggle off', /if \(node\.locked\) return/.test(code));
     /*
      * ---- 底部信息行(外层/说明/0bXXXX 掩码)已整行删除(2026-10-14 用户裁定) ----
      * 断言"删干净"必须在**剥注释后**的 code 上判(注释里必然提到这些类名)。
@@ -2756,7 +2748,7 @@ console.log('\n== 33. PID card stays inline; picking a loop switches it ==');
   /*
    * 交互定稿(2026-10-13):
    *   1. PID 卡片**内嵌常驻**在鱼骨图下方,不做浮空弹出;
-   *   2. 点击鱼骨图上的环 → 卡片切到那个环(并填入该环默认值)。
+   *   2. 左键切闭环开关；右键节点切换 PID；悬停和聚焦不切换。
    *
    * 【为什么放弃浮空】曾做成 absolute 跟随节点,实测飘到通道卡片底部 ——
    *   浮空需要可靠的定位基准与堆叠上下文,而通道卡片是多层的
@@ -2781,7 +2773,8 @@ console.log('\n== 33. PID card stays inline; picking a loop switches it ==');
       'the float variant drifted to the bottom of the card');
     check('no show/hide close button is needed', !/data-role="pidClose"/.test(html),
       'an inline card is always visible — there is nothing to close');
-    check('panel keeps a loop selector', /data-role="pidLoop"/.test(html));
+    check('panel has no loop dropdown', !/data-role="pidLoop"/.test(html));
+    check('PID instructions removed', !/pid-workflow-note|pidTuningHint/.test(html));
 
     /*
      * 位置:PID 卡片必须紧跟在闭环鱼骨图之后、曲线之前。
@@ -2822,20 +2815,12 @@ console.log('\n== 33. PID card stays inline; picking a loop switches it ==');
   if (fb) {
     const code = fb.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
 
-    check('clicking a node switches the PID card',
-      /node\.onclick[\s\S]{0,200}?this\.onFocusLoop/.test(code),
-      'the card must follow the picked loop');
-    /*
-     * 顺序:先切启用状态,再切卡片。
-     * 反了会按点击前的状态切换,与实际点亮结果不符。
-     */
-    check('the loop switch happens AFTER the toggle',
-      /this\._toggle\(n\);[\s\S]{0,200}?this\.onFocusLoop/.test(code),
-      'switching before the toggle would use the pre-click state');
-    check('hover also switches (mouse users)',
-      /onmouseenter[\s\S]{0,90}?onFocusLoop/.test(code));
-    check('keyboard focus also switches',
-      /onfocus\s*=\s*\(\) => this\.onFocusLoop/.test(code));
+    const click = code.match(/node\.onclick = \(\) => \{([\s\S]*?)\n\s*\};/)?.[1] || '';
+    const context = code.match(/node\.oncontextmenu = event => \{([\s\S]*?)\n\s*\};/)?.[1] || '';
+    check('left click toggles without switching PID', /this\._toggle\(n\)/.test(click) && !/onFocusLoop/.test(click));
+    check('right click selects PID without toggling', /preventDefault/.test(context) && /onFocusLoop/.test(context) && !/_toggle/.test(context));
+    check('hover and focus do not switch PID', !/onmouseenter|onfocus\s*=/.test(code));
+    check('locked current loop remains available for right-click PID', !/node\.disabled = true/.test(code));
     check('no blur-close hook remains',
       !/onBlurLoop/.test(code),
       'an inline card never closes');
@@ -2855,10 +2840,10 @@ console.log('\n== 33. PID card stays inline; picking a loop switches it ==');
     check('current bit 0b0001 maps to pidLoop "1"', /0b0001:\s*'1'/.test(code));
     check('angle bit 0b0100 maps to pidLoop "2"', /0b0100:\s*'2'/.test(code));
 
-    check('switching sets the selector and refills the form',
-      /sel\.value = loopVal/.test(code) && /fillPidForm\(i, loopVal\)/.test(code));
+    check('switching sets panel loop state and refills the form',
+      /dataset\.loop = String\(loopStr\)/.test(code) && /fillPidForm\(i, loopVal\)/.test(code));
     check('the title names the active loop',
-      /title\.textContent[\s\S]{0,120}?PID/.test(code));
+      /r\('pidTitle'\)\.textContent[\s\S]{0,120}?PID/.test(code));
   }
 }
 
@@ -3359,8 +3344,20 @@ console.log('\n== 39. 电机列表、十六进制 ID、删除匹配键 ==');
     && /}, 3000\)/.test(ui));
   check('old firmware cannot delete a DM motor without its feedback ID',
     /remove.disabled = !!pendingMotor \|\| missingRx/.test(ui));
-  check('DM4310 is the only DM model offered',
-    /<option value="4">DM4310<\/option>/.test(html));
+  check('DM4310 and DM8009P are separate model options',
+    /<option value="4">DM4310<\/option>/.test(html)
+    && /<option value="7">DM8009P<\/option>/.test(html));
+  check('DM8009P has distinct wire kind 7 and independent RX ID',
+    MotorKind.DM8009P === 7 && needsRxId(MotorKind.DM8009P));
+  const added8009 = new FrameParser().push(buildMotorAdd(MotorKind.DM8009P, 1, 1, 0x11))[0];
+  check('DM8009P add keeps TX 0x01 / RX 0x11 and model kind',
+    added8009.payload.equals(Buffer.from([7, 1, 1, 0x11, 0])));
+  const inv8009 = parseInventory(Buffer.from([1, 7, 1, 1, 2, 0x11, 0]));
+  check('DM8009P inventory label and feedback ID round-trip',
+    MotorKindLabel[inv8009.items[0].kind] === 'DM8009P' && inv8009.items[0].rxId === 0x11);
+  check('DM8009P keeps independent 0.05/0/0/10/0 speed defaults',
+    JSON.stringify(PID_DEFAULTS[MotorKind.DM8009P].speed) ===
+      JSON.stringify({ Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 0, improve: 1 }));
 
   const body = Buffer.from([2, MotorKind.M2006, 1, 3, 2, 0, 0,
     MotorKind.DM, 1, 6, 2, 0x02, 0x03]);

@@ -367,6 +367,7 @@ static void MotorBenchHandleSetPid(uint8_t *buf, uint16_t len);
 static void MotorBenchHandleQueryPid(uint8_t *buf, uint16_t len);
 static void MotorBenchHandleUnbind(uint8_t *buf, uint16_t len);
 static void MotorBenchSendAddAck(const MB_MotorAddAck_s *ack);
+static void MotorBenchSendTypedFrame(uint8_t type, const uint8_t *body, uint8_t body_len);
 /*
  * 这两个函数定义在文件后半部分,但 MotorBenchBind / MotorBenchUnbind
  * 需要提前调用它们来清残留参考值,故在此前置声明。
@@ -481,7 +482,7 @@ uint8_t MotorBenchRegisterMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t mo
         LOGERROR("[motor_bench] inventory full (%d)", MB_CHANNEL_MAX);
         return MB_ERR_NO_RESOURCE;
     }
-    if (!instance || (can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_HT)
+    if (!instance || (can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_DM8009P)
     {
         LOGERROR("[motor_bench] register failed: bad param kind=%d bus=%d id=%d", (int)kind, can_bus, motor_id);
         return MB_ERR_BAD_PARAM;
@@ -619,7 +620,7 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
         *out_ch = 0xFF;
 
     /* 1. 基本参数 */
-    if ((can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_HT || motor_id == 0)
+    if ((can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_DM8009P || motor_id == 0)
     {
         LOGERROR("[motor_bench] add rejected: bad param kind=%d bus=%d id=%d", (int)kind, can_bus, motor_id);
         return MB_ERR_BAD_PARAM;
@@ -634,7 +635,7 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
      *   界面上会误以为它生效了,而实际完全没有作用 ——
      *   这种"看起来配了、其实没生效"的静默忽略比报错更难排查。
      */
-    if (kind == MB_MOTOR_DM)
+    if (MotorBenchIsDMKind(kind))
     {
         if (rx_id == 0 || rx_id > 0x7ff)
         {
@@ -662,7 +663,9 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
     /* 2. 重复:同一总线上已有相同 (kind, bus, id) */
     for (uint8_t i = 0; i < mb_inventory_used; i++)
     {
-        if (mb_inventory[i].is_used && mb_inventory[i].kind == kind &&
+        if (mb_inventory[i].is_used &&
+            (mb_inventory[i].kind == kind ||
+             (MotorBenchIsDMKind(kind) && MotorBenchIsDMKind(mb_inventory[i].kind))) &&
             mb_inventory[i].can_bus == can_bus && mb_inventory[i].motor_id == motor_id)
         {
             LOGERROR("[motor_bench] add rejected: bus%d id%d already exists", can_bus, motor_id);
@@ -723,6 +726,9 @@ uint8_t MotorBenchRemoveMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t moto
         {
             /* 先停输出,再释放资源 */
             MotorBenchForceStopInstance(kind, mb_inventory[i].motor_ptr);
+            for (uint8_t ch = 0; ch < MB_CHANNEL_MAX; ch++)
+                if (mb_channels[ch].is_used && mb_channels[ch].motor_ptr == mb_inventory[i].motor_ptr)
+                    MotorBenchUnbind(ch);
 
             if (mb_motor_destroy && mb_inventory[i].motor_ptr)
                 mb_motor_destroy(kind, mb_inventory[i].motor_ptr);
@@ -730,6 +736,9 @@ uint8_t MotorBenchRemoveMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t moto
             /* 槽位前移,保持清单紧凑 */
             for (uint8_t j = i; j + 1 < mb_inventory_used; j++)
                 mb_inventory[j] = mb_inventory[j + 1];
+            for (uint8_t ch = 0; ch < MB_CHANNEL_MAX; ch++)
+                if (mb_channels[ch].is_used && mb_channels[ch].inv_index > i)
+                    mb_channels[ch].inv_index--;
             mb_inventory_used--;
             mb_inventory[mb_inventory_used].is_used = 0;
 
@@ -773,6 +782,8 @@ uint8_t MotorBenchGetInventory(uint8_t idx, MB_InventoryItemPublic_s *out)
 
 uint8_t MotorBenchBind(uint8_t channel_id, MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, Closeloop_Type_e outer_loop)
 {
+    if (MotorBenchIsDMKind(kind) && !(outer_loop & (ANGLE_LOOP | SPEED_LOOP)))
+        return MB_ERR_UNSUPPORTED;
     if (channel_id >= MB_CHANNEL_MAX)
     {
         LOGERROR("[motor_bench] bind failed: channel %d out of range", channel_id);
@@ -935,6 +946,7 @@ void MotorBenchForceStopInstance(MB_MotorKind_e kind, void *instance)
         DJIMotorStop((DJIMotorInstance *)instance);
         break;
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
         DMMotorStop((DMMotorInstance *)instance);
         break;
     default:
@@ -954,6 +966,7 @@ static uint8_t MotorBenchEnableInstance(MB_MotorKind_e kind, void *instance, uin
         enable ? DJIMotorEnable((DJIMotorInstance *)instance) : DJIMotorStop((DJIMotorInstance *)instance);
         return 1;
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
         enable ? DMMotorEnable((DMMotorInstance *)instance) : DMMotorStop((DMMotorInstance *)instance);
         return 1;
     default:
@@ -974,6 +987,7 @@ static uint8_t MotorBenchSetRefInstance(MB_MotorKind_e kind, void *instance, flo
         DJIMotorSetRef((DJIMotorInstance *)instance, ref);
         return 1;
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
         DMMotorSetRef((DMMotorInstance *)instance, ref);
         return 1;
     default:
@@ -1003,14 +1017,44 @@ static uint8_t MotorBenchSetLoopInstance(MB_MotorKind_e kind, void *instance, Cl
         return 1;
 
     case MB_MOTOR_DM:
-        /* DM 驱动当前未提供运行期切环接口,保持在初始化时设定的闭环 */
-        LOGWARNING("[motor_bench] DM motor: loop switch not supported, keeping initial");
+    case MB_MOTOR_DM8009P:
+        if (!(loop & (ANGLE_LOOP | SPEED_LOOP)))
+            return 0;
+        DMMotorOuterLoop((DMMotorInstance *)instance, loop);
         return 1;
 
     default:
         LOGERROR("[motor_bench] kind %d not wired for loop switch", (int)kind);
         return 0;
     }
+}
+
+uint8_t MotorBenchSetLoop(uint8_t channel_id, Closeloop_Type_e loop)
+{
+    if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
+        return MB_ERR_BAD_PARAM;
+    /* Reject malformed cascades before changing any state. */
+    if (!loop || (loop & ~ALL_THREE_LOOP) || ((loop & ANGLE_LOOP) && !(loop & SPEED_LOOP)))
+        return MB_ERR_BAD_PARAM;
+    MB_MotorChannel_s *ch = &mb_channels[channel_id];
+    if (MotorBenchIsDMKind(ch->kind) && !(loop & SPEED_LOOP))
+        return MB_ERR_UNSUPPORTED;
+    if (!MotorBenchIsDMKind(ch->kind) && ch->kind != MB_MOTOR_GM6020 &&
+        ch->kind != MB_MOTOR_M3508 && ch->kind != MB_MOTOR_M2006)
+        return MB_ERR_UNSUPPORTED;
+
+    MotorBenchSetEnable(channel_id, 0);
+    if (!MotorBenchSetLoopInstance(ch->kind, ch->motor_ptr, loop))
+        return MB_ERR_UNSUPPORTED;
+    ch->outer_loop = loop;
+    ch->position_zero = 0.0f; /* Next enable captures a fresh position origin. */
+    ch->ref_cmd = 0.0f;
+    MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, 0.0f);
+    /* Never mix samples collected in different units in the next telemetry. */
+    mb_tele_acc_current[channel_id] = 0.0f;
+    mb_tele_acc_voltage[channel_id] = 0.0f;
+    mb_tele_acc_count[channel_id] = 0;
+    return MB_OK;
 }
 
 uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
@@ -1020,10 +1064,25 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
 
     MB_MotorChannel_s *ch = &mb_channels[channel_id];
     /* Stop and every disabled -> enabled edge discard any previous target. */
+    if (enable)
+    {
+        MB_TelemetryItem_s feedback;
+        if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1))
+            return MB_ERR_BAD_PARAM;
+    }
+    if (enable && !ch->status_bit_enable && (ch->outer_loop & ANGLE_LOOP))
+    {
+        MB_TelemetryItem_s feedback;
+        if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1) || !isfinite(feedback.measure_angle))
+            return MB_ERR_BAD_PARAM;
+        /* GetMeasure reports angle relative to the previous origin. */
+        ch->position_zero += feedback.measure_angle;
+    }
     if (!enable || !ch->status_bit_enable)
     {
         MotorBenchForceStopInstance(ch->kind, ch->motor_ptr);
-        if (!MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, 0.0f))
+        float zero_ref = (ch->outer_loop & ANGLE_LOOP) ? ch->position_zero : 0.0f;
+        if (!MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, zero_ref))
             return MB_ERR_UNSUPPORTED;
         ch->ref_cmd = 0.0f;
     }
@@ -1122,6 +1181,18 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
         (outer == SPEED_LOOP || outer == SPEED_AND_CURRENT_LOOP);
 
     float to_send = need_rpm_conv ? limited * RPM_2_ANGLE_PER_SEC : limited;
+    if (outer & ANGLE_LOOP)
+    {
+        /* Position targets are relative degrees, never rpm. */
+        LIMIT_MIN_MAX(limited, -360.0f, 360.0f);
+        to_send = limited + mb_channels[channel_id].position_zero;
+        if (MotorBenchIsDMKind(mb_channels[channel_id].kind))
+        {
+            DMMotorInstance *m = (DMMotorInstance *)mb_channels[channel_id].motor_ptr;
+            LIMIT_MIN_MAX(to_send, -m->p_max * RAD_2_DEGREE, m->p_max * RAD_2_DEGREE);
+            limited = to_send - mb_channels[channel_id].position_zero;
+        }
+    }
 
     if (!MotorBenchSetRefInstance(mb_channels[channel_id].kind, mb_channels[channel_id].motor_ptr, to_send))
         return MB_ERR_UNSUPPORTED;
@@ -1185,13 +1256,14 @@ uint8_t MotorBenchGetMeasure(uint8_t channel_id, MB_TelemetryItem_s *out)
             break;
         out->measure_speed = m->measure.speed_aps / 6.0f; /* aps -> rpm */
         out->measure_torque = (float)m->measure.real_current;
-        out->measure_angle = m->measure.angle_single_round;
+        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? m->measure.total_angle - ch->position_zero : m->measure.angle_single_round;
         out->temperature = (int8_t)m->measure.temperature;
         /* 先判空再调用,避免 daemon 未注册时解引用空指针 */
         out->status |= (m->daemon && DaemonIsOnline(m->daemon)) ? 0x01 : 0x00;
         break;
     }
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
     {
         DMMotorInstance *m = (DMMotorInstance *)ch->motor_ptr;
         if (!m)
@@ -1199,6 +1271,8 @@ uint8_t MotorBenchGetMeasure(uint8_t channel_id, MB_TelemetryItem_s *out)
         out->measure_speed = m->measure.velocity; /* rad/s */
         out->measure_torque = m->measure.torque;  /* N·m */
         out->measure_angle = m->measure.position * RAD_2_DEGREE;
+        if (ch->outer_loop & ANGLE_LOOP)
+            out->measure_angle -= ch->position_zero;
         out->status |= (m->daemon && DaemonIsOnline(m->daemon)) ? 0x01 : 0x00;
         break;
     }
@@ -1426,6 +1500,13 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
         case MB_FRAME_MOTOR_UNBIND:
             MotorBenchHandleUnbind(payload, payload_len);
             break;
+        case MB_FRAME_LOOP_SET:
+            if (payload_len >= 2)
+            {
+                uint8_t ack[3] = {payload[0], payload[1], MotorBenchSetLoop(payload[0], (Closeloop_Type_e)payload[1])};
+                MotorBenchSendTypedFrame(MB_FRAME_LOOP_SET_ACK, ack, sizeof(ack));
+            }
+            break;
         default:
             LOGWARNING("[motor_bench] unknown frame type 0x%02X", type);
             break;
@@ -1575,11 +1656,17 @@ static void MotorBenchHandleSetPid(uint8_t *buf, uint16_t len)
                                ((uint32_t)buf[12] << 16) | ((uint32_t)buf[13] << 24));
     int32_t intlim = (int32_t)((uint32_t)buf[14] | ((uint32_t)buf[15] << 8) |
                                ((uint32_t)buf[16] << 16) | ((uint32_t)buf[17] << 24));
-    uint16_t improve = (uint16_t)(buf[2] | (buf[3] << 8));
+    uint16_t improve = buf[2];
+    float limit_scale = (buf[3] & 1u) ? 1000.0f : 1.0f;
 
-    MotorBenchSetPid(buf[0], buf[1],
+    uint8_t result = MotorBenchSetPid(buf[0], buf[1],
                       (float)kp / 100.0f, (float)ki / 100.0f, (float)kd / 100.0f,
-                      (float)maxout, (float)intlim, improve);
+                      (float)maxout / limit_scale, (float)intlim / limit_scale, improve);
+    if (result != MB_OK)
+    {
+        MB_PidSetAck_s ack = {.channel_id = buf[0], .loop = buf[1], .result = result};
+        MotorBenchSendTypedFrame(MB_FRAME_PID_SET_ACK, (const uint8_t *)&ack, sizeof(ack));
+    }
 }
 
 /**
@@ -1609,10 +1696,10 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
         return MB_ERR_BAD_PARAM;
 
-    /* 参数合理性:停机、拒收 NaN,负值钳到 0 */
-    if (!(kp >= 0.0f) || !(ki >= 0.0f) || !(kd >= 0.0f))
+    /* 拒收非有限值与负参数。 */
+    if (!isfinite(kp) || !isfinite(ki) || !isfinite(kd) || kp < 0 || ki < 0 || kd < 0)
         return MB_ERR_BAD_PARAM;
-    if (!(max_out >= 0.0f) || !(integral_limit >= 0.0f))
+    if (!isfinite(max_out) || !isfinite(integral_limit) || max_out < 0 || integral_limit < 0)
         return MB_ERR_BAD_PARAM;
 
     MB_MotorChannel_s *ch = &mb_channels[channel_id];
@@ -1649,10 +1736,28 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
         break;
     }
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
+    {
+        DMMotorInstance *m = (DMMotorInstance *)inst;
+        if (!m) return MB_ERR_BAD_PARAM;
+        if (loop == MB_PID_LOOP_SPEED)
+        {
+            if (max_out > m->t_max) return MB_ERR_BAD_PARAM;
+            target = &m->speed_PID;
+        }
+        else if (loop == MB_PID_LOOP_ANGLE)
+        {
+            if (max_out > m->v_max) return MB_ERR_BAD_PARAM;
+            target = &m->angle_PID;
+        }
+        else
+            return MB_ERR_UNSUPPORTED;
+        break;
+    }
     case MB_MOTOR_LK:
     case MB_MOTOR_HT:
     {
-        /* 达妙/LK/HT 的三环结构在各自驱动内部,这里不直接改,
+        /* LK/HT 的三环结构在各自驱动内部,这里不直接改,
          * 由后续按型号扩展;当前返回明确的不支持码而非静默丢弃。 */
         return MB_ERR_UNSUPPORTED;
     }
@@ -1705,22 +1810,34 @@ uint8_t MotorBenchQueryPid(uint8_t channel_id)
     rep.channel_id = channel_id;
     rep.kind = (uint8_t)ch->kind;
 
-    if (ch->kind == MB_MOTOR_DM || ch->kind == MB_MOTOR_LK || ch->kind == MB_MOTOR_HT)
+    if (ch->kind == MB_MOTOR_LK || ch->kind == MB_MOTOR_HT)
     {
         /* 非 DJI 系暂无逐环读取接口,回一个空报表让上位机知道"查了但没数据" */
         MotorBenchSendTypedFrame(MB_FRAME_PID_REPORT, (const uint8_t *)&rep, sizeof(rep));
         return MB_ERR_UNSUPPORTED;
     }
 
-    DJIMotorInstance *m = (DJIMotorInstance *)ch->motor_ptr;
-    if (!m)
+    if (!ch->motor_ptr)
         return MB_ERR_BAD_PARAM;
 
-    const PIDInstance *srcs[3] = {
-        &m->motor_controller.speed_PID,
-        &m->motor_controller.current_PID,
-        &m->motor_controller.angle_PID,
-    };
+    const PIDInstance *srcs[3];
+    float limit_scale = 1.0f;
+    if (MotorBenchIsDMKind(ch->kind))
+    {
+        DMMotorInstance *m = (DMMotorInstance *)ch->motor_ptr;
+        srcs[0] = &m->speed_PID;
+        srcs[1] = &m->current_PID;
+        srcs[2] = &m->angle_PID;
+        limit_scale = 1000.0f;
+        rep.reserved[0] = 1; /* Fractional torque/speed limits, encoded x1000. */
+    }
+    else
+    {
+        DJIMotorInstance *m = (DJIMotorInstance *)ch->motor_ptr;
+        srcs[0] = &m->motor_controller.speed_PID;
+        srcs[1] = &m->motor_controller.current_PID;
+        srcs[2] = &m->motor_controller.angle_PID;
+    }
 
     for (uint8_t i = 0; i < 3; i++)
     {
@@ -1738,9 +1855,9 @@ uint8_t MotorBenchQueryPid(uint8_t channel_id)
         rep.loop_kp_x100[i] = kp > 655.0f ? 65500u : (uint16_t)(kp * 100.0f + 0.5f);
         rep.loop_ki_x100[i] = ki > 655.0f ? 65500u : (uint16_t)(ki * 100.0f + 0.5f);
         rep.loop_kd_x100[i] = kd > 655.0f ? 65500u : (uint16_t)(kd * 100.0f + 0.5f);
-        /* 大限幅按 s32 原值下发,不缩放(缩放会溢出,见 MB_PidSetReq_s 注释) */
-        rep.loop_maxout[i] = (mo > 2147483000.0f) ? 2147483000 : (int32_t)mo;
-        rep.loop_intlim[i] = (il > 2147483000.0f) ? 2147483000 : (int32_t)il;
+        /* DJI 限幅按 s32 原值下发，DM 使用 x1000 保留小数。 */
+        rep.loop_maxout[i] = (mo * limit_scale > 2147483000.0f) ? 2147483000 : (int32_t)roundf(mo * limit_scale);
+        rep.loop_intlim[i] = (il * limit_scale > 2147483000.0f) ? 2147483000 : (int32_t)roundf(il * limit_scale);
         rep.loop_improve[i] = (uint8_t)srcs[i]->Improve;
     }
 
@@ -1774,6 +1891,29 @@ static void MotorBenchSendHeartbeatAck(void)
 
 void MotorBenchTask(void)
 {
+    /* Drivers latch STOP on feedback loss, even if feedback returned between
+     * control and this task. Keep bindings/PID, discard the old test target. */
+    for (uint8_t i = 0; i < MB_CHANNEL_MAX; i++)
+    {
+        MB_MotorChannel_s *ch = &mb_channels[i];
+        if (!ch->is_used || !ch->status_bit_enable)
+            continue;
+        MB_TelemetryItem_s feedback;
+        Motor_Working_Type_e stopped;
+        if (MotorBenchIsDMKind(ch->kind))
+            stopped = ((DMMotorInstance *)ch->motor_ptr)->stop_flag;
+        else if (ch->kind == MB_MOTOR_M2006 || ch->kind == MB_MOTOR_M3508 || ch->kind == MB_MOTOR_GM6020)
+            stopped = ((DJIMotorInstance *)ch->motor_ptr)->stop_flag;
+        else
+            continue;
+        if (stopped == MOTOR_STOP ||
+            (MotorBenchGetMeasure(i, &feedback) == MB_OK && !(feedback.status & 1)))
+        {
+            MotorBenchSetEnable(i, 0);
+            MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, 0.0f);
+            LOGWARNING("[motor_bench] ch%u offline: stopped; reconnect requires manual enable", i);
+        }
+    }
     /*
      * 先把 USB 接收队列里积压的数据全部解析掉。
      * @attention 这一步必须在任务上下文做,且要先于任何耗时动作 ——

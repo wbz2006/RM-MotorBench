@@ -35,6 +35,8 @@ import {
   buildMotorRemove,
   buildUnbind,
   parseUnbindAck,
+  buildSetLoop,
+  parseLoopSetAck,
   buildSetPid,
   buildPidQuery,
   parsePidReport,
@@ -82,8 +84,8 @@ const MIME = {
 };
 
 const server = http.createServer((req, res) => {
-  const urlPath = req.url === '/' ? '/index.html' : req.url.split('?')[0];
-  const safe = path.normalize(urlPath).replace(/^(\.\.[/\\])+/, '');
+  const urlPath = req.url.split('?')[0];
+  const safe = path.normalize(urlPath === '/' ? '/index.html' : urlPath).replace(/^(\.\.[/\\])+/, '');
   const filePath = path.join(__dirname, safe);
   if (!filePath.startsWith(__dirname)) {
     res.writeHead(403).end('forbidden');
@@ -94,7 +96,10 @@ const server = http.createServer((req, res) => {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('404');
       return;
     }
-    res.writeHead(200, { 'content-type': MIME[path.extname(filePath)] ?? 'application/octet-stream' });
+    res.writeHead(200, {
+      'content-type': MIME[path.extname(filePath)] ?? 'application/octet-stream',
+      'cache-control': 'no-store',
+    });
     res.end(data);
   });
 });
@@ -199,7 +204,7 @@ function handleCommand(cmd) {
 
 wss.on('connection', (ws) => {
   broadcast({ type: 'clients', count: wss.clients.size });
-  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels'] }));
+  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels', 'setLoop'] }));
   // A page reload does not close the Node-owned USB serial connection.
   ws.send(JSON.stringify({ type: 'serial', open: !!serialPort?.isOpen,
     path: serialPort?.path, baud: serialPort?.baudRate }));
@@ -285,6 +290,13 @@ wss.on('connection', (ws) => {
           data: { channelId, result: MBResult.BAD_PARAM },
         }));
         ws.send(JSON.stringify({ type: 'error', message: '串口未连接,请先打开串口' }));
+      }
+    } else if (cmd.type === 'setLoop') {
+      const { channelId, mask } = cmd;
+      const valid = Number.isInteger(channelId) && channelId >= 0 && channelId < 8 &&
+        Number.isInteger(mask) && mask >= 1 && mask <= 7 && (!(mask & 4) || !!(mask & 2));
+      if (!valid || !writeToSerial(buildSetLoop(channelId, mask))) {
+        ws.send(JSON.stringify({ type: 'loopAck', data: { channelId, mask, result: MBResult.BAD_PARAM } }));
       }
     } else if (cmd.type === 'pidSet') {      /*
        * 运行期写入 PID。板端回 0x8C 帧确认,驱动前会停机并清历史量。
@@ -380,6 +392,9 @@ async function openSerial(portPath, baud) {
         } else if (fr.type === FrameType.UNBIND_ACK) {
           const ack = parseUnbindAck(fr.payload);
           if (ack) broadcast({ type: 'unbindAck', data: ack });
+        } else if (fr.type === FrameType.LOOP_SET_ACK) {
+          const ack = parseLoopSetAck(fr.payload);
+          if (ack) broadcast({ type: 'loopAck', data: ack });
         }
       }
     });
