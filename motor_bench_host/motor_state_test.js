@@ -15,10 +15,22 @@ const appSource = fs.readFileSync(path.join(root, 'application/motor_bench_app/m
 const dmConfigBuilder = appSource.match(/static void BenchBuildDMConfig\([\s\S]*?\n\}/)?.[0];
 const motorDestroy = appSource.match(/static void BenchMotorDestroy\([\s\S]*?\n\}/)?.[0];
 const supportsDm8009p = appSource.includes('MB_MOTOR_DM8009P');
+/*
+ * 2026-10-19:LK/HT 接入后,工厂里新增了对 BenchBuildLKConfig /
+ * BenchBuildHTConfig 的调用。harness 是按"从 app 源码里抽取函数原文"
+ * 的方式编译的,所以这两个 builder 也必须一并抽取,否则报
+ * implicit declaration。
+ */
+const lkConfigBuilder = appSource.match(/static void BenchBuildLKConfig\([\s\S]*?\n\}/)?.[0];
+const htConfigBuilder = appSource.match(/static void BenchBuildHTConfig\([\s\S]*?\n\}/)?.[0];
+const supportsLkHt = !!lkConfigBuilder && !!htConfigBuilder;
 const motorFactory = appSource.match(/static uint8_t BenchMotorFactory\([\s\S]*?\n\}/)?.[0];
 assert.ok(motorFactory, 'profile tests must use the actual application factory');
 assert.ok(motorDestroy, 'deletion tests must use the actual application destructor');
 assert.ok(dmConfigBuilder, 'DM tests must use the actual application defaults');
+if (supportsLkHt) {
+  assert.ok(lkConfigBuilder && htConfigBuilder, 'LK/HT builders must be extractable');
+}
 const djiConfigSection = appSource.slice(appSource.indexOf('#define BENCH_PID_TABLE_SIZE'), appSource.indexOf('static void BenchBuildDMConfig('));
 assert.ok(djiConfigSection.includes('static void BenchBuildDJIConfig('));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-motor-state-'));
@@ -71,7 +83,35 @@ int HAL_CAN_AbortTxRequest(CAN_HandleTypeDef *can, uint32_t mailbox);
 void HAL_CAN_GetRxMessage(CAN_HandleTypeDef *can, uint32_t fifo, CAN_RxHeaderTypeDef *header, uint8_t *bytes);
 `,
   'arm_math.h': '#pragma once\n',
-  'cmsis_os.h': '#pragma once\nstatic inline void vTaskSuspendAll(void) {}\nstatic inline void xTaskResumeAll(void) {}\n',
+  /*
+   * cmsis_os.h stub —— 2026-10-19 扩展。
+   *
+   * HT04.c 的 HTMotorControlInit() 用 osThreadDef / osThreadCreate
+   * 给每颗 HT 电机建任务,而原来的 stub 只有 vTaskSuspendAll /
+   * xTaskResumeAll,远远不够。这里补上 CMSIS-RTOS v1 的线程 API 桩
+   * (返回 NULL / 空实现),让 HT04.c 能链上;
+   * 测试并不真正跑那些任务,只是需要符号存在。
+   */
+  'cmsis_os.h': `#pragma once
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+typedef void *osThreadId;
+typedef void (*os_pthread)(void const *);
+#define osPriorityNormal 0
+static inline void vTaskSuspendAll(void) {}
+static inline void xTaskResumeAll(void) {}
+static inline void osDelay(uint32_t ms) { (void)ms; }
+/* HT04.c 用 __itoa();本机工具链是 MinGW,没有这个 newlib 符号,补一个桩 */
+static inline char *__itoa(int value, char *buf, int radix) { (void)radix; sprintf(buf, "%d", value); return buf; }
+/* HT04.c 用 osThreadDef(name,fn,prio,inst,stack) 定义一个线程描述符,
+ * 再用 osThread(name) 取它、交给 osThreadCreate。测试不真跑这些任务,
+ * 只要符号能链上即可,故 osThreadCreate 直接返回 NULL。 */
+#define osThreadDef(name, thread, priority, instances, stacksz) \\
+  static const struct { const char *n; os_pthread f; } os_##name = { #name, thread }
+#define osThread(name) (&os_##name)
+static inline osThreadId osThreadCreate(const void *td, void const *arg) { (void)td; (void)arg; return NULL; }
+`,
   'bsp_dwt.h': `#pragma once
 #include <stdint.h>
 float DWT_GetDeltaT(uint32_t *last);
@@ -238,6 +278,8 @@ static void dm_feedback(DMMotorInstance *m, unsigned speed) {
 }
 ${djiConfigSection}
 ${dmConfigBuilder}
+${supportsLkHt ? lkConfigBuilder : ''}
+${supportsLkHt ? htConfigBuilder : ''}
 ${motorDestroy}
 ${supportsDm8009p ? motorFactory : ''}
 static int lifecycle(void) {
@@ -1136,13 +1178,26 @@ try {
     try { execFileSync(cc, ['--version'], { env, stdio: 'pipe' }); return true; } catch { return false; }
   });
   if (!compiler) throw new Error('Native gcc/clang is required for motor state regression tests');
+  /*
+   * include 路径必须覆盖 motor_bench.h 实际 include 的所有头文件。
+   * @note 2026-10-19:motor_bench.h 新增 LK9025.h / HT04.h
+   *   (LK/HT 接入测试台),所以补上这两个目录 —— 少一个就是
+   *   "fatal error: LK9025.h: No such file or directory"。
+   */
   const includes = [tmp, 'modules', 'modules/motor', 'modules/motor/DJImotor',
-    'modules/motor/DMmotor', 'modules/motor_bench', 'modules/algorithm',
+    'modules/motor/DMmotor', 'modules/motor/LKmotor', 'modules/motor/HTmotor',
+    'modules/motor_bench', 'modules/algorithm',
     'modules/daemon', 'bsp/can', 'bsp/usart', 'bsp/log', 'application',
     'Middlewares/Third_Party/SEGGER/RTT', 'Middlewares/Third_Party/SEGGER/Config']
     .flatMap((p) => ['-I', path.isAbsolute(p) ? p : path.join(root, p)]);
+  /*
+   * 2026-10-19:motor_bench.c 新增了 LK/HT 的分发调用,
+   * 所以链接列表要带上这两个库,否则 undefined reference。
+   */
   const sources = ['modules/motor_bench/motor_bench.c', 'modules/motor/DJImotor/dji_motor.c',
-    'modules/motor/DMmotor/dmmotor.c', 'modules/algorithm/controller.c',
+    'modules/motor/DMmotor/dmmotor.c', 'modules/motor/LKmotor/LK9025.c',
+    'modules/motor/HTmotor/HT04.c',
+    'modules/algorithm/controller.c', 'modules/algorithm/user_lib.c',
     'modules/algorithm/crc8.c', 'modules/daemon/daemon.c', 'bsp/can/bsp_can.c',
     'Middlewares/Third_Party/SEGGER/RTT/SEGGER_RTT_printf.c']
     .map((p) => path.join(root, p));

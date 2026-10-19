@@ -51,14 +51,24 @@ export const MotorKind = {
   DM8009P: 7,
 };
 
+/*
+ * 电机种类显示名称。
+ *
+ * @attention 统一为「厂商 + 型号」格式(2026-10-19 用户要求"与大疆系保持一致")。
+ *   DJI 三型原本就带"大疆 "前缀,而达妙/岭芯/海泰是裸型号 ——
+ *   混排会让下拉列表读起来一半正式一半潦草。现在全部带厂商前缀。
+ *
+ * @note 前缀用品牌常用中文名,不写英文厂商全称:
+ *   "达妙"而非 "DM-robots",与实验室口头叫法一致。
+ */
 export const MotorKindLabel = {
   [MotorKind.GM6020]: '大疆 GM6020',
   [MotorKind.M3508]: '大疆 M3508',
   [MotorKind.M2006]: '大疆 M2006',
-  [MotorKind.DM]: 'DM4310',
-  [MotorKind.DM8009P]: 'DM8009P',
-  [MotorKind.LK]: 'LK9025',
-  [MotorKind.HT]: 'HT04',
+  [MotorKind.DM]: '达妙 DM4310',
+  [MotorKind.DM8009P]: '达妙 DM8009P',
+  [MotorKind.LK]: '岭芯 LK9025',
+  [MotorKind.HT]: '海泰 HT04',
 };
 
 /* ============================================================
@@ -88,19 +98,23 @@ export function usesDjiIdSegment(kind) {
 /**
  * 该型号是否需要上位机显式指定 rx_id(反馈 ID)
  *
- * @note 只有达妙 DM 需要 —— 它走 MIT 协议,发送(tx_id)与接收(rx_id)
- *   是两个独立 ID。DJI 系是"一拖四"打包协议,rx_id 由驱动内部
- *   按 0x200+id+1 / 0x204+id+1 算出,上位机传了也会被忽略。
+ * @note 2026-10-19 起包含 HT04 —— 它的 HTMotorInit() 直接拿
+ *   can_init_config.rx_id 建 CAN 过滤器,不做内部改写,与 DM 一样
+ *   必须显式给(多颗 HT 靠它区分)。
+ *
+ *   DJI 三型与 LK9025 不需要:rx_id 由驱动内部算出,传了也会被忽略。
  *
  * @returns {boolean} true = 界面上要给 rx_id 输入框
  */
 export function needsRxId(kind) {
-  return kind === MotorKind.DM || kind === MotorKind.DM8009P;
+  return kind === MotorKind.DM
+    || kind === MotorKind.DM8009P
+    || kind === MotorKind.HT;
 }
 
 /**
  * rx_id 的合法范围(CAN 标准帧 11 位 ID)
- * @note 达妙电机的反馈 ID 由电调侧配置决定,常见 0x00~0x0F 一小段,
+ * @note 电调的反馈 ID 由电调侧配置决定,常见 0x00~0x0F 一小段,
  *   但协议层不替用户猜范围,只保证不越出 CAN 标准帧上限。
  */
 export const RX_ID_MIN = 0;
@@ -108,11 +122,20 @@ export const RX_ID_MAX = 0x7ff;
 
 /**
  * 预估某配置算出的反馈 ID(rx_id)
- * @returns {number} rx_id;非 DJI 系返回 0(表示不占用该 ID 段)
+ *
+ * @note 必须与固件 motor_bench.c 的 MotorBenchPredictRxId() 一致:
+ *   GM6020      : 0x204 + id
+ *   M3508/M2006 : 0x200 + id
+ *   LK9025      : 0x140 + id   ← 2026-10-19 补入;LK 驱动内部改写,
+ *                                与用户填的 ID 不同,此前预检完全跳过它
+ *   DM / HT     : 0 —— rx_id 由请求显式指定,不按 motor_id 推导
+ *
+ * @returns {number} rx_id;0 表示不按 motor_id 推导(跳过预检)
  */
 export function predictRxId(kind, motorId) {
   if (kind === MotorKind.GM6020) return 0x204 + motorId;
   if (kind === MotorKind.M3508 || kind === MotorKind.M2006) return 0x200 + motorId;
+  if (kind === MotorKind.LK) return 0x140 + motorId;
   return 0;
 }
 
@@ -584,6 +607,27 @@ export const PID_DEFAULTS = {
   [MotorKind.DM8009P]: {
     speed: { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 0, improve: 1 },
     current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
+    angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
+  },
+  /*
+   * 岭芯 LK9025 / 海泰 HT04 —— 2026-10-19 接入测试台。
+   *
+   * @attention 这两组数字是**未经实机验证的保守基线**,目的只是
+   *   "能转起来且不立刻振荡",不是整定结论。速度单位都是 rad/s
+   *   (与 DM 一致),不是 DJI 的 rpm。真机必须重新整定。
+   *
+   * @note 与固件 BenchBuildLKConfig/BenchBuildHTConfig 保持一致:
+   *   速度环 Kp=0.5/MaxOut=5,电流环 Kp=0.7/Ki=0.1/MaxOut=5,
+   *   位置环 Kp=0.1/MaxOut=2。
+   */
+  [MotorKind.LK]: {
+    speed: { Kp: 0.5, Ki: 0, Kd: 0, MaxOut: 5, IntegralLimit: 0, improve: 1 },
+    current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 5, IntegralLimit: 0, improve: 1 },
+    angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
+  },
+  [MotorKind.HT]: {
+    speed: { Kp: 0.5, Ki: 0, Kd: 0, MaxOut: 5, IntegralLimit: 0, improve: 1 },
+    current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 5, IntegralLimit: 0, improve: 1 },
     angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
   },
 };

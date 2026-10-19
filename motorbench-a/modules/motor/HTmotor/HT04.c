@@ -211,6 +211,28 @@ void HTMotorControlInit()
         return;
     for (size_t i = 0; i < idx; i++)
     {
+        /*
+         * @attention 2026-10-19 增加防重复保护。
+         *
+         * 原实现没有检查 ht_task_handle[i] 是否已建过任务 ——
+         * 该数组赋值后从未被读取,纯粹是个"写了没人看"的字段。
+         * 在"开机一次性静态配置"下看不出问题(RobotInit 里只调一次),
+         * 但测试台支持**运行期动态创建电机**:每加一颗 HT 都要再调
+         * 一次本函数,于是已建过任务的实例会被**重复建任务** ——
+         * 两个任务同时驱动同一实例,CAN 控制帧重复发送,总线拥塞。
+         *
+         * 加一道"已建过就跳过"的判断,让本函数可安全重复调用。
+         *
+         * @note 这里只解决"重复创建",不解决"移除电机后任务仍在跑"。
+         *   HT 库没有提供 HTMotorDeinit/osThreadDelete 接口,
+         *   而测试台的 BenchMotorDestroy 会 free 掉实例 ——
+         *   已建任务会继续访问已释放的内存(悬空指针)。
+         *   彻底修需要给 HT 库加实例销毁接口,属驱动层改动,
+         *   当前先在上层文档标注该限制,见 motor_bench_app.c 的说明。
+         */
+        if (ht_task_handle[i] != NULL)
+            continue;
+
         char ht_id_buff[2] = {0};
         __itoa(i, ht_id_buff, 10);
         strcat(ht_task_name, ht_id_buff); // 似乎没什么吊用,osthreaddef会把第一个变量当作宏字符串传入,作为任务名

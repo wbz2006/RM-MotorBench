@@ -21,6 +21,8 @@
 #include "motor_def.h"
 #include "dji_motor.h"
 #include "dmmotor.h"
+#include "LK9025.h"
+#include "HT04.h"
 #include "general_def.h"
 
 /* ============================================================

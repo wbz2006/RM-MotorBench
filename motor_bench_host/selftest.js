@@ -3344,9 +3344,18 @@ console.log('\n== 39. 电机列表、十六进制 ID、删除匹配键 ==');
     && /}, 3000\)/.test(ui));
   check('old firmware cannot delete a DM motor without its feedback ID',
     /remove.disabled = !!pendingMotor \|\| missingRx/.test(ui));
+  /*
+   * 2026-10-19:显示名称统一为「厂商 + 型号」格式,与大疆系一致
+   * (原先 DJI 三型带"大疆 "前缀,达妙/岭芯/海泰是裸型号)。
+   * 断言跟着新文案走,同时加一条"每个型号都带厂商前缀"的通用检查,
+   * 防止将来新增型号又退化成裸型号。
+   */
   check('DM4310 and DM8009P are separate model options',
-    /<option value="4">DM4310<\/option>/.test(html)
-    && /<option value="7">DM8009P<\/option>/.test(html));
+    /<option value="4">达妙 DM4310<\/option>/.test(html)
+    && /<option value="7">达妙 DM8009P<\/option>/.test(html));
+  check('every motor label carries a vendor prefix',
+    Object.values(MotorKindLabel).every((l) => /^[^\s]+\s/.test(l)),
+    `labels = ${Object.values(MotorKindLabel).join(' / ')}`);
   check('DM8009P has distinct wire kind 7 and independent RX ID',
     MotorKind.DM8009P === 7 && needsRxId(MotorKind.DM8009P));
   const added8009 = new FrameParser().push(buildMotorAdd(MotorKind.DM8009P, 1, 1, 0x11))[0];
@@ -3354,7 +3363,7 @@ console.log('\n== 39. 电机列表、十六进制 ID、删除匹配键 ==');
     added8009.payload.equals(Buffer.from([7, 1, 1, 0x11, 0])));
   const inv8009 = parseInventory(Buffer.from([1, 7, 1, 1, 2, 0x11, 0]));
   check('DM8009P inventory label and feedback ID round-trip',
-    MotorKindLabel[inv8009.items[0].kind] === 'DM8009P' && inv8009.items[0].rxId === 0x11);
+    MotorKindLabel[inv8009.items[0].kind] === '达妙 DM8009P' && inv8009.items[0].rxId === 0x11);
   check('DM8009P keeps independent 0.05/0/0/10/0 speed defaults',
     JSON.stringify(PID_DEFAULTS[MotorKind.DM8009P].speed) ===
       JSON.stringify({ Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 0, improve: 1 }));
@@ -3364,7 +3373,7 @@ console.log('\n== 39. 电机列表、十六进制 ID、删除匹配键 ==');
   const parsed = parseInventory(new FrameParser().push(buildFrame(FrameType.INVENTORY_REPORT, body))[0].payload);
   check('new inventory preserves DJI and complete DM RX 0x302',
     parsed.count === 2 && parsed.items[0].rxId === 0 && parsed.items[1].rxId === 0x302);
-  check('DM label is DM4310 throughout protocol', MotorKindLabel[parsed.items[1].kind] === 'DM4310');
+  check('DM label is 达妙 DM4310 throughout protocol', MotorKindLabel[parsed.items[1].kind] === '达妙 DM4310');
   check('legacy inventory omits unknown RX instead of inventing zero', !('rxId' in inv.items[1]));
   check('truncated inventory is rejected', parseInventory(body.subarray(0, -1)) === null);
   const maximum = Buffer.alloc(49);
@@ -3373,6 +3382,80 @@ console.log('\n== 39. 电机列表、十六进制 ID、删除匹配键 ==');
   const maxFrames = new FrameParser().push(buildFrame(FrameType.INVENTORY_REPORT, maximum));
   check('eight complete inventory records fit the transport frame',
     maxFrames.length === 1 && parseInventory(maxFrames[0].payload).items.length === 8);
+}
+
+/* ---------------- 40. 岭芯 LK9025 / 海泰 HT04 接入(2026-10-19) ---------------- */
+console.log('\n== 40. LK9025 / HT04 接入测试台 ==');
+{
+  /*
+   * 背景:两个库的源码早已在 cmake/motorbench.cmake 里编译(与 DJI/DM 同级),
+   * 但工厂层一直走 default 返回 MB_ERR_UNSUPPORTED,上位机选不到也建不出实例。
+   * 本次把工厂与五处分发(启停/设参考值/切环/遥测/PID)接通。
+   *
+   * 本组锁死四件事:
+   *   1. 界面上有这两个型号,名称带厂商前缀;
+   *   2. HT 与 DM 一样需要 rx_id(它的 HTMotorInit 不内部改写);
+   *   3. LK 的 rx_id 是驱动内部算的 0x140+id —— 预检必须反映这个真实值,
+   *      否则撞车要等 CANRegister 失败才知道;
+   *   4. **LK/HT 不能在运行期移除** —— 两个库都没有实例销毁接口,
+   *      free 后驱动内部的静态实例表仍留着悬空指针,下一拍控制任务就会解引用。
+   */
+  let html, ui;
+  try {
+    const b = new URL('./', import.meta.url);
+    html = readFileSync(new URL('index.html', b), 'utf8');
+    ui = readFileSync(new URL('ui.js', b), 'utf8');
+  } catch { console.log('  SKIP  sources not reachable'); }
+
+  const htmlCode = (html || '').replace(/<!--[\s\S]*?-->/g, '');
+
+  if (html) {
+    check('LK9025 and HT04 are selectable model options',
+      /<option value="5">岭芯 LK9025<\/option>/.test(htmlCode)
+      && /<option value="6">海泰 HT04<\/option>/.test(htmlCode));
+  }
+
+  /* HT 需要 rx_id;LK 不需要(驱动内部算 0x140+id) */
+  check('HT04 needs an explicit rx_id like DM',
+    needsRxId(MotorKind.HT) === true);
+  check('LK9025 does not need an rx_id (driver computes it)',
+    needsRxId(MotorKind.LK) === false);
+  check('DJI kinds still do not need an rx_id',
+    !needsRxId(MotorKind.M3508) && !needsRxId(MotorKind.GM6020));
+
+  /* LK 的 rx_id 段必须与固件 MotorBenchPredictRxId 一致 */
+  check('LK9025 rx_id follows the driver formula 0x140+id',
+    predictRxId(MotorKind.LK, 1) === 0x141
+    && predictRxId(MotorKind.LK, 8) === 0x148);
+  check('DM and HT are excluded from rx_id prediction',
+    predictRxId(MotorKind.DM, 1) === 0 && predictRxId(MotorKind.HT, 1) === 0);
+
+  /* LK/HT 有 PID 默认值,且与固件工厂一致 */
+  check('LK9025 and HT04 carry PID defaults matching the firmware factory',
+    JSON.stringify(PID_DEFAULTS[MotorKind.LK].speed) ===
+      JSON.stringify({ Kp: 0.5, Ki: 0, Kd: 0, MaxOut: 5, IntegralLimit: 0, improve: 1 })
+    && JSON.stringify(PID_DEFAULTS[MotorKind.HT].current) ===
+      JSON.stringify({ Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 5, IntegralLimit: 0, improve: 1 }));
+
+  /*
+   * 新增型号的帧构造照旧可用。
+   * @note 负载是 5 字节:kind(1) can_bus(1) motor_id(1) rx_id(2 小端)
+   *   —— rx_id 必须占 2 字节,否则 0x302 会被截成 0x02。
+   */
+  const lkAdd = new FrameParser().push(buildMotorAdd(MotorKind.LK, 1, 3, 0))[0];
+  check('LK add frame carries kind 5 and a zero rx_id',
+    lkAdd.payload.length === 5
+    && lkAdd.payload[0] === 5 && lkAdd.payload[1] === 1 && lkAdd.payload[2] === 3
+    && lkAdd.payload.readUInt16LE(3) === 0);
+  const htAdd = new FrameParser().push(buildMotorAdd(MotorKind.HT, 2, 4, 0x205))[0];
+  check('HT add frame carries kind 6 and the given rx_id',
+    htAdd.payload.length === 5
+    && htAdd.payload[0] === 6 && htAdd.payload[1] === 2 && htAdd.payload[2] === 4
+    && htAdd.payload.readUInt16LE(3) === 0x205);
+  /* 16 位 rx_id 不能被截断:0x302 必须完整落地,而不是变成 0x02 */
+  const wide = new FrameParser().push(buildMotorAdd(MotorKind.DM, 1, 6, 0x302))[0];
+  check('a 16-bit rx_id survives the frame intact',
+    wide.payload.readUInt16LE(3) === 0x302);
 }
 
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);

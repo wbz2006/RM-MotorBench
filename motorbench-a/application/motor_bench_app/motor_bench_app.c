@@ -11,6 +11,8 @@
 #include "bsp_dwt.h"
 #include "can.h"
 #include "usart.h"
+#include "LK9025.h"
+#include "HT04.h"
 #include <string.h> /* memset —— 生成电机配置前必须把整个结构体清零 */
 
 /*
@@ -282,6 +284,120 @@ static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus,
 }
 
 /* ============================================================
+ * 岭芯 LK9025 / 海泰 HT04 —— 2026-10-19 接入
+ *
+ * 这两个库的源码早已在 cmake/motorbench.cmake 里编译(与 DJI/DM 同级),
+ * 但工厂层一直走 default 分支返回 MB_ERR_UNSUPPORTED,
+ * 所以上位机选不到、也建不出实例。本次把工厂接通。
+ *
+ * @attention 两者的对外接口与 DJI/DM 完全同构
+ *   (Motor_Init_Config_s + Motor_Control_Setting_s + 三环 PID +
+ *    CANInstance + daemon),所以不需要新的 config builder,
+ *    直接复用 BenchBuildDJIConfig 的写法即可。
+ *   差别只在 PID 默认值与闭环组合:
+ *     - LK/HT 的电流环同样由驱动内部处理,close_loop 必须含 CURRENT_LOOP;
+ *     - 速度单位都是 rad/s(与 DM 一致),**不是** DJI 的 rpm。
+ * ============================================================ */
+
+/**
+ * @brief 生成岭芯 LK9025 的初始化配置
+ *
+ * @note LK 与 DJI 结构同构,但**没有** LKMotorOuterLoop() 这类切环接口
+ *       (只有 SetRef/Stop/Enable/IsOnline),所以 outer_loop 在建实例时
+ *       写死为 SPEED_LOOP|CURRENT_LOOP,运行期不支持切换 ——
+ *       这一点由 motor_bench.c 的 MotorBenchSetLoopInstance 分流处理。
+ */
+static void BenchBuildLKConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus, uint8_t tx_id)
+{
+    ref->motor_type = MOTOR_TYPE_NONE; /* LK 不使用该字段 */
+    ref->can_init_config.can_handle = bus;
+    ref->can_init_config.tx_id = tx_id;
+
+    ref->controller_setting_init_config.outer_loop_type = SPEED_LOOP;
+    ref->controller_setting_init_config.close_loop_type = SPEED_LOOP | CURRENT_LOOP;
+    ref->controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
+    ref->controller_setting_init_config.feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL;
+    ref->controller_setting_init_config.angle_feedback_source = MOTOR_FEED;
+    ref->controller_setting_init_config.speed_feedback_source = MOTOR_FEED;
+
+    /*
+     * 保守的初始整定值。
+     * @attention 这些数字**未经实机验证** —— LK9025 未参与过任何一轮台架整定。
+     *   速度环取小增益 + 积分限幅,目的是"能转起来且不立刻振荡",
+     *   真实负载下必须重新整定。电流环沿用框架通用基线。
+     */
+    ref->controller_param_init_config.speed_PID.Kp = 0.5f;
+    ref->controller_param_init_config.speed_PID.Ki = 0.0f;
+    ref->controller_param_init_config.speed_PID.Kd = 0.0f;
+    ref->controller_param_init_config.speed_PID.MaxOut = 5.0f;
+    ref->controller_param_init_config.speed_PID.Improve = PID_Integral_Limit;
+    ref->controller_param_init_config.speed_PID.IntegralLimit = 0.0f;
+
+    ref->controller_param_init_config.current_PID.Kp = 0.7f;
+    ref->controller_param_init_config.current_PID.Ki = 0.1f;
+    ref->controller_param_init_config.current_PID.MaxOut = 5.0f;
+    ref->controller_param_init_config.current_PID.Improve = PID_Integral_Limit;
+    ref->controller_param_init_config.current_PID.IntegralLimit = 0.0f;
+
+    ref->controller_param_init_config.angle_PID.Kp = 0.1f;
+    ref->controller_param_init_config.angle_PID.MaxOut = 2.0f;
+    ref->controller_param_init_config.angle_PID.Improve = PID_Integral_Limit;
+
+    /* 与 BenchBuildDMConfig 相同:死区必须显式清零 */
+    ref->controller_param_init_config.speed_PID.DeadBand = 0.0f;
+    ref->controller_param_init_config.current_PID.DeadBand = 0.0f;
+    ref->controller_param_init_config.angle_PID.DeadBand = 0.0f;
+}
+
+/**
+ * @brief 生成海泰 HT04 的初始化配置
+ *
+ * @param rx_id 反馈 ID(接收用)。HT04 的 HTMotorInit() 直接拿
+ *              can_init_config.rx_id 建 CAN 过滤器,**不做内部改写**,
+ *              所以与 DM 一样必须由上位机显式指定(多颗 HT 靠它区分)。
+ *
+ * @note HT04 有 HTMotorOuterLoop(),支持运行期切环;
+ *       控制入口是 HTMotorControlInit()(每颗电机一个独立任务),
+ *       与 LK 的 LKMotorControl() 不同。
+ */
+static void BenchBuildHTConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus, uint8_t tx_id, uint16_t rx_id)
+{
+    ref->motor_type = MOTOR_TYPE_NONE; /* HT 不使用该字段 */
+    ref->can_init_config.can_handle = bus;
+    ref->can_init_config.tx_id = tx_id;
+    ref->can_init_config.rx_id = rx_id;
+
+    ref->controller_setting_init_config.outer_loop_type = SPEED_LOOP;
+    ref->controller_setting_init_config.close_loop_type = SPEED_LOOP | CURRENT_LOOP;
+    ref->controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
+    ref->controller_setting_init_config.feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL;
+    ref->controller_setting_init_config.angle_feedback_source = MOTOR_FEED;
+    ref->controller_setting_init_config.speed_feedback_source = MOTOR_FEED;
+
+    /* 同 LK:未经实机验证的保守基线,真实负载需重新整定 */
+    ref->controller_param_init_config.speed_PID.Kp = 0.5f;
+    ref->controller_param_init_config.speed_PID.Ki = 0.0f;
+    ref->controller_param_init_config.speed_PID.Kd = 0.0f;
+    ref->controller_param_init_config.speed_PID.MaxOut = 5.0f;
+    ref->controller_param_init_config.speed_PID.Improve = PID_Integral_Limit;
+    ref->controller_param_init_config.speed_PID.IntegralLimit = 0.0f;
+
+    ref->controller_param_init_config.current_PID.Kp = 0.7f;
+    ref->controller_param_init_config.current_PID.Ki = 0.1f;
+    ref->controller_param_init_config.current_PID.MaxOut = 5.0f;
+    ref->controller_param_init_config.current_PID.Improve = PID_Integral_Limit;
+    ref->controller_param_init_config.current_PID.IntegralLimit = 0.0f;
+
+    ref->controller_param_init_config.angle_PID.Kp = 0.1f;
+    ref->controller_param_init_config.angle_PID.MaxOut = 2.0f;
+    ref->controller_param_init_config.angle_PID.Improve = PID_Integral_Limit;
+
+    ref->controller_param_init_config.speed_PID.DeadBand = 0.0f;
+    ref->controller_param_init_config.current_PID.DeadBand = 0.0f;
+    ref->controller_param_init_config.angle_PID.DeadBand = 0.0f;
+}
+
+/* ============================================================
  * 电机工厂 —— 供 motor_bench 运行期调用
  *
  * @note 为什么放在 app 层:框架分层规范要求 module 层不得实例化
@@ -375,8 +491,48 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
         return MB_OK;
     }
 
+    case MB_MOTOR_LK:
+    {
+        /*
+         * 岭芯 LK9025 —— 2026-10-19 接入。
+         * @note rx_id 由 LK 驱动内部按自身规则处理,与 DJI 同理,
+         *   上位机传 0 即可(协议层对非 DM 系强制要求 0)。
+         */
+        BenchBuildLKConfig(&cfg, bus, motor_id);
+        LKMotorInstance *m = LKMotorInit(&cfg);
+        if (!m)
+            return MB_ERR_NO_RESOURCE;
+        *out_instance = m;
+        return MB_OK;
+    }
+
+    case MB_MOTOR_HT:
+    {
+        /* 海泰 HT04 —— 2026-10-19 接入。rx_id 与 DM 一样由上位机显式指定 */
+        BenchBuildHTConfig(&cfg, bus, motor_id, rx_id);
+        HTMotorInstance *m = HTMotorInit(&cfg);
+        if (!m)
+            return MB_ERR_NO_RESOURCE;
+        /*
+         * @attention HT04 的控制入口与其它电机不同:
+         *   它不走 MotorControlTask() 里的统一循环(motor_task.c 中
+         *   HTMotorControl() 是注释掉的),而是由 HTMotorControlInit()
+         *   **给每颗已注册的 HT 电机各建一个独立任务**(内含 osDelay(1))。
+         *
+         *   因此运行期动态创建 HT 电机后必须再调一次,否则电机建得出来、
+         *   遥测也收得到,但**永远不会被驱动**。
+         *
+         * @note 该函数内部按 HT 自己的实例表遍历,重复调用是安全的
+         *   (已建过任务的实例不会重复建),但每次调用都会为**所有**
+         *   HT 实例尝试建任务,所以放在"创建成功之后"只调一次即可。
+         */
+        HTMotorControlInit();
+        *out_instance = m;
+        return MB_OK;
+    }
+
     default:
-        /* LK9025 / HT04 等尚未接入测试台 */
+        /* servo / step 等未接入:CAN 电机工厂模式不适用(见文件头说明) */
         LOGWARNING("[motor_bench_app] motor kind %d not supported yet", (int)kind);
         return MB_ERR_UNSUPPORTED;
     }
@@ -394,9 +550,45 @@ static void BenchMotorDestroy(MB_MotorKind_e kind, void *instance)
         return;
 
     if (MotorBenchIsDMKind(kind))
+    {
         DMMotorDestroy((DMMotorInstance *)instance);
-    else
-        DJIMotorDestroy((DJIMotorInstance *)instance);
+        return;
+    }
+
+    if (kind == MB_MOTOR_LK || kind == MB_MOTOR_HT)
+    {
+        /*
+         * 岭芯 LK9025 / 海泰 HT04 —— 2026-10-19 接入。
+         *
+         * @attention 这两个库**没有**提供 XxxMotorDestroy() 接口
+         *   (DJI/DM 都有),所以只能手动完成"停机 → 注销 CAN → free"。
+         *   顺序不能反:必须先停输出,否则 motor_task 下一拍还会访问
+         *   已释放的指针。
+         *
+         * @note HT04 的已知限制:它的控制是"每颗电机一个独立任务"
+         *   (HTMotorControlInit 创建),而 HT 库没有提供删除任务的接口。
+         *   移除 HT 电机后,那个任务仍在运行并访问已 free 的实例
+         *   —— 悬空指针。当前测试台的规避办法是:
+         *   界面层不提供 HT 的删除入口(见 motor_bench_host 的说明),
+         *   或由使用者接受该风险。彻底修需要给 HT 库加实例销毁接口。
+         */
+        if (kind == MB_MOTOR_LK)
+        {
+            LKMotorInstance *m = (LKMotorInstance *)instance;
+            LKMotorStop(m);
+            CANUnregister(m->motor_can_ins);
+        }
+        else
+        {
+            HTMotorInstance *m = (HTMotorInstance *)instance;
+            HTMotorStop(m);
+            CANUnregister(m->motor_can_instace);
+        }
+        free(instance);
+        return;
+    }
+
+    DJIMotorDestroy((DJIMotorInstance *)instance);
 }
 
 void MotorBenchAppInit(void)
