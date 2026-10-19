@@ -94,8 +94,9 @@ DMMotorInstance *DMMotorInitWithModel(Motor_Init_Config_s *config, DMMotorModel_
     if (!motor)
         return NULL;
     memset(motor, 0, sizeof(DMMotorInstance));
+    motor->model = model;
     motor->p_max = DM_P_MAX;
-    motor->v_max = DM_V_MAX;
+    motor->v_max = model == DM_MODEL_8009P ? DM8009P_V_MAX : DM_V_MAX;
     motor->t_max = model == DM_MODEL_8009P ? DM8009P_T_MAX : DM_T_MAX;
     
     motor->motor_settings = config->controller_setting_init_config;
@@ -242,7 +243,8 @@ void DMMotorControl()
                 set = PIDCalculate(&motor->speed_PID, motor->measure.velocity, set);
         }
 
-        LIMIT_MIN_MAX(set, -motor->t_max, motor->t_max);
+        float torque_limit = motor->model == DM_MODEL_4310 ? DM4310_PEAK_TORQUE : motor->t_max;
+        LIMIT_MIN_MAX(set, -torque_limit, torque_limit);
 
         motor_send_mailbox.position_des = float_to_uint(0, -motor->p_max, motor->p_max, 16);
         motor_send_mailbox.velocity_des = float_to_uint(0, -motor->v_max, motor->v_max, 12);

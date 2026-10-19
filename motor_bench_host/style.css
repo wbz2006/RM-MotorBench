@@ -297,7 +297,7 @@ button.enable.on { color: var(--danger); background: var(--danger-dim); border-c
 button.enable.on::before { content: '■'; font-size: 9px; }
 button.enable.on:hover { background: #ff766e25; border-color: var(--danger); }
 .control-row .ghost { height: 42px; font-size: 12px; }
-.setpoint-program { position: relative; min-width: 0; }
+.setpoint-program { position: relative; min-width: 0; container-type: inline-size; }
 .preset-content[inert] { opacity: .3; }
 .preset-blocker { position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 8px; padding: 20px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: #101211c9; box-shadow: inset 0 0 32px #0006; backdrop-filter: blur(1px); text-align: center; }
 .preset-blocker strong { color: var(--warn); font-size: 14px; }
@@ -306,11 +306,32 @@ button.enable.on:hover { background: #ff766e25; border-color: var(--danger); }
 .preset-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
 .preset-toolbar > select { flex: 1; min-width: 140px; }
 .preset-toolbar > label { flex: 0 1 100px; }
+.preset-toolbar > .preset-repeat { flex: 0 0 auto; align-items: center; align-self: center; gap: 6px; }
 .setpoint-program label { display: flex; flex-wrap: wrap; align-content: start; gap: 5px; min-width: 0; font-size: 10px; color: var(--muted); }
 .setpoint-program label > span { margin-left: auto; font-family: var(--mono); }
-.setpoint-program label > input { flex-basis: 100%; width: 100%; font-size: 12px; }
-.preset-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-.preset-steps { grid-template-columns: minmax(0, 1fr) 110px; }
+.setpoint-program label > input:not([type='checkbox']) { flex-basis: 100%; width: 100%; font-size: 12px; }
+.wave-config { min-width: 0; }
+.wave-diagram { position: relative; width: 100%; min-width: 0; aspect-ratio: 2 / 1; min-height: 225px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); }
+.wave-diagram svg { display: block; width: 100%; height: 100%; position: absolute; inset: 0; }
+.wave-diagram svg path { fill: none; vector-effect: non-scaling-stroke; }
+.wave-diagram svg text { fill: var(--muted); font: 11px var(--mono); }
+.wave-diagram .wave-grid { stroke: var(--line); stroke-dasharray: 3 5; }
+.wave-diagram .wave-axis { stroke: var(--line-strong); }
+.wave-diagram .wave-shape { stroke: var(--accent); stroke-width: 2; }
+.wave-diagram .wave-dimension { stroke: var(--text-dim); }
+.wave-diagram .wave-symbol { fill: var(--accent); font-size: 13px; }
+.wave-diagram .wave-leader { stroke: var(--accent); stroke-dasharray: 3 3; opacity: .6; }
+.setpoint-program .wave-input { position: absolute; padding: 7px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); color: var(--text-dim); }
+.wave-amplitude { right: 10px; top: 10px; width: 27%; min-width: 95px; }
+.wave-period { left: 22%; bottom: 8px; width: 30%; min-width: 100px; }
+.wave-dwell { right: 10px; bottom: 10px; width: 32%; min-width: 125px; }
+.setpoint-program .wave-values { margin-top: 10px; }
+@container (max-width: 400px) {
+  .wave-diagram { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 6px; aspect-ratio: auto; min-height: 0; }
+  .wave-diagram svg { position: static; grid-column: 1 / -1; height: auto; }
+  .setpoint-program .wave-input { position: static; width: auto; min-width: 0; }
+  .wave-dwell { grid-column: 1 / -1; }
+}
 .preset-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .preset-actions button { font-size: 11px; min-height: 32px; }
 .setpoint-program[data-running='true'] [data-role='presetStart'] { color: var(--accent); border-color: var(--accent); }

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101211" />
     <title>MOTORBENCH / 电机测试台</title>
-    <link rel="stylesheet" href="style.css?v=20261018-pid-context" />
+    <link rel="stylesheet" href="style.css?v=20261019-dm4310-defaults" />
   </head>
   <body>
     <a class="skip-link" href="#channels">跳转到电机通道</a>
@@ -318,7 +318,16 @@
               **不要**用隐藏 canvas 的方式做空态 —— 塌成 0 高度后
               chart.js 读取高度会得到 0,曲线将永远画不出来。
           -->
-          <div class="chart-empty" data-role="chartEmpty"><svg viewBox="0 0 64 40" fill="none" aria-hidden="true"><path d="M0 20h16l8-14 12 28 9-14h19" /></svg><span>等待遥测数据</span><small>WAITING FOR SIGNAL</small></div>
+          <!--
+            空态曲线图标。
+
+            @attention 路径两端**必须内缩**(这里用 2~62 而不是 0~64):
+              原来写 M0 20 ... h19 让横线正好落在 viewBox 的 x=0 / x=64 上,
+              而 stroke-width 1.5 有一半在框外被裁掉 ——
+              视觉上就是四个角各缺一小块、露出背景色,看着像"图标画歪了"。
+              内缩 2px 后描边完整落在框内,四角干净。
+          -->
+          <div class="chart-empty" data-role="chartEmpty"><svg viewBox="0 0 64 40" fill="none" aria-hidden="true"><path d="M2 20h15l8-13 12 26 9-13h16" /></svg><span>等待遥测数据</span><small>WAITING FOR SIGNAL</small></div>
           <div class="chart-foot">
             <!--
               滤波开关(2026-10-13 用户要求:电流和转速波动太大)。
@@ -369,22 +378,47 @@
                   <option value="sine">∿ 正弦输出</option>
                   <option value="steps">⌁ 阶梯输出</option>
                 </select>
-                <label>循环次数<input data-role="presetCycles" type="number" min="1" max="1000" step="1" value="1" /></label>
+                <label class="preset-repeat"><input data-role="presetInfinite" type="checkbox" checked />无限循环</label>
+                <label data-role="presetCycleCount" hidden>循环次数<input data-role="presetCycles" type="number" min="1" max="1000" step="1" value="1" disabled /></label>
               </div>
-              <div class="preset-fields" data-role="presetSine">
-                <label>幅值 <span data-role="presetUnit">rpm</span><input data-role="presetAmplitude" type="number" min="0" step="any" value="500" /></label>
-                <label>偏置 <span data-role="presetUnit">rpm</span><input data-role="presetOffset" type="number" step="any" value="0" /></label>
-                <label>周期 / s<input data-role="presetPeriod" type="number" min="0.5" max="3600" step="0.1" value="4" /></label>
+              <div class="wave-config" data-role="presetSine">
+                <div class="wave-diagram wave-sine">
+                  <svg viewBox="0 0 560 280" role="img" aria-label="固定正弦示意图：幅值 A 是零线到峰值的距离，周期 T 是完整一轮的时间">
+                    <path class="wave-grid" d="M42 66H448M42 186H448M122 40V215M282 40V215M362 40V215" />
+                    <path class="wave-axis" d="M42 32V216M30 126H475M470 122L475 126 470 130" />
+                    <text x="25" y="130">0</text><text x="457" y="149">t</text>
+                    <path class="wave-shape" d="M42 126C71 92 93 66 122 66S173 92 202 126S253 186 282 186S333 160 362 126S413 66 442 66" />
+                    <path class="wave-dimension" d="M122 69V123M118 74L122 69 126 74M118 118L122 123 126 118M42 204V216M362 204V216M45 210H359M50 206L45 210 50 214M354 206L359 210 354 214" />
+                    <text class="wave-symbol" x="135" y="101">A</text><text class="wave-symbol" x="195" y="202">T</text>
+                    <path class="wave-leader" d="M143 87L181 29H381" />
+                    <text x="51" y="25">SINE / ±A</text>
+                  </svg>
+                  <label class="wave-input wave-amplitude">幅值 A <span data-role="presetUnit">rpm</span><input data-role="presetAmplitude" type="number" min="0" step="any" value="500" /></label>
+                  <label class="wave-input wave-period">周期 T <span>s</span><input data-role="presetPeriod" type="number" min="0.5" max="3600" step="0.1" value="4" /></label>
+                </div>
               </div>
-              <div class="preset-fields preset-steps" data-role="presetSteps" hidden>
-                <label>目标序列 <span data-role="presetUnit">rpm</span><input data-role="presetValues" type="text" value="0, 500, 1000, 500, 0" placeholder="用逗号分隔，如 0, 500, 1000, 0" /></label>
-                <label>每级保持 / s<input data-role="presetDwell" type="number" min="0.1" max="3600" step="0.1" value="2" /></label>
+              <div class="wave-config" data-role="presetSteps" hidden>
+                <div class="wave-diagram wave-steps">
+                  <svg viewBox="0 0 560 280" role="img" aria-label="固定阶梯示意图：V1 至 V5 为各级目标，Δt 为每级保持时间">
+                    <path class="wave-grid" d="M42 54H448M42 104H448M118 40V196M194 40V196M270 40V196M346 40V196M422 40V196" />
+                    <path class="wave-axis" d="M42 32V196M30 154H475M470 150L475 154 470 158" />
+                    <text x="25" y="158">0</text><text x="457" y="177">t</text>
+                    <path class="wave-shape" d="M42 154H118V104H194V54H270V104H346V154H422" />
+                    <text class="wave-symbol" x="66" y="142">V1</text><text class="wave-symbol" x="142" y="92">V2</text><text class="wave-symbol" x="218" y="42">V3</text><text class="wave-symbol" x="294" y="92">V4</text><text class="wave-symbol" x="370" y="142">V5</text>
+                    <path class="wave-dimension" d="M194 175V187M270 175V187M197 181H267M202 177L197 181 202 185M262 177L267 181 262 185" />
+                    <text class="wave-symbol" x="220" y="202">Δt</text>
+                    <path class="wave-leader" d="M238 205L281 228H355" />
+                    <text x="51" y="25">STEPS / V1 → Vn</text>
+                  </svg>
+                  <label class="wave-input wave-dwell">每级保持 Δt <span>s</span><input data-role="presetDwell" type="number" min="0.1" max="3600" step="0.1" value="2" /></label>
+                </div>
+                <label class="wave-values">目标序列 V1 → Vn <span data-role="presetUnit">rpm</span><input data-role="presetValues" type="text" value="0, 500, 1000, 500, 0" placeholder="用逗号分隔，如 0, 500, 1000, 0" /></label>
               </div>
               <div class="preset-actions">
                 <button data-role="presetStart" class="ghost" disabled>▶ 启动预设</button>
                 <button data-role="presetStop" class="ghost" disabled>停止并归零</button>
               </div>
-              <p data-role="presetStatus" class="preset-status" role="status">先绑定并使能速度环电机 · 完成后归零</p>
+              <p data-role="presetStatus" class="preset-status" role="status">先绑定并使能速度环电机 · 默认无限循环</p>
               </div>
               <div class="preset-blocker" data-role="presetBlocker" role="status" hidden>
                 <strong>当前处于位置环</strong>
@@ -414,13 +448,13 @@
 
     <footer class="hint">
       <p>
-        <span class="footer-label">SYS / SAFETY · UI 20261018-pid-context</span> 电机登记并绑定后，需显式使能才会跟随目标。
+        <span class="footer-label">SYS / SAFETY · UI 20261019-dm4310-defaults</span> 电机登记并绑定后，需显式使能才会跟随目标。
         <strong>未使能前电机不出力</strong>;约 1.5 秒收不到上位机心跳,A 板会自动全停;
         页面处于焦点时，按空格立即全停（输入框内同样有效）；关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
       </p>
     </footer>
     </div>
 
-    <script type="module" src="ui.js?v=20261018-pid-context"></script>
+    <script type="module" src="ui.js?v=20261019-dm4310-defaults"></script>
   </body>
 </html>

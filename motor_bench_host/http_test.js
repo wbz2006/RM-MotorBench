@@ -20,22 +20,22 @@ test('static assets bypass cache and versioned root loads the current PID interf
   const base = 'http://127.0.0.1:' + server.address().port;
   try {
     for (const [route, file] of [
-      ['/', 'index.html'], ['/?v=20261018-pid-context', 'index.html'],
-      ['/index.html?v=20261018-pid-context', 'index.html'],
-      ['/ui.js?v=20261018-pid-context', 'ui.js'], ['/protocol.js', 'protocol.js'],
-      ['/style.css?v=20261018-pid-context', 'style.css'],
+      ['/', 'index.html'], ['/?v=20261019-dm4310-defaults', 'index.html'],
+      ['/index.html?v=20261019-dm4310-defaults', 'index.html'],
+      ['/ui.js?v=20261019-dm4310-defaults', 'ui.js'], ['/protocol.js', 'protocol.js'],
+      ['/style.css?v=20261019-dm4310-defaults', 'style.css'],
     ]) {
       const response = await fetch(base + route);
       assert.equal(response.status, 200, route);
       assert.equal(response.headers.get('cache-control'), 'no-store', route);
       assert.equal(await response.text(), fs.readFileSync(path.join(root, file), 'utf8'), route);
     }
-    const html = await (await fetch(base + '/?v=20261018-pid-context')).text();
-    assert.match(html, /UI 20261018-pid-context/);
+    const html = await (await fetch(base + '/?v=20261019-dm4310-defaults')).text();
+    assert.match(html, /UI 20261019-dm4310-defaults/);
     assert.doesNotMatch(html, /pid-workflow-note|pidTuningHint|data-role="pidLoop"/);
     assert.match(html, /data-role="pidPanel" data-loop="0"/);
     assert.match(html, /pMaxOutUnit/);
-    const ui = await (await fetch(base + '/ui.js?v=20261018-pid-context')).text();
+    const ui = await (await fetch(base + '/ui.js?v=20261019-dm4310-defaults')).text();
     assert.match(ui, /stopForPidEdit/);
     assert.match(ui, /输出限幅须为/);
     const { MBResult, MBResultText } = await import('./protocol.js');

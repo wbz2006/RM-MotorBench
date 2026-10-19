@@ -6,6 +6,11 @@
 
 **核心特性：换电机不需要改配置表、不需要重新烧固件。** 按电调拨码开关上的实际 ID，在网页上现场添加即可。
 
+**Windows 桌面版下载：** [GitHub Releases](https://github.com/wbz2006/RM-MotorBench/releases)。
+下载 `MotorBench-1.0.0-Windows-x64.exe`，双击进入独立调试窗口，无需安装 Node.js 或另外打开浏览器。
+同一 Release 提供配套 A 板 1.12 固件；DM4310 请使用该固件，以匹配修正后的量程与默认 PID。
+桌面版的开发和打包方法见[上位机说明](motor_bench_host/README.md#windows-桌面便携版)。
+
 ---
 
 ## 为什么做这个

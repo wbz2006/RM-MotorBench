@@ -331,8 +331,7 @@ static int lifecycle(void) {
     return failures ? 1 : 0;
 }
 static int dm_stability(void) {
-    /* Tests the shared low-torque builder baseline, not the user-specified
-     * DM4310 factory profile or loaded motor tuning:
+    /* Tests the shared low-gain builder, not the user-selected factory profile:
      * J=0.0002..0.001 kg*m^2, 2 ms control and 1..2 samples of feedback delay. */
     for (unsigned test = 0; test < 3; ++test) {
         Motor_Init_Config_s config = {0};
@@ -358,19 +357,19 @@ static int dm_stability(void) {
             peak = fmaxf(peak, fabsf(velocity));
             if (n > 900) tail_peak = fmaxf(tail_peak, fabsf(velocity));
         }
-        CHECK(peak_torque <= 0.51f);
+        CHECK(peak_torque <= 3.01f);
         CHECK(peak < 0.5f);
         CHECK(tail_peak < 0.2f);
         /* A large command must respect the commissioning torque limit too. */
         dm_feedback(m, 2048);
-        DMMotorSetRef(m, 40);
+        DMMotorSetRef(m, 100);
         now += 2; DMMotorControl();
         float positive = DM_T_MIN + dm_torque(m) * (DM_T_MAX - DM_T_MIN) / 4095;
-        CHECK(positive > 0 && positive <= 0.51f);
-        DMMotorSetRef(m, -40);
+        CHECK(positive > 0 && positive <= 3.01f);
+        DMMotorSetRef(m, -100);
         now += 2; DMMotorControl();
         float negative = DM_T_MIN + dm_torque(m) * (DM_T_MAX - DM_T_MIN) / 4095;
-        CHECK(negative < 0 && negative >= -0.51f);
+        CHECK(negative < 0 && negative >= -3.01f);
         DMMotorStop(m);
         printf("DM model %u: peak=%.3f tail=%.3f torque=%.3f\n", test, peak, tail_peak, peak_torque);
     }
@@ -538,8 +537,8 @@ static int dm_telemetry(void) {
         {6, 0x80, 0, 0x9a, 0xb3, 0x45, 25, 26},
         {6, 0x80, 0, 0x67, 0x8a, 0xbc, 25, 26},
     };
-    const float speeds[] = {9.3956044f, -8.6043956f};
-    const float torques[] = {-10.6417582f, 6.1582418f};
+    const float speeds[] = {6.26373626f, -5.73626374f};
+    const float torques[] = {-5.91208791f, 3.42124542f};
     for (unsigned n = 0; n < 2; ++n) {
         memcpy(m->motor_can_instace->rx_buff, frames[n], 8);
         m->motor_can_instace->rx_len = 8;
@@ -630,10 +629,10 @@ static int position_control(const char *speed_pid, const char *angle_pid, const 
     CHECK(MotorBenchSetRef(1, -30) == MB_OK);
     now += 2; DMMotorControl(); CHECK(dm_torque(b) < 2047);
     receive_hex("${buildHeartbeat().toString('hex')}");
-    receive_hex("${buildSetPid(1, 0, { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 18, IntegralLimit: 0, scaledLimits: true }).toString('hex')}");
-    CHECK(fabsf(b->speed_PID.MaxOut - 18.0f) < 0.0001f);
-    receive_hex("${buildSetPid(1, 2, { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 45, IntegralLimit: 0, scaledLimits: true }).toString('hex')}");
-    CHECK(fabsf(b->angle_PID.MaxOut - 45.0f) < 0.0001f);
+    receive_hex("${buildSetPid(1, 0, { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 7, IntegralLimit: 0, scaledLimits: true }).toString('hex')}");
+    CHECK(fabsf(b->speed_PID.MaxOut - 7.0f) < 0.0001f);
+    receive_hex("${buildSetPid(1, 2, { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 30, IntegralLimit: 0, scaledLimits: true }).toString('hex')}");
+    CHECK(fabsf(b->angle_PID.MaxOut - 30.0f) < 0.0001f);
     receive_hex(speed_pid);
     receive_hex(angle_pid);
     CHECK(fabsf(b->speed_PID.MaxOut - 0.375f) < 0.0001f);
@@ -688,10 +687,10 @@ static int dm_profiles(void) {
     CHECK(MotorBenchBind(0, MB_MOTOR_DM, 1, 6, SPEED_LOOP) == MB_OK);
     CHECK(MotorBenchBind(1, MB_MOTOR_DM8009P, 1, 1, SPEED_LOOP) == MB_OK);
     DMMotorInstance *a = profile_motors[0], *b = profile_motors[1];
-    CHECK(a && b && a->t_max == 18 && b->t_max == 54);
-    CHECK(a->p_max == 12.5f && b->p_max == 12.5f && a->v_max == 45 && b->v_max == 45);
-    CHECK(a->speed_PID.Kp == 0.65f && a->speed_PID.Ki == 12.0f && a->speed_PID.Kd == 0.0f);
-    CHECK(a->speed_PID.MaxOut == 15.0f && a->speed_PID.IntegralLimit == 1000.0f);
+    CHECK(a && b && a->t_max == 10 && b->t_max == 54);
+    CHECK(a->p_max == 12.5f && b->p_max == 12.5f && a->v_max == 30 && b->v_max == 45);
+    CHECK(a->speed_PID.Kp == 0.55f && a->speed_PID.Ki == 0.0f && a->speed_PID.Kd == 0.0f);
+    CHECK(a->speed_PID.MaxOut == 7.0f && a->speed_PID.IntegralLimit == 0.0f);
     CHECK(b->speed_PID.MaxOut == 10.0f);
     CHECK(MotorBenchQueryPid(0) == MB_OK && MotorBenchQueryPid(1) == MB_OK);
     print_wire("DM_DEFAULTS_WIRE");
@@ -704,28 +703,32 @@ static int dm_profiles(void) {
         can->rx_len = 8;
         can->can_module_callback(can);
     }
-    CHECK(fabsf(a->measure.velocity - b->measure.velocity) < 0.0001f);
-    CHECK(fabsf(b->measure.torque - 3 * a->measure.torque) < 0.0001f);
+    CHECK(fabsf(a->measure.velocity - 6.26373626f) < 0.0001f);
+    CHECK(fabsf(a->measure.torque - (-5.91208791f)) < 0.0001f);
+    CHECK(fabsf(b->measure.velocity - 9.3956044f) < 0.0001f);
+    CHECK(fabsf(b->measure.torque - 5.4f * a->measure.torque) < 0.0001f);
     CHECK(fabsf(b->measure.torque - (-31.9252746f)) < 0.0001f);
     MB_TelemetryItem_s feedback;
     CHECK(MotorBenchGetMeasure(1, &feedback) == MB_OK && (feedback.status & 1));
     CHECK(fabsf(feedback.measure_torque - b->measure.torque) < 0.0001f);
-    /* Same 30 rad/s error: the user-specified DM4310 profile saturates
-     * at 15 N*m; the independent DM8009P profile requests 1.5 N*m. */
+    /* At 30 rad/s error, 4310 saturates at 7 N*m; 8009P requests 1.5 N*m.
+     * Keep the independently configured MIT spans: 4310=10, 8009P=54. */
     for (unsigned i = 0; i < 2; i++) {
         motors[i]->measure.velocity = 0;
         CHECK(MotorBenchSetEnable(i, 1) == MB_OK);
         CHECK(MotorBenchSetRef(i, 30) == MB_OK);
     }
     now += 2; DMMotorControl();
-    CHECK(dm_torque(a) == 3753 && dm_torque(b) == 2104);
-    CHECK(fabsf(a->speed_PID.Output - 15.0f) < 0.0001f);
+    CHECK(dm_torque(a) == 3480 && dm_torque(b) == 2104);
+    CHECK(fabsf(a->speed_PID.Output - 7.0f) < 0.0001f);
     CHECK(fabsf(b->speed_PID.Output - 1.5f) < 0.0001f);
     CHECK(MotorBenchSetEnable(0, 0) == MB_OK && MotorBenchSetEnable(1, 0) == MB_OK);
-    CHECK(MotorBenchSetPid(0, MB_PID_LOOP_SPEED, 1, 0, 0, 20, 0, 0) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchSetPid(0, MB_PID_LOOP_SPEED, 1, 0, 0, 7.001f, 0, 0) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchSetPid(0, MB_PID_LOOP_SPEED, 1, 0, 0, 10, 0, 0) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchSetPid(0, MB_PID_LOOP_ANGLE, 0.1f, 0, 0, 30.001f, 0, 0) == MB_ERR_BAD_PARAM);
     CHECK(MotorBenchSetPid(1, MB_PID_LOOP_SPEED, 1, 0, 0, 54, 0, 0) == MB_OK);
     CHECK(MotorBenchSetPid(1, MB_PID_LOOP_SPEED, 1, 0, 0, 54.001f, 0, 0) == MB_ERR_BAD_PARAM);
-    CHECK(b->speed_PID.MaxOut == 54 && a->speed_PID.MaxOut == 15.0f);
+    CHECK(b->speed_PID.MaxOut == 54 && a->speed_PID.MaxOut == 7.0f);
     CHECK(MotorBenchSetPid(1, MB_PID_LOOP_ANGLE, 0.1f, 0, 0, 45, 0, 0) == MB_OK);
     CHECK(MotorBenchSetPid(1, MB_PID_LOOP_ANGLE, 0.1f, 0, 0, 45.001f, 0, 0) == MB_ERR_BAD_PARAM);
     CHECK(MotorBenchSetPid(1, MB_PID_LOOP_CURRENT, 0, 0, 0, 1, 0, 0) == MB_ERR_UNSUPPORTED);
@@ -738,14 +741,23 @@ static int dm_profiles(void) {
     CHECK(MotorBenchSetLoop(1, SPEED_LOOP) == MB_OK);
     CHECK(MotorBenchSetLoop(1, CURRENT_LOOP) == MB_ERR_UNSUPPORTED);
     for (unsigned i = 0; i < 2; i++) {
-        CHECK(MotorBenchSetPid(i, MB_PID_LOOP_SPEED, 1, 0, 0, 10, 0, 0) == MB_OK);
+        CHECK(MotorBenchSetPid(i, MB_PID_LOOP_SPEED, 1, 0, 0, i == 0 ? 7 : 10, 0, 0) == MB_OK);
         motors[i]->measure.velocity = 0;
         DaemonReload(motors[i]->daemon);
         CHECK(MotorBenchSetEnable(i, 1) == MB_OK);
         CHECK(MotorBenchSetRef(i, 6) == MB_OK);
     }
     now += 2; DMMotorControl();
-    CHECK(dm_torque(a) == 2730 && dm_torque(b) == 2275);
+    CHECK(dm_torque(a) == 3276 && dm_torque(b) == 2275);
+    /* Even a direct driver user bypassing the PID setter cannot command
+     * more than the 4310 manual's peak torque. Keep MIT encoding at +/-10. */
+    a->speed_PID.MaxOut = 100;
+    DMMotorSetRef(a, 100);
+    now += 2; DMMotorControl();
+    CHECK(dm_torque(a) == 3480); /* +7 N*m in the real +/-10 MIT span. */
+    DMMotorSetRef(a, -100);
+    now += 2; DMMotorControl();
+    CHECK(dm_torque(a) == 614); /* -7 N*m, within one encoding step. */
     CHECK(MotorBenchRemoveMotor(MB_MOTOR_DM8009P, 1, 1, 0x11) == MB_OK);
     CHECK(MotorBenchGetInventoryCount() == 1 && CANGetFilterFree(&hcan1) == 13);
     CHECK(MotorBenchGetMeasure(1, &feedback) != MB_OK);
@@ -991,6 +1003,17 @@ try {
   const ui = fs.readFileSync(path.join(host, 'ui.js'), 'utf8');
   const server = fs.readFileSync(path.join(host, 'server.js'), 'utf8');
   {
+    const source = ui.match(/function pidOutputSpec\(kind, loop\) \{[\s\S]*?\n\}/)?.[0];
+    assert.ok(source);
+    const context = { MotorKind, needsRxId: kind => [MotorKind.DM, MotorKind.DM8009P].includes(kind) };
+    vm.runInNewContext(source, context);
+    assert.equal(context.pidOutputSpec(MotorKind.DM, 0).max, 7);
+    assert.equal(context.pidOutputSpec(MotorKind.DM, 2).max, 30);
+    assert.equal(context.pidOutputSpec(MotorKind.DM8009P, 0).max, 54);
+    assert.equal(context.pidOutputSpec(MotorKind.DM8009P, 2).max, 45);
+    console.log('PASS browser PID bounds: DM4310 peak 7 N*m / VMAX 30; DM8009P 54 / 45');
+  }
+  {
     const editStart = ui.indexOf('    const stopForPidEdit = () => {');
     const edit = ui.slice(editStart, ui.indexOf('    for (const role of', editStart));
     const ackStart = ui.indexOf("    case 'pidAck': {");
@@ -1012,7 +1035,7 @@ try {
       setDisplayedRef:(i,value)=>{state.displayedRef=value;},
       stopProgram:i=>stops.push(i), stopAllPrograms:()=>{},
       MBResult:{OK:0,BAD_PARAM:1,UNSUPPORTED:5}, MBResultText:{},
-      pidOutputSpec:()=>({unit:'N·m',max:18}),
+      pidOutputSpec:()=>({unit:'N·m',max:7}),
     };
     vm.runInNewContext(cleanup + send + edit +
       'globalThis.editPid=stopForPidEdit; function receivePid(data) {const msg={data}; switch ("pidAck") {' + ack + '}}', state);
@@ -1216,7 +1239,7 @@ try {
       for (const loop of ['speed', 'current', 'angle'])
         assert.deepEqual(report[loop], PID_DEFAULTS[report.kind][loop], `${MotorKind[report.kind]} ${loop} defaults must match firmware`);
     }
-    console.log('PASS firmware factory / USB readback / browser PID defaults agree; independent DM4310 0.65/12/0/15/1000 and DM8009P profiles');
+    console.log('PASS firmware factory / USB readback / browser PID defaults agree; DM4310 0.55/0/0/7/0 and independent DM8009P profile');
     const hex = output.match(/DM8009P_PID_WIRE ([0-9a-f]+)/)?.[1];
     assert.ok(hex);
     const frames = new FrameParser().push(Buffer.from(hex, 'hex'));
@@ -1251,8 +1274,8 @@ try {
     const t = parseTelemetry(frames[0].payload).items[0];
     assert.equal(t.enabled, false);
     assert.equal(t.online, true);
-    assert.ok(Math.abs(t.speed - 0.3956044) < 0.0001, `averaged speed was ${t.speed}`);
-    assert.ok(Math.abs(t.torque - (-2.2417582)) < 0.0001, `averaged torque was ${t.torque}`);
+    assert.ok(Math.abs(t.speed - 0.26373626) < 0.0001, `averaged speed was ${t.speed}`);
+    assert.ok(Math.abs(t.torque - (-1.24542125)) < 0.0001, `averaged torque was ${t.torque}`);
     console.log('PASS independent MIT feedback vectors through real DM decoder, disabled telemetry averaging, USB framing and host parsing; speed/torque are not swapped');
   }
   {

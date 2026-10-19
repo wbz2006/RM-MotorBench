@@ -10,6 +10,7 @@ build/
 
 # ---- 依赖 ----
 node_modules/
+motor_bench_host/dist/
 
 # ---- 文档配图(原框架自带,体积大且与本项目无关) ----
 **/.assets/

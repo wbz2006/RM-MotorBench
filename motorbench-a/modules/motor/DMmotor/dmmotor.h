@@ -10,11 +10,16 @@
 
 #define DM_P_MIN  (-12.5f)
 #define DM_P_MAX  12.5f
-#define DM_V_MIN  (-45.0f)
-#define DM_V_MAX  45.0f
-#define DM_T_MIN  (-18.0f)
-#define DM_T_MAX   18.0f
-/* DM8009P limits read from the user's motor: P=12.5, V=45, T=54. */
+/* DM-J4310-2EC V1.1: MIT spans read from the user's tuning assistant.
+ * Protocol TMAX is an encoding span, not the motor's working torque. */
+#define DM_V_MIN  (-30.0f)
+#define DM_V_MAX  30.0f
+#define DM_T_MIN  (-10.0f)
+#define DM_T_MAX   10.0f
+#define DM4310_RATED_TORQUE 3.0f
+#define DM4310_PEAK_TORQUE  7.0f
+/* DM8009P keeps its independent, previously verified MIT spans. */
+#define DM8009P_V_MAX 45.0f
 #define DM8009P_T_MAX 54.0f
 
 typedef enum
@@ -57,6 +62,7 @@ typedef struct
     float *speed_feedforward_ptr;
     float *current_feedforward_ptr;
     float pid_ref;
+    DMMotorModel_e model;
     float p_max;
     float v_max;
     float t_max;

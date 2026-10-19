@@ -31,7 +31,7 @@ const MOTOR_SPEC = {
   [MotorKindLabel[1]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // GM6020
   [MotorKindLabel[2]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M3508
   [MotorKindLabel[3]]: { unit: 'rpm', range: 7000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M2006
-  [MotorKindLabel[4]]: { unit: 'rad/s', range: 40, feedbackLabel: '转矩', feedbackUnit: 'N·m' }, // DM4310
+  [MotorKindLabel[4]]: { unit: 'rad/s', range: 30, feedbackLabel: '转矩', feedbackUnit: 'N·m' }, // DM4310 MIT VMAX; 24 V no-load max is 20.94 rad/s
   [MotorKindLabel[MotorKind.DM8009P]]: { unit: 'rad/s', range: 40, feedbackLabel: '转矩', feedbackUnit: 'N·m' },
   [MotorKindLabel[5]]: { unit: 'rad/s', range: 40 }, // LK
   [MotorKindLabel[6]]: { unit: 'rad/s', range: 40 }, // HT
@@ -506,7 +506,10 @@ function renderProgram(i) {
   el.querySelector('[data-role="presetPanel"]').dataset.running = String(running);
   el.querySelector('[data-role="presetSine"]').hidden = mode !== 'sine';
   el.querySelector('[data-role="presetSteps"]').hidden = mode !== 'steps';
+  const infinite = el.querySelector('[data-role="presetInfinite"]').checked;
+  el.querySelector('[data-role="presetCycleCount"]').hidden = infinite;
   for (const input of el.querySelectorAll('.setpoint-program input, .setpoint-program select')) input.disabled = running || positionMode;
+  el.querySelector('[data-role="presetCycles"]').disabled = running || positionMode || infinite;
   el.querySelector('[data-role="presetStart"]').disabled = running || !canRunProgram(i);
   el.querySelector('[data-role="presetStart"]').textContent = running ? '正在输出…' : '▶ 启动预设';
   el.querySelector('[data-role="presetStop"]').disabled = !running;
@@ -551,7 +554,10 @@ function tickProgram(i) {
     setDisplayedRef(i, point.ref);
   }
   const step = point.step ? ` · 第 ${point.step}/${state.program.steps.length} 级` : '';
-  programMessage(i, `第 ${point.cycle}/${state.program.cycles} 轮${step} · ${elapsed.toFixed(1)} / ${state.program.duration.toFixed(1)} s`);
+  const progress = state.program.cycles === 0
+    ? `第 ${point.cycle} 轮 · 无限循环${step} · ${elapsed.toFixed(1)} s`
+    : `第 ${point.cycle}/${state.program.cycles} 轮${step} · ${elapsed.toFixed(1)} / ${state.program.duration.toFixed(1)} s`;
+  programMessage(i, progress);
 }
 
 function startProgram(i) {
@@ -563,9 +569,8 @@ function startProgram(i) {
   try {
     const program = createSetpointProgram({
       mode: r('presetMode').value,
-      cycles: r('presetCycles').valueAsNumber,
+      cycles: r('presetInfinite').checked ? 0 : r('presetCycles').valueAsNumber,
       amplitude: r('presetAmplitude').valueAsNumber,
-      offset: r('presetOffset').valueAsNumber,
       period: r('presetPeriod').valueAsNumber,
       steps: r('presetValues').value,
       dwell: r('presetDwell').valueAsNumber,
@@ -958,7 +963,6 @@ function fillMotorOptions() {
         for (const unit of el.querySelectorAll('[data-role="presetUnit"]')) unit.textContent = spec.unit;
         const amplitude = spec.unit === 'rad/s' ? 1 : 500;
         el.querySelector('[data-role="presetAmplitude"]').value = String(amplitude);
-        el.querySelector('[data-role="presetOffset"]').value = '0';
         el.querySelector('[data-role="presetValues"]').value = `0, ${amplitude}, ${amplitude * 2}, ${amplitude}, 0`;
       }
       renderChannel(i);
@@ -983,8 +987,8 @@ function currentChannelKind(i) {
 
 function pidOutputSpec(kind, loop) {
   if (needsRxId(kind)) {
-    if (loop === 0) return { unit: 'N·m', max: kind === MotorKind.DM8009P ? 54 : 18 };
-    if (loop === 2) return { unit: 'rad/s', max: 45 }; // dmmotor.h: DM_V_MAX
+    if (loop === 0) return { unit: 'N·m', max: kind === MotorKind.DM8009P ? 54 : 7 };
+    if (loop === 2) return { unit: 'rad/s', max: kind === MotorKind.DM8009P ? 45 : 30 };
     return { unit: '', max: null };
   }
   return { unit: kind ? (loop === 2 ? 'deg/s' : 'raw') : '', max: null };
@@ -1000,7 +1004,9 @@ function updatePidUnits(i, kind, loop) {
   const output = el.querySelector('[data-role="pMaxOut"]');
   if (spec.max === null) output.removeAttribute('max');
   else output.max = String(spec.max);
-  output.title = spec.max === null ? `PID 输出的绝对值上限${spec.unit ? `（${spec.unit}）` : ''}`
+  output.title = kind === MotorKind.DM && loop === 0
+    ? '额定转矩 3 N·m，峰值 7 N·m；峰值不能作为持续工作转矩'
+    : spec.max === null ? `PID 输出的绝对值上限${spec.unit ? `（${spec.unit}）` : ''}`
     : `允许范围 0～${spec.max} ${spec.unit}（当前 MIT 协议量程上限，非建议工作值）`;
 }
 
@@ -1291,6 +1297,7 @@ function bindEvents() {
       };
     }
     r('presetMode').onchange = () => renderProgram(i);
+    r('presetInfinite').onchange = () => renderProgram(i);
     r('presetStart').onclick = () => startProgram(i);
     r('presetStop').onclick = () => stopProgram(i, '已停止 · 目标已归零', true);
     slider.oninput = () => {

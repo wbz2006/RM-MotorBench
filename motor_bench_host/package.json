@@ -4,8 +4,12 @@
   "description": "大疆 A 板电机测试台 · 上位机(串口桥 + Web UI)",
   "type": "module",
   "private": true,
+  "main": "desktop.cjs",
   "scripts": {
     "start": "node server.js",
+    "desktop": "electron .",
+    "build:exe": "node node_modules/electron/install.js && electron-builder --config electron-builder.cjs --win portable --x64",
+    "test:desktop": "node desktop_test.js",
     "test": "node selftest.js",
     "test:http": "node --test http_test.js",
     "test:integration": "node integration_test.js",
@@ -19,5 +23,9 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "electron": "44.9.0",
+    "electron-builder": "26.15.3"
   }
 }

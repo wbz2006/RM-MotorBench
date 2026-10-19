@@ -462,7 +462,10 @@ function stopHeartbeat() {
 
 /* ---------------- 退出时确保电机停止 ---------------- */
 
+let shuttingDown = false;
 async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log('\n正在关闭:先下发全停指令…');
   try {
     if (serialPort && serialPort.isOpen) {
@@ -477,11 +480,19 @@ async function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+if (process.send) {
+  process.on('message', (message) => {
+    if (message?.type === 'shutdown') shutdown();
+  });
+  process.on('disconnect', shutdown);
+}
 
 /* ---------------- 启动 ---------------- */
 
 server.listen(args.port, args.host, () => {
-  console.log(`电机测试台上位机已启动: http://${args.host}:${args.port}`);
+  const port = server.address().port;
+  console.log(`电机测试台上位机已启动: http://${args.host}:${port}`);
   console.log(`默认串口波特率: ${args.baud}`);
   console.log('按 Ctrl+C 退出(退出时会自动下发全停)');
+  if (process.send) process.send({ type: 'ready', port });
 });

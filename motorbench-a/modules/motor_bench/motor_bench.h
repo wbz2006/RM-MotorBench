@@ -35,7 +35,7 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 10
+#define MB_FW_VERSION_MINOR 12
 
 /** 通道数上限 */
 #define MB_CHANNEL_MAX 8

@@ -987,9 +987,9 @@ console.log('\n== 18. PID protocol: frame layout, fixed-point, defaults ==');
       const value = dm.match(new RegExp(`speed_PID\\.${key} = ([0-9.]+)f`))?.[1];
       check(`DM ${key} matches the real firmware default`, value !== undefined && Number(value) === defaults[key]);
     }
-    check('DM4310 默认速度环采用用户指定五参数',
-      defaults.Kp === 0.65 && defaults.Ki === 12 && defaults.Kd === 0 &&
-      defaults.MaxOut === 15 && defaults.IntegralLimit === 1000 && defaults.improve === 1);
+    check('DM4310 采用用户指定的 0.55/0/0/7/0 默认速度环',
+      defaults.Kp === 0.55 && defaults.Ki === 0 && defaults.Kd === 0 &&
+      defaults.MaxOut === 7 && defaults.IntegralLimit === 0 && defaults.improve === 1);
   }
 
   /*

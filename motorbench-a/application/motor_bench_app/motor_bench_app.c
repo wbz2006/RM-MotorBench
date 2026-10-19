@@ -231,7 +231,7 @@ static void BenchBuildDJIConfig(Motor_Init_Config_s *ref, Motor_Type_e type, CAN
  *              主机 → 电机 用 tx_id,电机 → 主机 回传感测 用 rx_id,
  *              主机的 CAN 过滤器按 rx_id 匹配,配错就永远收不到反馈。
  *
- * @note DM 驱动的速度单位是 rad/s(DM_V_MIN/MAX = ±45),
+ * @note DM4310 速度量程为 ±30 rad/s，DM8009P 为 ±45 rad/s，
  *       上位机若要给 rpm,需要在协议层做单位换算
  */
 static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus, uint8_t tx_id, uint16_t rx_id)
@@ -257,13 +257,12 @@ static void BenchBuildDMConfig(Motor_Init_Config_s *ref, CAN_HandleTypeDef *bus,
     ref->controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
     ref->controller_setting_init_config.speed_feedback_source = MOTOR_FEED;
 
-    /* MIT speed-loop output is N*m, not DJI current units. The old Kp=5
-     * and 10 N*m limit cause alternating torque on a bare DM4310 at 500 Hz.
-     * Use a gentle commissioning baseline; tune further for the actual load. */
+    /* MIT speed-loop output is N*m. Start with P-only control and the
+     * DM-J4310-2EC manual's 3 N*m rated torque; tune for the actual load. */
     ref->controller_param_init_config.speed_PID.Kp = 0.05f;
     ref->controller_param_init_config.speed_PID.Ki = 0.0f;
     ref->controller_param_init_config.speed_PID.Kd = 0.0f;
-    ref->controller_param_init_config.speed_PID.MaxOut = 0.5f; /* N*m, initial bench limit */
+    ref->controller_param_init_config.speed_PID.MaxOut = 3.0f; /* N*m, rated torque */
     ref->controller_param_init_config.speed_PID.Improve = PID_Integral_Limit;
     ref->controller_param_init_config.speed_PID.IntegralLimit = 0.0f;
     /* Position targets and feedback are degrees; output is speed in rad/s. */
@@ -471,15 +470,15 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
          * 单颗也可能收不到反馈。现在由协议显式传入。
          */
         BenchBuildDMConfig(&cfg, bus, motor_id, rx_id);
-        /* Model-specific, user-confirmed speed PID defaults. MaxOut is
-         * an output ceiling, not a constant torque command. */
+        /* Model-specific commissioning defaults. Gains need load tuning;
+         * MaxOut is an output ceiling, not a constant torque command. */
         if (kind == MB_MOTOR_DM)
         {
-            cfg.controller_param_init_config.speed_PID.Kp = 0.65f;
-            cfg.controller_param_init_config.speed_PID.Ki = 12.0f;
+            cfg.controller_param_init_config.speed_PID.Kp = 0.55f;
+            cfg.controller_param_init_config.speed_PID.Ki = 0.0f;
             cfg.controller_param_init_config.speed_PID.Kd = 0.0f;
-            cfg.controller_param_init_config.speed_PID.MaxOut = 15.0f;
-            cfg.controller_param_init_config.speed_PID.IntegralLimit = 1000.0f;
+            cfg.controller_param_init_config.speed_PID.MaxOut = 7.0f;
+            cfg.controller_param_init_config.speed_PID.IntegralLimit = 0.0f;
         }
         else if (kind == MB_MOTOR_DM8009P)
             cfg.controller_param_init_config.speed_PID.MaxOut = 10.0f;

@@ -597,9 +597,9 @@ export const PID_DEFAULTS = {
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 0 },
     angle: { Kp: 8, Ki: 0, Kd: 0, MaxOut: 500, IntegralLimit: 100, improve: 5 },
   },
-  // DM4310 用户指定速度环默认值；MIT 速度环输出为 N*m，与固件工厂一致。
+  // DM-J4310-2EC V1.1: user-selected 0.55/0/0/7/0 speed defaults.
   [MotorKind.DM]: {
-    speed: { Kp: 0.65, Ki: 12, Kd: 0, MaxOut: 15, IntegralLimit: 1000, improve: 1 },
+    speed: { Kp: 0.55, Ki: 0, Kd: 0, MaxOut: 7, IntegralLimit: 0, improve: 1 },
     current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
     angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
   },

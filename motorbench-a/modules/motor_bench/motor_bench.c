@@ -1851,7 +1851,8 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
         if (!m) return MB_ERR_BAD_PARAM;
         if (loop == MB_PID_LOOP_SPEED)
         {
-            if (max_out > m->t_max) return MB_ERR_BAD_PARAM;
+            float torque_limit = ch->kind == MB_MOTOR_DM ? DM4310_PEAK_TORQUE : m->t_max;
+            if (max_out > torque_limit) return MB_ERR_BAD_PARAM;
             target = &m->speed_PID;
         }
         else if (loop == MB_PID_LOOP_ANGLE)
