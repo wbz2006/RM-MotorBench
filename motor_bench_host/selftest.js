@@ -3410,9 +3410,24 @@ console.log('\n== 40. LK9025 / HT04 接入测试台 ==');
   const htmlCode = (html || '').replace(/<!--[\s\S]*?-->/g, '');
 
   if (html) {
-    check('LK9025 and HT04 are selectable model options',
-      /<option value="5">岭芯 LK9025<\/option>/.test(htmlCode)
-      && /<option value="6">海泰 HT04<\/option>/.test(htmlCode));
+    /*
+     * 2026-10-19 用户裁定:界面上**暂不开放** LK9025 / HT04,
+     * 只保留达妙与大疆两系。理由是两者都未经实机验证,
+     * 且不能在运行期移除(驱动库没有实例销毁接口)。
+     *
+     * 底层能力全部保留 —— 协议枚举、固件工厂、驱动分发、
+     * PID 默认值、rx_id 规则都在,只把界面选项藏起来,
+     * 等实机跑通后把两个 <option> 加回去即可,无需再动其它层。
+     */
+    check('LK9025 and HT04 are NOT offered in the model dropdown (not yet proven)',
+      !/<option value="5">/.test(htmlCode) && !/<option value="6">/.test(htmlCode),
+      'the 2026-10-19 ruling keeps only DJI and DM selectable');
+    check('DJI and DM kinds remain selectable',
+      /<option value="1">大疆 GM6020<\/option>/.test(htmlCode)
+      && /<option value="2">大疆 M3508<\/option>/.test(htmlCode)
+      && /<option value="3">大疆 M2006<\/option>/.test(htmlCode)
+      && /<option value="4">达妙 DM4310<\/option>/.test(htmlCode)
+      && /<option value="7">达妙 DM8009P<\/option>/.test(htmlCode));
   }
 
   /* HT 需要 rx_id;LK 不需要(驱动内部算 0x140+id) */

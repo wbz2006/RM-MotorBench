@@ -77,10 +77,17 @@
         <div id="addForm" class="registry-form" role="group" aria-label="添加电机" hidden>
           <div class="registry-form-heading"><strong>添加电机</strong><span>NEW MOTOR</span></div>
           <label>型号
+            <!--
+              @attention 2026-10-19:当前只放达妙与大疆两系。
+                LK9025 / HT04 的驱动已接入固件工厂(见 motor_bench_app.c),
+                但**暂不开放给上位机** —— 两者都未经实机验证,
+                且不能在运行期移除(驱动库没有实例销毁接口,见 motor_bench.c
+                的 MotorBenchRemoveMotor)。等实机跑通再放开选项。
+                底层协议(MotorKind.LK / HT)与固件能力保留,不受此处影响。
+            -->
             <select id="addKind" title="电机型号">
               <option value="1">大疆 GM6020</option><option value="2">大疆 M3508</option>
               <option value="3">大疆 M2006</option><option value="4">达妙 DM4310</option>
-              <option value="5">岭芯 LK9025</option><option value="6">海泰 HT04</option>
               <option value="7">达妙 DM8009P</option>
             </select>
           </label>
