@@ -54,6 +54,7 @@ typedef struct
     PIDInstance speed_PID;
     PIDInstance angle_PID;
     float pid_ref;
+    SpeedRamp_s speed_ramp;
 
     Motor_Working_Type_e stop_flag; // 启停标志
 

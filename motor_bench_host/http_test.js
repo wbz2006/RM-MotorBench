@@ -31,7 +31,9 @@ test('static assets bypass cache and versioned root loads the current PID interf
       assert.equal(await response.text(), fs.readFileSync(path.join(root, file), 'utf8'), route);
     }
     const html = await (await fetch(base + '/?v=20261019-dm4310-defaults')).text();
-    assert.match(html, /UI 20261019-dm4310-defaults/);
+    assert.match(html, /UI 20261021-speed-controls/);
+    assert.match(html, /style\.css\?v=20261021-speed-controls/);
+    assert.match(html, /ui\.js\?v=20261021-speed-controls/);
     assert.doesNotMatch(html, /pid-workflow-note|pidTuningHint|data-role="pidLoop"/);
     assert.match(html, /data-role="pidPanel" data-loop="0"/);
     assert.match(html, /pMaxOutUnit/);

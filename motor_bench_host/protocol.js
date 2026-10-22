@@ -597,15 +597,15 @@ export const PID_DEFAULTS = {
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 20000, IntegralLimit: 3000, improve: 0 },
     angle: { Kp: 8, Ki: 0, Kd: 0, MaxOut: 500, IntegralLimit: 100, improve: 5 },
   },
-  // DM-J4310-2EC V1.1: user-selected 0.55/0/0/7/0 speed defaults.
+  // DM-J4310-2EC V1.1: user-selected speed gains and integral limit.
   [MotorKind.DM]: {
-    speed: { Kp: 0.55, Ki: 0, Kd: 0, MaxOut: 7, IntegralLimit: 0, improve: 1 },
+    speed: { Kp: 0.55, Ki: 0.5, Kd: 0, MaxOut: 7, IntegralLimit: 100, improve: 1 },
     current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
     angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
   },
-  // User-confirmed commissioning ceiling; keep gains gentle, tune for load.
+  // DM8009P: speed defaults from the user's commissioning screenshot.
   [MotorKind.DM8009P]: {
-    speed: { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 0, improve: 1 },
+    speed: { Kp: 0.55, Ki: 5, Kd: 0, MaxOut: 17.5, IntegralLimit: 100, improve: 1 },
     current: { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, improve: 0 },
     angle: { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 2, IntegralLimit: 0, improve: 1 },
   },

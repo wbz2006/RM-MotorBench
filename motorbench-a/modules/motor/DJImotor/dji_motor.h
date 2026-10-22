@@ -77,6 +77,7 @@ typedef struct
     DJI_Motor_Measure_s measure;            // 电机测量值
     Motor_Control_Setting_s motor_settings; // 电机设置
     Motor_Controller_s motor_controller;    // 电机控制器
+    SpeedRamp_s speed_ramp;
 
     CANInstance *motor_can_instance; // 电机CAN实例
     // 分组发送设置

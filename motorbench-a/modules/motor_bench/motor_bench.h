@@ -35,7 +35,13 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 12
+#define MB_FW_VERSION_MINOR 18
+
+/* Speed-mode target shaping, independent of PID and motor protocol spans. */
+#define MB_SPEED_ACCEL_RAD 100.0f
+#define MB_SPEED_ZERO_DECEL_RAD 200.0f
+#define MB_SPEED_ACCEL_RPM 30000.0f
+#define MB_SPEED_ZERO_DECEL_RPM 60000.0f
 
 /** 通道数上限 */
 #define MB_CHANNEL_MAX 8

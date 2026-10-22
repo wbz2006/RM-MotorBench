@@ -1261,7 +1261,13 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
          mb_channels[channel_id].kind == MB_MOTOR_M2006) &&
         (outer == SPEED_LOOP || outer == SPEED_AND_CURRENT_LOOP);
 
+    if (mb_channels[channel_id].kind == MB_MOTOR_DM &&
+        (outer == SPEED_LOOP || outer == SPEED_AND_CURRENT_LOOP))
+        LIMIT_MIN_MAX(limited, -DM4310_24V_SPEED_LIMIT, DM4310_24V_SPEED_LIMIT);
     float to_send = need_rpm_conv ? limited * RPM_2_ANGLE_PER_SEC : limited;
+    /* HT speed PID uses deg/s internally; its UI and feedback use rad/s. */
+    if (mb_channels[channel_id].kind == MB_MOTOR_HT && (outer == SPEED_LOOP || outer == SPEED_AND_CURRENT_LOOP))
+        to_send = limited * RAD_2_DEGREE;
     if (outer & ANGLE_LOOP)
     {
         /* Position targets are relative degrees, never rpm. */
@@ -1857,7 +1863,8 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
         }
         else if (loop == MB_PID_LOOP_ANGLE)
         {
-            if (max_out > m->v_max) return MB_ERR_BAD_PARAM;
+            float speed_limit = ch->kind == MB_MOTOR_DM ? DM4310_24V_SPEED_LIMIT : m->v_max;
+            if (max_out > speed_limit) return MB_ERR_BAD_PARAM;
             target = &m->angle_PID;
         }
         else
@@ -2061,6 +2068,10 @@ void MotorBenchTask(void)
             stopped = ((DMMotorInstance *)ch->motor_ptr)->stop_flag;
         else if (ch->kind == MB_MOTOR_M2006 || ch->kind == MB_MOTOR_M3508 || ch->kind == MB_MOTOR_GM6020)
             stopped = ((DJIMotorInstance *)ch->motor_ptr)->stop_flag;
+        else if (ch->kind == MB_MOTOR_LK)
+            stopped = ((LKMotorInstance *)ch->motor_ptr)->stop_flag;
+        else if (ch->kind == MB_MOTOR_HT)
+            stopped = ((HTMotorInstance *)ch->motor_ptr)->stop_flag;
         else
             continue;
         if (stopped == MOTOR_STOP ||

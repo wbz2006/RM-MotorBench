@@ -353,13 +353,17 @@ static void DJIMotorResetController(DJIMotorInstance *motor)
 void DJIMotorStop(DJIMotorInstance *motor)
 {
     motor->stop_flag = MOTOR_STOP;
+    motor->speed_ramp.ref = 0.0f;
     DJIMotorResetController(motor);
 }
 
 void DJIMotorEnable(DJIMotorInstance *motor)
 {
     if (motor->stop_flag == MOTOR_STOP)
+    {
         DJIMotorResetController(motor);
+        SpeedRampReset(&motor->speed_ramp, motor->measure.speed_aps);
+    }
     motor->stop_flag = MOTOR_ENALBED;
 }
 
@@ -551,6 +555,15 @@ void DJIMotorControl()
         pid_ref = motor_controller->pid_ref; // 保存设定值,防止motor_controller->pid_ref在计算过程中被修改
         if (motor_setting->motor_reverse_flag == MOTOR_DIRECTION_REVERSE)
             pid_ref *= -1; // 设置反转
+
+        if ((motor_setting->outer_loop_type & SPEED_LOOP) && !(motor_setting->outer_loop_type & ANGLE_LOOP) &&
+            !SpeedRampApply(&motor->speed_ramp, pid_ref, &pid_ref))
+        {
+            DJIMotorStop(motor);
+            motor_controller->pid_ref = 0.0f;
+            memset(sender_assignment[group].tx_buff + 2 * num, 0, sizeof(uint16_t));
+            continue;
+        }
 
         // pid_ref会顺次通过被启用的闭环充当数据的载体
         // 计算位置环,只有启用位置环且外层闭环为位置时会计算速度环输出

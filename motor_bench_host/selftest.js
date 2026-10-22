@@ -987,9 +987,9 @@ console.log('\n== 18. PID protocol: frame layout, fixed-point, defaults ==');
       const value = dm.match(new RegExp(`speed_PID\\.${key} = ([0-9.]+)f`))?.[1];
       check(`DM ${key} matches the real firmware default`, value !== undefined && Number(value) === defaults[key]);
     }
-    check('DM4310 采用用户指定的 0.55/0/0/7/0 默认速度环',
-      defaults.Kp === 0.55 && defaults.Ki === 0 && defaults.Kd === 0 &&
-      defaults.MaxOut === 7 && defaults.IntegralLimit === 0 && defaults.improve === 1);
+    check('DM4310 采用用户指定的 0.55/0.5/0/7/100 默认速度环',
+      defaults.Kp === 0.55 && defaults.Ki === 0.5 && defaults.Kd === 0 &&
+      defaults.MaxOut === 7 && defaults.IntegralLimit === 100 && defaults.improve === 1);
   }
 
   /*
@@ -1134,7 +1134,7 @@ console.log('\n== 19. PID panel must stay visible (disable, not hide) ==');
         /'pidApply'[\s\S]*'pidQuery'[\s\S]*'pidReset'/.test(body));
     }
     check('motor dropdown change refreshes the PID panel',
-      /r\('motor'\)\.onchange\s*=\s*\(\)\s*=>\s*initPidPanel\(/.test(uiSrc),
+      /r\('motor'\)\.onchange\s*=\s*\(\)\s*=>\s*(?:\{\s*)?initPidPanel\(/.test(uiSrc),
       'otherwise selecting a different motor shows the wrong defaults');
   }
 }
@@ -3181,8 +3181,8 @@ console.log('\n== 37. 串口与添加电机并成一行;鱼骨图底部信息行
       missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : '');
 
     check('the serial group comes first, 添加电机 second',
-      htmlCode.indexOf('id="portSelect"') < htmlCode.indexOf('添加电机')
-      && htmlCode.indexOf('添加电机') < htmlCode.indexOf('id="addMotor"'));
+      htmlCode.indexOf('id="portSelect"') < htmlCode.indexOf('id="openAddMotor"')
+      && htmlCode.indexOf('id="openAddMotor"') < htmlCode.indexOf('id="addMotor"'));
     check('the live add-result message stays inside the add group',
       /id="addMotor"[\s\S]{0,120}?id="addMsg"/.test(htmlCode),
       'addMsg is where conflicts/ack text shows up — it must stay next to 添加');
@@ -3364,9 +3364,9 @@ console.log('\n== 39. 电机列表、十六进制 ID、删除匹配键 ==');
   const inv8009 = parseInventory(Buffer.from([1, 7, 1, 1, 2, 0x11, 0]));
   check('DM8009P inventory label and feedback ID round-trip',
     MotorKindLabel[inv8009.items[0].kind] === '达妙 DM8009P' && inv8009.items[0].rxId === 0x11);
-  check('DM8009P keeps independent 0.05/0/0/10/0 speed defaults',
+  check('DM8009P uses user-selected 0.55/5/0/17.5/100 speed defaults',
     JSON.stringify(PID_DEFAULTS[MotorKind.DM8009P].speed) ===
-      JSON.stringify({ Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 10, IntegralLimit: 0, improve: 1 }));
+      JSON.stringify({ Kp: 0.55, Ki: 5, Kd: 0, MaxOut: 17.5, IntegralLimit: 100, improve: 1 }));
 
   const body = Buffer.from([2, MotorKind.M2006, 1, 3, 2, 0, 0,
     MotorKind.DM, 1, 6, 2, 0x02, 0x03]);

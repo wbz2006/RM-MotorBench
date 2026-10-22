@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { MotorKindLabel } from './protocol.js';
 import assert from 'node:assert/strict';
 import { firmwareRoot } from './firmware_test_paths.js';
 import { FrameParser, FrameType, buildEnable, buildSetRef, buildMotorAdd, buildMotorRemove, buildAllStop, buildUnbind, buildHeartbeat, buildSetPid, buildSetLoop, parseHeartbeatAck, parseLoopSetAck, parsePidReport, parseInventory, parseTelemetry, MotorKind, PID_DEFAULTS } from './protocol.js';
@@ -15,6 +16,8 @@ const appSource = fs.readFileSync(path.join(root, 'application/motor_bench_app/m
 const dmConfigBuilder = appSource.match(/static void BenchBuildDMConfig\([\s\S]*?\n\}/)?.[0];
 const motorDestroy = appSource.match(/static void BenchMotorDestroy\([\s\S]*?\n\}/)?.[0];
 const supportsDm8009p = appSource.includes('MB_MOTOR_DM8009P');
+const supportsDmIntegralHold = fs.readFileSync(path.join(root, 'modules/algorithm/controller.h'), 'utf8').includes('PIDCalculateWithIntegralHold');
+const supportsDmSpeedRamp = fs.readFileSync(path.join(root, 'modules/algorithm/controller.h'), 'utf8').includes('SpeedRampApply');
 /*
  * 2026-10-19:LK/HT 接入后,工厂里新增了对 BenchBuildLKConfig /
  * BenchBuildHTConfig 的调用。harness 是按"从 app 源码里抽取函数原文"
@@ -101,7 +104,8 @@ typedef void (*os_pthread)(void const *);
 #define osPriorityNormal 0
 static inline void vTaskSuspendAll(void) {}
 static inline void xTaskResumeAll(void) {}
-static inline void osDelay(uint32_t ms) { (void)ms; }
+void test_os_delay(uint32_t ms);
+static inline void osDelay(uint32_t ms) { test_os_delay(ms); }
 /* HT04.c 用 __itoa();本机工具链是 MinGW,没有这个 newlib 符号,补一个桩 */
 static inline char *__itoa(int value, char *buf, int radix) { (void)radix; sprintf(buf, "%d", value); return buf; }
 /* HT04.c 用 osThreadDef(name,fn,prio,inst,stack) 定义一个线程描述符,
@@ -139,8 +143,19 @@ const harness = String.raw`
 #include "bsp_log.h"
 ${supportsAutoReconnect ? '#define MB_AUTO_RECONNECT_TEST 1' : ''}
 
+#include <setjmp.h>
+static jmp_buf ht_iteration_end;
+static int ht_step_active;
+void test_os_delay(uint32_t ms) { (void)ms; if (ht_step_active) longjmp(ht_iteration_end, 1); }
+extern void HTMotorTask(void const *argument);
+static void ht_step(HTMotorInstance *m) {
+    if (setjmp(ht_iteration_end) == 0) { ht_step_active = 1; HTMotorTask(m); }
+    ht_step_active = 0;
+}
 CAN_HandleTypeDef hcan1, hcan2;
 static uint32_t now = 1000;
+static uint8_t override_dt;
+static float injected_dt;
 static unsigned failures;
 static uint8_t sent[2][3][8];
 static uint8_t usb_buffer[256];
@@ -180,7 +195,7 @@ uint8_t *USBInit(USB_Init_Config_s c) { usb_receive = c.rx_cbk; return usb_buffe
 float DWT_GetDeltaT(uint32_t *last) {
     float dt = (now - *last) / 1000.0f;
     *last = now;
-    return dt;
+    return override_dt ? injected_dt : dt;
 }
 float DWT_GetTimeline_s(void) { return now / 1000.0f; }
 static float poll_elapsed;
@@ -374,6 +389,113 @@ static int dm_stability(void) {
         printf("DM model %u: peak=%.3f tail=%.3f torque=%.3f\n", test, peak, tail_peak, peak_torque);
     }
     if (!failures) puts("PASS DM shared low-torque baseline zero-speed stability with delayed feedback");
+    return failures ? 1 : 0;
+}
+static int dm_zero_integral(void) {
+    for (unsigned model = 0; model < 2; ++model) {
+        Motor_Init_Config_s config = {0};
+        BenchBuildDMConfig(&config, &hcan1, model + 1, 0x300 + model);
+        config.controller_param_init_config.speed_PID = (PID_Init_Config_s){
+            .Kp = 0.55f, .Ki = 5, .MaxOut = 7, .IntegralLimit = 100,
+            .Improve = PID_Integral_Limit };
+        DMMotorInstance *m = DMMotorInitWithModel(&config, model ? DM_MODEL_8009P : DM_MODEL_4310);
+        CHECK(m != NULL);
+        dm_feedback(m, 2047);
+        DMMotorEnable(m);
+        DMMotorSetRef(m, 0);
+        for (unsigned raw = 2047; raw <= 2048; ++raw) {
+            PIDReset(&m->speed_PID);
+            // One minute at either nearest-to-zero code must not build torque.
+            for (unsigned n = 0; n < 30000; ++n) {
+                dm_feedback(m, raw);
+                now += 2; DMMotorControl();
+            }
+            CHECK(m->speed_PID.Iout == 0);
+            CHECK(fabsf(m->speed_PID.Output) < 0.01f);
+            CHECK(m->speed_PID.Ki == 5 && m->measure.velocity != 0);
+            for (int direction = -1; direction <= 1; direction += 2) {
+                m->speed_PID.Iout = direction * 0.6f;
+                for (unsigned n = 0; n < 1000; ++n) {
+                    dm_feedback(m, raw);
+                    now += 2; DMMotorControl();
+                }
+                CHECK(fabsf(m->speed_PID.Iout - direction * 0.6f) < 0.00001f);
+                CHECK(fabsf(m->speed_PID.Output - direction * 0.6f) < 0.01f);
+            }
+        }
+        // Exact zero and a configured PID deadband must also retain holding torque.
+        m->measure.velocity = 0;
+        m->speed_PID.DeadBand = 0.02f;
+        now += 2; DMMotorControl();
+        CHECK(fabsf(m->speed_PID.Output - 0.6f) < 0.00001f);
+        m->speed_PID.DeadBand = 0;
+        for (unsigned raw = 2046; raw <= 2049; raw += 3) {
+            PIDReset(&m->speed_PID);
+            dm_feedback(m, raw);
+            now += 2; DMMotorControl();
+            CHECK(m->speed_PID.Iout * m->measure.velocity < 0);
+        }
+        // Even a small nonzero command must keep its normal integral action.
+        PIDReset(&m->speed_PID);
+        dm_feedback(m, 2047);
+        DMMotorSetRef(m, 0.001f);
+        now += 2; DMMotorControl();
+        CHECK(m->speed_PID.Iout > 0);
+        // The speed loop in the position cascade uses the same rule.
+        DMMotorOuterLoop(m, ANGLE_AND_SPEED_LOOP);
+        DMMotorEnable(m);
+        DMMotorSetRef(m, m->measure.position * RAD_2_DEGREE);
+        now += 2; DMMotorControl();
+        CHECK(m->speed_PID.Iout == 0);
+        DMMotorSetRef(m, m->pid_ref + 1);
+        now += 2; DMMotorControl();
+        CHECK(m->speed_PID.Iout > 0);
+        DMMotorStop(m);
+        CHECK(m->speed_PID.Iout == 0);
+    }
+    if (!failures) puts("PASS DM4310/DM8009P Ki=5: 60s at both zero codes, retained holding torque, real motion/nonzero targets and position cascade");
+    return failures ? 1 : 0;
+}
+static int dm_invalid_control(void) {
+    Motor_Init_Config_s config = {0};
+    BenchBuildDMConfig(&config, &hcan1, 1, 0x11);
+    DMMotorInstance *m = DMMotorInitWithModel(&config, DM_MODEL_8009P);
+    CHECK(m != NULL);
+    const float intervals[] = {0, -0.002f, NAN, INFINITY, 1.0f};
+    for (unsigned i = 0; i < sizeof(intervals) / sizeof(intervals[0]); ++i) {
+        dm_feedback(m, 2047);
+        DMMotorEnable(m);
+        DMMotorSetRef(m, 0);
+        override_dt = 1; injected_dt = intervals[i];
+        now += 2; DMMotorControl();
+        override_dt = 0;
+        CHECK(m->stop_flag == MOTOR_STOP);
+        CHECK(isfinite(m->speed_PID.Output) && m->speed_PID.Output == 0);
+        CHECK(m->motor_can_instace->tx_buff[7] == DM_CMD_RESET_MODE);
+        now += 2; DMMotorControl();
+        CHECK(m->stop_flag == MOTOR_STOP); // No automatic restart after recovery.
+    }
+    // An invalid state or reference must never reach a float-to-CAN conversion.
+    for (unsigned test = 0; test < 4; ++test) {
+        dm_feedback(m, 2047);
+        DMMotorEnable(m);
+        DMMotorSetRef(m, test == 0 ? NAN : 0);
+        if (test == 1) m->speed_PID.Iout = NAN;
+        if (test == 2) m->measure.velocity = NAN;
+        if (test == 3) m->speed_PID.Iout = INFINITY;
+        now += 2; DMMotorControl();
+        CHECK(m->stop_flag == MOTOR_STOP);
+        CHECK(m->motor_can_instace->tx_buff[7] == DM_CMD_RESET_MODE);
+    }
+    // Normal timing must still produce a bounded finite command.
+    dm_feedback(m, 2047);
+    DMMotorEnable(m);
+    DMMotorSetRef(m, 0);
+    now += 2; DMMotorControl();
+    CHECK(m->stop_flag == MOTOR_ENALBED);
+    CHECK(isfinite(m->speed_PID.Output) && fabsf(m->speed_PID.Output) < 0.01f);
+    DMMotorStop(m);
+    if (!failures) puts("PASS invalid PID dt (zero/negative/NaN/Inf/long gap) and nonfinite control stop DM before CAN encoding; recovery stays stopped");
     return failures ? 1 : 0;
 }
 static int mixed(void) {
@@ -631,8 +753,8 @@ static int position_control(const char *speed_pid, const char *angle_pid, const 
     receive_hex("${buildHeartbeat().toString('hex')}");
     receive_hex("${buildSetPid(1, 0, { Kp: 0.05, Ki: 0, Kd: 0, MaxOut: 7, IntegralLimit: 0, scaledLimits: true }).toString('hex')}");
     CHECK(fabsf(b->speed_PID.MaxOut - 7.0f) < 0.0001f);
-    receive_hex("${buildSetPid(1, 2, { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 30, IntegralLimit: 0, scaledLimits: true }).toString('hex')}");
-    CHECK(fabsf(b->angle_PID.MaxOut - 30.0f) < 0.0001f);
+    receive_hex("${buildSetPid(1, 2, { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 20.94, IntegralLimit: 0, scaledLimits: true }).toString('hex')}");
+    CHECK(fabsf(b->angle_PID.MaxOut - 20.94f) < 0.0001f);
     receive_hex(speed_pid);
     receive_hex(angle_pid);
     CHECK(fabsf(b->speed_PID.MaxOut - 0.375f) < 0.0001f);
@@ -689,9 +811,10 @@ static int dm_profiles(void) {
     DMMotorInstance *a = profile_motors[0], *b = profile_motors[1];
     CHECK(a && b && a->t_max == 10 && b->t_max == 54);
     CHECK(a->p_max == 12.5f && b->p_max == 12.5f && a->v_max == 30 && b->v_max == 45);
-    CHECK(a->speed_PID.Kp == 0.55f && a->speed_PID.Ki == 0.0f && a->speed_PID.Kd == 0.0f);
-    CHECK(a->speed_PID.MaxOut == 7.0f && a->speed_PID.IntegralLimit == 0.0f);
-    CHECK(b->speed_PID.MaxOut == 10.0f);
+    CHECK(a->speed_PID.Kp == 0.55f && a->speed_PID.Ki == 0.5f && a->speed_PID.Kd == 0.0f);
+    CHECK(a->speed_PID.MaxOut == 7.0f && a->speed_PID.IntegralLimit == 100.0f);
+    CHECK(b->speed_PID.Kp == 0.55f && b->speed_PID.Ki == 5.0f && b->speed_PID.Kd == 0.0f);
+    CHECK(b->speed_PID.MaxOut == 17.5f && b->speed_PID.IntegralLimit == 100.0f);
     CHECK(MotorBenchQueryPid(0) == MB_OK && MotorBenchQueryPid(1) == MB_OK);
     print_wire("DM_DEFAULTS_WIRE");
     CHECK(b->motor_can_instace->tx_id == 1 && b->motor_can_instace->rx_id == 0x11);
@@ -711,21 +834,33 @@ static int dm_profiles(void) {
     MB_TelemetryItem_s feedback;
     CHECK(MotorBenchGetMeasure(1, &feedback) == MB_OK && (feedback.status & 1));
     CHECK(fabsf(feedback.measure_torque - b->measure.torque) < 0.0001f);
-    /* At 30 rad/s error, 4310 saturates at 7 N*m; 8009P requests 1.5 N*m.
-     * Keep the independently configured MIT spans: 4310=10, 8009P=54. */
+    /* At 30 rad/s error, 4310 saturates at 7 N*m; 8009P requests 16.8 N*m.
+     * Keep the independently configured MIT spans: 4310=10, 8009P=54.
+     * Bypass the trajectory for this encoding test; test its rate separately. */
+#ifdef MB_SPEED_ACCEL_RAD
+    CHECK(a->speed_ramp.rate == MB_SPEED_ACCEL_RAD && b->speed_ramp.rate == MB_SPEED_ACCEL_RAD);
+    b->speed_ramp.rate = 0;
+    a->speed_ramp.rate = 0;
+#endif
     for (unsigned i = 0; i < 2; i++) {
         motors[i]->measure.velocity = 0;
         CHECK(MotorBenchSetEnable(i, 1) == MB_OK);
         CHECK(MotorBenchSetRef(i, 30) == MB_OK);
     }
     now += 2; DMMotorControl();
-    CHECK(dm_torque(a) == 3480 && dm_torque(b) == 2104);
+    CHECK(dm_torque(a) == 3480 && dm_torque(b) == 2684);
     CHECK(fabsf(a->speed_PID.Output - 7.0f) < 0.0001f);
-    CHECK(fabsf(b->speed_PID.Output - 1.5f) < 0.0001f);
+    CHECK(fabsf(b->speed_PID.Output - 16.8f) < 0.0001f);
+    CHECK(a->pid_ref == 20.94f && b->pid_ref == 30);
+    MB_TelemetryItem_s capped;
+    CHECK(MotorBenchGetMeasure(0, &capped) == MB_OK && capped.ref == 20.94f);
+    CHECK(MotorBenchSetRef(0, -30) == MB_OK && a->pid_ref == -20.94f);
+    CHECK(MotorBenchGetMeasure(0, &capped) == MB_OK && capped.ref == -20.94f);
     CHECK(MotorBenchSetEnable(0, 0) == MB_OK && MotorBenchSetEnable(1, 0) == MB_OK);
     CHECK(MotorBenchSetPid(0, MB_PID_LOOP_SPEED, 1, 0, 0, 7.001f, 0, 0) == MB_ERR_BAD_PARAM);
     CHECK(MotorBenchSetPid(0, MB_PID_LOOP_SPEED, 1, 0, 0, 10, 0, 0) == MB_ERR_BAD_PARAM);
-    CHECK(MotorBenchSetPid(0, MB_PID_LOOP_ANGLE, 0.1f, 0, 0, 30.001f, 0, 0) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchSetPid(0, MB_PID_LOOP_ANGLE, 0.1f, 0, 0, 20.941f, 0, 0) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchSetPid(0, MB_PID_LOOP_ANGLE, 0.1f, 0, 0, 20.94f, 0, 0) == MB_OK);
     CHECK(MotorBenchSetPid(1, MB_PID_LOOP_SPEED, 1, 0, 0, 54, 0, 0) == MB_OK);
     CHECK(MotorBenchSetPid(1, MB_PID_LOOP_SPEED, 1, 0, 0, 54.001f, 0, 0) == MB_ERR_BAD_PARAM);
     CHECK(b->speed_PID.MaxOut == 54 && a->speed_PID.MaxOut == 7.0f);
@@ -767,6 +902,228 @@ static int dm_profiles(void) {
     if (!failures) puts("PASS actual factory DM4310 + DM8009P coexistence, independent MIT spans, torque encoding/decoding, PID bounds, loops, TX collision and deletion");
     return failures ? 1 : 0;
 }
+#ifdef MB_SPEED_ACCEL_RAD
+static int shared_speed_ramp(unsigned kind) {
+    void *instance = NULL;
+    unsigned id = kind == MB_MOTOR_DM ? 6 : 1;
+    unsigned rx = kind == MB_MOTOR_DM ? 0x302 : kind == MB_MOTOR_DM8009P ? 0x11 : kind == MB_MOTOR_HT ? 0x22 : 0;
+    CHECK(BenchMotorFactory(kind, 1, id, rx, &instance) == MB_OK);
+    SpeedRamp_s *ramp = NULL;
+    PIDInstance *speed = NULL;
+    Motor_Control_Setting_s *setting = NULL;
+    Motor_Working_Type_e *stop = NULL;
+    DaemonInstance *daemon = NULL;
+    float scale = 1, target_scale = 1;
+    if (kind <= MB_MOTOR_M2006) {
+        DJIMotorInstance *m = instance;
+        ramp = &m->speed_ramp; speed = &m->motor_controller.speed_PID;
+        setting = &m->motor_settings; stop = &m->stop_flag; daemon = m->daemon;
+        scale = 6; target_scale = 200;
+    } else if (kind == MB_MOTOR_DM || kind == MB_MOTOR_DM8009P) {
+        DMMotorInstance *m = instance;
+        ramp = &m->speed_ramp; speed = &m->speed_PID;
+        setting = &m->motor_settings; stop = &m->stop_flag; daemon = m->daemon;
+    } else if (kind == MB_MOTOR_LK) {
+        LKMotorInstance *m = instance;
+        ramp = &m->speed_ramp; speed = &m->speed_PID;
+        setting = &m->motor_settings; stop = &m->stop_flag; daemon = m->daemon;
+    } else if (kind == MB_MOTOR_HT) {
+        HTMotorInstance *m = instance;
+        ramp = &m->speed_ramp; speed = &m->speed_PID;
+        setting = &m->motor_settings; stop = &m->stop_flag; daemon = m->motor_daemon;
+        scale = RAD_2_DEGREE;
+    }
+    CHECK(ramp && speed && setting && stop && daemon);
+    CHECK(fabsf(ramp->rate - (kind <= MB_MOTOR_M2006 ? 30000 : 100) * scale) < 0.01f);
+    CHECK(ramp->zero_rate == 2 * ramp->rate);
+    CHECK(MotorBenchRegisterMotor(kind, 1, id, rx, SPEED_LOOP, instance) == MB_OK);
+    CHECK(MotorBenchBind(0, kind, 1, id, SPEED_LOOP) == MB_OK);
+    DaemonReload(daemon);
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    const float targets[] = {3, -3, 4, 0};
+    const unsigned intervals[] = {1, 2, 5};
+    float previous = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        float target = targets[i] * target_scale * scale;
+        speed->Iout = 0.25f;
+        CHECK(MotorBenchSetRef(0, targets[i] * target_scale) == MB_OK);
+        CHECK(speed->Iout == 0.25f);
+        uint32_t started = now;
+        float expected_ms = fabsf(target - previous) / (target == 0 ? ramp->zero_rate : ramp->rate) * 1000;
+        for (unsigned n = 0; n < 500 && previous != target; n++) {
+            unsigned ms = intervals[n % 3];
+            now += ms; DaemonReload(daemon);
+            DJIMotorControl(); DMMotorControl(); LKMotorControl();
+            if (kind == MB_MOTOR_HT) ht_step(instance);
+            CHECK(*stop == MOTOR_ENALBED);
+            float current = speed->Ref;
+            float rate = target == 0 ? ramp->zero_rate : ramp->rate;
+            CHECK(fabsf(current - previous) <= rate * ms / 1000 + 0.001f);
+            CHECK(fabsf(current - ramp->ref) < 0.001f);
+            CHECK((current - previous) * (target - previous) >= -0.001f);
+            CHECK(fabsf(target-current) <= fabsf(target-previous) + 0.001f);
+            previous = current;
+        }
+        CHECK(previous == target);
+        CHECK(now - started <= expected_ms + 5);
+        if (target == 0) {
+            MB_TelemetryItem_s feedback;
+            CHECK(MotorBenchGetMeasure(0, &feedback) == MB_OK && (feedback.status & 2) && feedback.ref == 0);
+        }
+    }
+    CHECK(MotorBenchSetRef(0, 3 * target_scale) == MB_OK);
+    now += 2; DJIMotorControl(); DMMotorControl(); LKMotorControl();
+    if (kind == MB_MOTOR_HT) ht_step(instance);
+    CHECK(ramp->ref > 0);
+    CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    CHECK(*stop == MOTOR_STOP && ramp->ref == 0);
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    CHECK(MotorBenchSetRef(0, 3 * target_scale) == MB_OK);
+    override_dt = 1; injected_dt = 0;
+    now += 2; DJIMotorControl(); DMMotorControl(); LKMotorControl();
+    if (kind == MB_MOTOR_HT) ht_step(instance);
+    override_dt = 0;
+    CHECK(*stop == MOTOR_STOP && ramp->ref == 0);
+    MotorBenchTask();
+    MB_TelemetryItem_s feedback;
+    CHECK(MotorBenchGetMeasure(0, &feedback) == MB_OK && !(feedback.status & 2) && feedback.ref == 0);
+    now += 2; DaemonReload(daemon); DJIMotorControl(); DMMotorControl(); LKMotorControl();
+    if (kind == MB_MOTOR_HT) ht_step(instance);
+    CHECK(*stop == MOTOR_STOP);
+    // Feedback loss discards the trajectory; returned feedback cannot restart it.
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    CHECK(MotorBenchSetRef(0, 3 * target_scale) == MB_OK);
+    for (unsigned n = 0; n < 12; n++) DaemonTask();
+    now += 2; DJIMotorControl(); DMMotorControl(); LKMotorControl();
+    if (kind == MB_MOTOR_HT) ht_step(instance);
+    CHECK(*stop == MOTOR_STOP && ramp->ref == 0);
+    MotorBenchTask(); DaemonReload(daemon);
+    now += 2; DJIMotorControl(); DMMotorControl(); LKMotorControl();
+    if (kind == MB_MOTOR_HT) ht_step(instance);
+    CHECK(*stop == MOTOR_STOP);
+    // Fresh enable starts at measured motion in the driver's own speed units.
+    float moving = 3 * target_scale;
+    if (kind <= MB_MOTOR_M2006) ((DJIMotorInstance *)instance)->measure.speed_aps = moving * scale;
+    else if (kind == MB_MOTOR_DM || kind == MB_MOTOR_DM8009P) ((DMMotorInstance *)instance)->measure.velocity = moving;
+    else if (kind == MB_MOTOR_LK) ((LKMotorInstance *)instance)->measure.speed_rads = moving;
+    else ((HTMotorInstance *)instance)->measure.speed_rads = moving;
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    CHECK(fabsf(ramp->ref - moving * scale) < 0.001f);
+    CHECK(MotorBenchSetRef(0, 0) == MB_OK);
+    now += 2; DJIMotorControl(); DMMotorControl(); LKMotorControl();
+    if (kind == MB_MOTOR_HT) ht_step(instance);
+    CHECK(fabsf(ramp->ref - (moving * scale - ramp->zero_rate * 0.002f)) < 0.001f);
+    CHECK(*stop == MOTOR_ENALBED);
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    setting->outer_loop_type = ANGLE_AND_SPEED_LOOP;
+    setting->close_loop_type = ANGLE_AND_SPEED_LOOP;
+    ramp->ref = 123;
+    now += 2; DJIMotorControl(); DMMotorControl(); LKMotorControl();
+    if (kind == MB_MOTOR_HT) ht_step(instance);
+    CHECK(ramp->ref == 123 && *stop == MOTOR_ENALBED);
+    if (kind <= MB_MOTOR_M2006) {
+        CHECK(MotorBenchSetLoop(0, CURRENT_LOOP) == MB_OK);
+        CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+        ramp->ref = 456;
+        CHECK(MotorBenchSetRef(0, 2) == MB_OK);
+        now += 2; DJIMotorControl();
+        CHECK(ramp->ref == 456);
+    }
+    printf("PASS kind %u: actual factory/driver units, reverse/zero rates, retained integral, enabled zero, stop reset, invalid dt latch, position/current bypass\n",kind);
+    return failures ? 1 : 0;
+}
+static int dm_speed_ramp(void) {
+    void *instance = NULL;
+    CHECK(BenchMotorFactory(MB_MOTOR_DM, 1, 6, 0x302, &instance) == MB_OK);
+    DMMotorInstance *m = instance;
+    dm_feedback(m, 2047);
+    DMMotorEnable(m);
+    float previous = 0;
+    const float targets[] = {20.94f, 2, 10, 3, -3, 0};
+    const unsigned intervals[] = {1, 2, 5};
+    for (unsigned target = 0; target < sizeof(targets) / sizeof(targets[0]); ++target) {
+        m->speed_PID.Iout = 0.25f;
+        DMMotorSetRef(m, targets[target]);
+        CHECK(m->speed_PID.Iout == 0.25f); // Target edits retain load compensation.
+        uint32_t started = now;
+        for (unsigned n = 0; n < 1000 && previous != targets[target]; ++n) {
+            unsigned ms = intervals[n % 3];
+            unsigned raw = (unsigned)lroundf((previous + 30) * 4095 / 60);
+            dm_feedback(m, raw);
+            now += ms; DMMotorControl();
+            float current = m->speed_PID.Ref;
+            CHECK(m->stop_flag == MOTOR_ENALBED);
+            float rate = targets[target] == 0 ? 200 : 100;
+            CHECK(fabsf(current - previous) <= rate * ms / 1000.0f + 0.00001f);
+            CHECK((current - previous) * (targets[target] - previous) >= 0);
+            CHECK(fabsf(targets[target] - current) <= fabsf(targets[target] - previous));
+            previous = current;
+        }
+        CHECK(previous == targets[target]);
+        if (target == 0) CHECK(now - started <= 215); // Full range no longer takes 2 s.
+        if (targets[target] == 0) CHECK(now - started <= 20); // -3 -> 0 brakes faster.
+    }
+    // An immediate stop interrupts a ramp; recovery must not resume its target.
+    dm_feedback(m, 2047);
+    DMMotorSetRef(m, 10);
+    now += 2; DMMotorControl();
+    CHECK(fabsf(m->speed_PID.Ref - 0.2f) < 0.00001f);
+    DMMotorSetRef(m, -10); // Replace the target before the old ramp completes.
+    now += 2; DMMotorControl();
+    CHECK(fabsf(m->speed_PID.Ref) < 0.00001f);
+    CHECK(m->stop_flag == MOTOR_ENALBED);
+    DMMotorStop(m);
+    CHECK(m->stop_flag == MOTOR_STOP && m->motor_can_instace->tx_buff[7] == DM_CMD_RESET_MODE);
+    now += 2; DMMotorControl();
+    CHECK(m->stop_flag == MOTOR_STOP && m->speed_PID.Output == 0);
+    // Re-enabling a moving motor starts from fresh feedback, not the old ramp.
+    dm_feedback(m, 2116);
+    DMMotorEnable(m);
+    DMMotorSetRef(m, 0);
+    now += 2; DMMotorControl();
+    CHECK(fabsf(m->speed_PID.Ref - (m->measure.velocity - 0.4f)) < 0.00001f);
+    CHECK(m->stop_flag == MOTOR_ENALBED); // Zero is active braking, not disable.
+    // Position cascade bypasses speed-target shaping.
+    DMMotorOuterLoop(m, ANGLE_AND_SPEED_LOOP);
+    dm_feedback(m, 2047);
+    DMMotorEnable(m);
+    DMMotorSetRef(m, m->measure.position * RAD_2_DEGREE + 10);
+    now += 2; DMMotorControl();
+    CHECK(fabsf(m->speed_PID.Ref - 1) < 0.0001f);
+    DMMotorStop(m);
+    DMMotorOuterLoop(m, SPEED_LOOP);
+    const float invalid_dt[] = {0, -0.002f, NAN, INFINITY, 1};
+    for (unsigned i = 0; i < sizeof(invalid_dt) / sizeof(invalid_dt[0]); ++i) {
+        dm_feedback(m, 2047); DMMotorEnable(m); DMMotorSetRef(m, 1);
+        override_dt = 1; injected_dt = invalid_dt[i];
+        now += 2; DMMotorControl(); override_dt = 0;
+        CHECK(m->stop_flag == MOTOR_STOP && m->pid_ref == 0 && m->speed_ramp.ref == 0);
+        CHECK(m->motor_can_instace->tx_buff[7] == DM_CMD_RESET_MODE);
+        now += 2; DMMotorControl();
+        CHECK(m->stop_flag == MOTOR_STOP);
+    }
+    dm_feedback(m, 2047); DMMotorEnable(m); DMMotorSetRef(m, NAN);
+    now += 2; DMMotorControl();
+    CHECK(m->stop_flag == MOTOR_STOP && m->pid_ref == 0);
+    // Lost feedback interrupts the trajectory and recovery stays disabled.
+    dm_feedback(m, 2047); DMMotorEnable(m); DMMotorSetRef(m, 5);
+    now += 2; DMMotorControl();
+    for (unsigned i = 0; i < 11; ++i) DaemonTask();
+    now += 2; DMMotorControl();
+    CHECK(m->stop_flag == MOTOR_STOP && m->speed_ramp.ref == 0 && m->pid_ref == 0);
+    dm_feedback(m, 2047); now += 2; DMMotorControl();
+    CHECK(m->stop_flag == MOTOR_STOP);
+    CHECK(BenchMotorFactory(MB_MOTOR_DM8009P, 1, 1, 0x11, &instance) == MB_OK);
+    m = instance;
+    dm_feedback(m, 2047);
+    DMMotorEnable(m); DMMotorSetRef(m, 4);
+    now += 2; DMMotorControl();
+    CHECK(fabsf(m->speed_PID.Ref - 0.2f) < 0.00001f);
+    DMMotorStop(m);
+    if (!failures) puts("PASS actual DM4310 factory: bounded acceleration/deceleration/reversal/zero at variable dt, retained integral, immediate stop, fresh enable, position isolation and 8009P shared ramp");
+    return failures ? 1 : 0;
+}
+#endif
 #endif
 #ifdef MB_AUTO_RECONNECT_TEST
 static void dji_feedback(DJIMotorInstance *m) {
@@ -859,6 +1216,10 @@ int main(int argc, char **argv) {
 #endif
 #ifdef DM8009P_T_MAX
     if (argc == 2 && !strcmp(argv[1], "dm-profiles")) return dm_profiles();
+#ifdef MB_SPEED_ACCEL_RAD
+    if (argc == 2 && !strcmp(argv[1], "dm-speed-ramp")) return dm_speed_ramp();
+    if (argc == 3 && !strcmp(argv[1], "shared-speed-ramp")) return shared_speed_ramp(atoi(argv[2]));
+#endif
 #endif
     if (argc == 5 && !strcmp(argv[1], "position")) return position_control(argv[2], argv[3], argv[4]);
     if (argc == 4 && !strcmp(argv[1], "rx")) return receive_add(argv[2], argv[3]);
@@ -923,6 +1284,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "loop-switch")) return loop_switch();
     if (!strcmp(argv[1], "dm-telemetry")) return dm_telemetry();
     if (!strcmp(argv[1], "dm-stability")) return dm_stability();
+    if (!strcmp(argv[1], "dm-zero-integral")) return dm_zero_integral();
+    if (!strcmp(argv[1], "dm-invalid-control")) return dm_invalid_control();
     if (!strcmp(argv[1], "mixed")) return mixed();
     DJIMotorInstance *a = make_motor(0, 1, 1);
     DJIMotorInstance *b = make_motor(1, 1, 2);
@@ -1005,13 +1368,15 @@ try {
   {
     const source = ui.match(/function pidOutputSpec\(kind, loop\) \{[\s\S]*?\n\}/)?.[0];
     assert.ok(source);
-    const context = { MotorKind, needsRxId: kind => [MotorKind.DM, MotorKind.DM8009P].includes(kind) };
-    vm.runInNewContext(source, context);
+    const motorSpec = ui.match(/const MOTOR_SPEC = \{[\s\S]*?\n\};/)?.[0];
+    assert.ok(motorSpec);
+    const context = { MotorKind, MotorKindLabel, needsRxId: kind => [MotorKind.DM, MotorKind.DM8009P].includes(kind) };
+    vm.runInNewContext(motorSpec + '\n' + source, context);
     assert.equal(context.pidOutputSpec(MotorKind.DM, 0).max, 7);
-    assert.equal(context.pidOutputSpec(MotorKind.DM, 2).max, 30);
+    assert.equal(context.pidOutputSpec(MotorKind.DM, 2).max, 20.94);
     assert.equal(context.pidOutputSpec(MotorKind.DM8009P, 0).max, 54);
-    assert.equal(context.pidOutputSpec(MotorKind.DM8009P, 2).max, 45);
-    console.log('PASS browser PID bounds: DM4310 peak 7 N*m / VMAX 30; DM8009P 54 / 45');
+    assert.equal(context.pidOutputSpec(MotorKind.DM8009P, 2).max, 17.6);
+    console.log('PASS browser PID bounds: DM4310 peak 7 N*m / speed limit 20.94; DM8009P 54 N*m / speed limit 17.6 rad/s');
   }
   {
     const editStart = ui.indexOf('    const stopForPidEdit = () => {');
@@ -1024,7 +1389,9 @@ try {
     const commands = [], stops = [], pending = new Map();
     const message = {textContent:'',className:''};
     const state = {
-      i:0, pidMsg:message, pendingPidApplies:pending,
+      i:0, MotorKind, pidMsg:message, pendingPidApplies:pending,
+      MotorKindLabel, LoopType:{ANGLE_LOOP:4}, boundLoopMasks:new Map([[0,2]]),
+      MOTOR_SPEC:{[MotorKindLabel[MotorKind.DM]]:{range:20.94}},
       pendingLoopChanges:new Map(), pendingUnbindChannels:new Set(),
       ws:{readyState:1,send:value=>commands.push(JSON.parse(value))},
       serialConnected:true, boardOnline:true, document:{hidden:false},
@@ -1201,6 +1568,53 @@ try {
     try { execFileSync(cc, ['--version'], { env, stdio: 'pipe' }); return true; } catch { return false; }
   });
   if (!compiler) throw new Error('Native gcc/clang is required for motor state regression tests');
+  const dwtSource = path.join(root, 'bsp/dwt/bsp_dwt.c');
+  if (fs.readFileSync(dwtSource, 'utf8').includes('DWT_ReadCycles')) {
+    // Compile the real clock code with register stubs to simulate debugger detach.
+    const dir = path.join(tmp, 'dwt');
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'main.h'), `#pragma once
+#include <stdint.h>
+typedef struct { volatile uint32_t CTRL, CYCCNT; } DwtRegisters;
+typedef struct { volatile uint32_t DEMCR; } DebugRegisters;
+extern DwtRegisters dwt;
+extern DebugRegisters debug;
+#define DWT (&dwt)
+#define CoreDebug (&debug)
+#define CoreDebug_DEMCR_TRCENA_Msk (1u << 24)
+#define DWT_CTRL_CYCCNTENA_Msk 1u
+`);
+    fs.writeFileSync(path.join(dir, 'test.c'), `#include <assert.h>
+#include <math.h>
+#include "bsp_dwt.h"
+DwtRegisters dwt;
+DebugRegisters debug;
+int main(void) {
+    DWT_Init(168);
+    uint32_t last = 0;
+    dwt.CYCCNT = 168000; dwt.CTRL = 0; debug.DEMCR = 0;
+    assert(fabsf(DWT_GetDeltaT(&last) - 0.001f) < 0.000001f);
+    assert(dwt.CTRL & 1); assert(debug.DEMCR & (1u << 24));
+    assert(dwt.CYCCNT == 168000);
+    dwt.CYCCNT = 336000; dwt.CTRL = 0; debug.DEMCR = 0;
+    assert(fabs(DWT_GetDeltaT64(&last) - 0.001) < 0.000001);
+    assert(dwt.CTRL & 1); assert(debug.DEMCR & (1u << 24));
+    dwt.CTRL = 0; debug.DEMCR = 0;
+    assert(fabsf(DWT_GetTimeline_ms() - 2) < 0.001f);
+    assert(dwt.CTRL & 1); assert(debug.DEMCR & (1u << 24));
+    dwt.CTRL = 0; debug.DEMCR = 0;
+    DWT_Delay(0); DWT_Delay_ms(0);
+    assert(dwt.CTRL & 1); assert(debug.DEMCR & (1u << 24));
+    assert(dwt.CYCCNT == 336000);
+    return 0;
+}
+`);
+    const clockTest = path.join(dir, process.platform === 'win32' ? 'test.exe' : 'test');
+    execFileSync(compiler, ['-std=gnu11', '-O1', '-I', dir, '-I', path.dirname(dwtSource),
+      path.join(dir, 'test.c'), dwtSource, '-lm', '-o', clockTest], { env, stdio: 'pipe' });
+    execFileSync(clockTest, [], { env, stdio: 'pipe' });
+    console.log('PASS actual DWT clock restores debugger-cleared enables for delta/timeline/delay without resetting its cycle count');
+  }
   /*
    * include 路径必须覆盖 motor_bench.h 实际 include 的所有头文件。
    * @note 2026-10-19:motor_bench.h 新增 LK9025.h / HT04.h
@@ -1228,6 +1642,10 @@ try {
   execFileSync(compiler, ['-std=gnu11', '-O1', '-ffunction-sections', '-fdata-sections',
     ...includes, main, ...sources, '-Wl,--gc-sections', '-lm', '-o', exe], { env, stdio: 'pipe' });
   let failed = false;
+  if (supportsDmSpeedRamp) {
+    for (const kind of [1, 2, 3, 4, 5, 6, 7])
+      process.stdout.write(execFileSync(exe, ['shared-speed-ramp', String(kind)], { env, stdio: 'pipe' }));
+  }
   if (supportsDm8009p) {
     const output = execFileSync(exe, ['dm-profiles'], { env, encoding: 'utf8', stdio: 'pipe' });
     const defaultHex = output.match(/DM_DEFAULTS_WIRE ([0-9a-f]+)/)?.[1];
@@ -1239,7 +1657,7 @@ try {
       for (const loop of ['speed', 'current', 'angle'])
         assert.deepEqual(report[loop], PID_DEFAULTS[report.kind][loop], `${MotorKind[report.kind]} ${loop} defaults must match firmware`);
     }
-    console.log('PASS firmware factory / USB readback / browser PID defaults agree; DM4310 0.55/0/0/7/0 and independent DM8009P profile');
+    console.log('PASS firmware factory / USB readback / browser PID defaults agree; DM4310 0.55/0.5/0/7/100 and DM8009P 0.55/5/0/17.5/100');
     const hex = output.match(/DM8009P_PID_WIRE ([0-9a-f]+)/)?.[1];
     assert.ok(hex);
     const frames = new FrameParser().push(Buffer.from(hex, 'hex'));
@@ -1309,7 +1727,7 @@ try {
     console.log(output.split('\n').filter(line => !line.includes('_WIRE')).join('\n'));
     console.log('PASS actual firmware heartbeat framing and parsed version, including bytewise USB input');
   }
-  for (const scenario of ['stop', 'windup', 'binding', 'peer', 'mixed', 'logging', 'dm-stability', 'lifecycle', ...(supportsAutoReconnect ? ['reconnect'] : [])]) {
+  for (const scenario of ['stop', 'windup', 'binding', 'peer', 'mixed', 'logging', 'dm-stability', ...(supportsDmIntegralHold ? ['dm-zero-integral', 'dm-invalid-control'] : []), ...(supportsDmSpeedRamp ? ['dm-speed-ramp'] : []), 'lifecycle', ...(supportsAutoReconnect ? ['reconnect'] : [])]) {
     try { process.stdout.write(execFileSync(exe, [scenario], { env, stdio: 'pipe' })); }
     catch (error) {
       failed = true;

@@ -167,6 +167,11 @@ void DMMotorEnable(DMMotorInstance *motor)
         PIDReset(&motor->speed_PID);
         PIDReset(&motor->angle_PID);
         PIDReset(&motor->current_PID);
+        /* A fresh enable starts from measured motion, never an old trajectory.
+         * Treat the two central MIT velocity codes as a stationary origin. */
+        float velocity = motor->measure.velocity;
+        float zero_band = motor->v_max / 4095.0f * 1.001f;
+        SpeedRampReset(&motor->speed_ramp, isfinite(velocity) && fabsf(velocity) > zero_band ? velocity : 0.0f);
         DMMotorSetMode(DM_CMD_MOTOR_MODE, motor);
     }
     motor->stop_flag = MOTOR_ENALBED;
@@ -177,6 +182,7 @@ void DMMotorStop(DMMotorInstance *motor)
     if (motor->stop_flag != MOTOR_STOP && DMMotorSetMode(DM_CMD_RESET_MODE, motor))
         motor->last_disable_ms = HAL_GetTick();
     motor->stop_flag = MOTOR_STOP;
+    motor->speed_ramp.ref = 0.0f;
     PIDReset(&motor->speed_PID);
     PIDReset(&motor->angle_PID);
     PIDReset(&motor->current_PID);
@@ -237,10 +243,50 @@ void DMMotorControl()
          * matching this driver's feedback and the host's DM unit label. */
         else
         {
+            /* Limit speed commands at the control rate, including rapid target
+             * replacement and reversals. Position-loop output is left intact. */
+            if ((setting->outer_loop_type & SPEED_LOOP) && !(setting->outer_loop_type & ANGLE_LOOP) &&
+                !SpeedRampApply(&motor->speed_ramp, set, &set))
+            {
+                DMMotorStop(motor);
+                motor->pid_ref = 0;
+                continue;
+            }
             if (setting->outer_loop_type & ANGLE_LOOP)
+            {
                 set = PIDCalculate(&motor->angle_PID, motor->measure.position * RAD_2_DEGREE, set);
+                if (motor->angle_PID.dt <= 0.0f)
+                {
+                    DMMotorStop(motor);
+                    motor->pid_ref = 0;
+                    continue;
+                }
+            }
             if (setting->outer_loop_type & (ANGLE_LOOP | SPEED_LOOP))
-                set = PIDCalculate(&motor->speed_PID, motor->measure.velocity, set);
+            {
+                /* 12-bit MIT velocity has no exact zero: the central codes
+                 * decode to +/-VMAX/4095. Freeze only their integral at a zero
+                 * speed target, including one produced by the position loop.
+                 * A small tolerance covers floating-point decoding roundoff. */
+                float zero_band = motor->v_max / 4095.0f * 1.001f;
+                uint8_t hold_integral = set == 0.0f && fabsf(motor->measure.velocity) <= zero_band;
+                set = PIDCalculateWithIntegralHold(&motor->speed_PID, motor->measure.velocity, set, hold_integral);
+                if (motor->speed_PID.dt <= 0.0f)
+                {
+                    DMMotorStop(motor);
+                    motor->pid_ref = 0;
+                    continue;
+                }
+            }
+        }
+
+        /* NaN-to-integer conversion must never become a full-scale torque.
+         * Latch the motor off; a fresh user enable is required after recovery. */
+        if (!isfinite(set))
+        {
+            DMMotorStop(motor);
+            motor->pid_ref = 0;
+            continue;
         }
 
         float torque_limit = motor->model == DM_MODEL_4310 ? DM4310_PEAK_TORQUE : motor->t_max;

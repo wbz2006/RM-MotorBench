@@ -26,13 +26,14 @@ import { LoopFishbone } from './fishbone.js';
 import { createSetpointProgram, sampleSetpoint } from './setpoint.js';
 import { initCalculator } from './calculator-ui.js';
 
-/** 各电机种类的参考值限幅与单位(与固件 MB_REF_LIMIT_* 及驱动量程对应) */
+/** 各电机种类的参考值限幅与单位；工作转速上限与 MIT 编解码量程独立。 */
 const MOTOR_SPEC = {
   [MotorKindLabel[1]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // GM6020
   [MotorKindLabel[2]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M3508
   [MotorKindLabel[3]]: { unit: 'rpm', range: 7000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M2006
-  [MotorKindLabel[4]]: { unit: 'rad/s', range: 30, feedbackLabel: '转矩', feedbackUnit: 'N·m' }, // DM4310 MIT VMAX; 24 V no-load max is 20.94 rad/s
-  [MotorKindLabel[MotorKind.DM8009P]]: { unit: 'rad/s', range: 40, feedbackLabel: '转矩', feedbackUnit: 'N·m' },
+  [MotorKindLabel[4]]: { unit: 'rad/s', range: 20.94, feedbackLabel: '转矩', feedbackUnit: 'N·m', speedLimitHint: '24 V 空载转速上限：±20.94 rad/s（200 rpm）；带载可达转速更低。' }, // MIT VMAX stays 30.
+  // Official DM-J8009P-2EC manual V1.3, p.7: 168 rpm at 24 V = 17.59 rad/s (rounded to 17.6).
+  [MotorKindLabel[MotorKind.DM8009P]]: { unit: 'rad/s', range: 17.6, feedbackLabel: '转矩', feedbackUnit: 'N·m', speedLimitHint: '24 V 空载转速上限：±17.6 rad/s（168 rpm）；带载可达转速更低。' },
   [MotorKindLabel[5]]: { unit: 'rad/s', range: 40 }, // LK
   [MotorKindLabel[6]]: { unit: 'rad/s', range: 40 }, // HT
 };
@@ -51,6 +52,7 @@ let boardOnline = false;
 let boardLastSeen = null;
 let serialConnected = false;
 let serialPath = null;
+let inventoryReceived = false;
 let channelsReady = false;
 let channelResetPending = null;
 let channelResetTimer = null;
@@ -134,8 +136,14 @@ function sendResetChannel(start = false) {
   send(start ? { type: 'resetChannels' } : { type: 'unbind', channelId });
 }
 
+function hasFreshTelemetry(i) {
+  const t = telemetryByChannel.get(i);
+  return !!t && performance.now() - t.receivedAt < 2000;
+}
+
 function canControlChannel(i) {
-  return channelsReady && sessionChannels.has(i) && telemetryByChannel.has(i) && !pendingLoopChanges.has(i);
+  return ws.readyState === 1 && serialConnected && boardOnline && channelsReady &&
+    sessionChannels.has(i) && hasFreshTelemetry(i) && !pendingLoopChanges.has(i) && !pendingUnbindChannels.has(i);
 }
 
 function clearPendingLoop(i) {
@@ -150,6 +158,10 @@ function noteBoardResponse() {
 
 // The server can remain connected while the board is stuck or stops responding.
 setInterval(() => {
+  for (const i of channelIds()) {
+    if (telemetryByChannel.has(i) && !hasFreshTelemetry(i)) renderChannel(i);
+  }
+  updateWorkspaceStatus();
   if (!boardOnline || boardLastSeen === null || Date.now() - boardLastSeen < 2000) return;
   boardOnline = false;
   for (const i of pendingPidApplies.keys()) cancelPidResume(i);
@@ -195,6 +207,9 @@ function syncRxIdVisibility() {
   $('#addIdLabel').textContent = dm ? '发送 ID / TX' : '电调 ID';
   $('#addId').inputMode = dm ? 'text' : 'numeric';
   $('#addId').setAttribute('aria-label', dm ? '发送 ID 十六进制' : '电调 ID');
+  $('#addIdHelp').textContent = dm
+    ? 'CAN 按实际接线选择。TX 对应电调 CAN ID，RX 对应 Master ID；两项均按十六进制填写，0x 前缀已提供。'
+    : 'CAN 总线按实际接线选择，电调 ID 填 1～8，与电调上的实际设置一致。';
 }
 
 function formatMotorId(m) {
@@ -308,6 +323,7 @@ function renderMotorList() {
     row.append(number, info, remove);
     list.appendChild(row);
   });
+  renderGuidance();
 }
 
 function sendMotorEdit(command) {
@@ -418,6 +434,17 @@ function send(obj) {
       (obj.type === 'setRef' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
   if (pendingLoopChanges.has(obj.channelId) &&
       (obj.type === 'setRef' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
+  // Number inputs do not enforce HTML min/max when sending commands.
+  // Cover manual targets, enable-with-target, and automatic outputs at the same boundary.
+  if ((obj.type === 'setRef' || (obj.type === 'enable' && obj.enable)) && obj.ref !== undefined &&
+      [MotorKind.DM, MotorKind.DM8009P].includes(currentChannelKind(obj.channelId)) &&
+      !((boundLoopMasks.get(obj.channelId) ?? readLoopMask(obj.channelId)) & LoopType.ANGLE_LOOP)) {
+    const ref = Number(obj.ref);
+    if (!Number.isFinite(ref)) return;
+    const limit = MOTOR_SPEC[MotorKindLabel[currentChannelKind(obj.channelId)]].range;
+    obj = { ...obj, ref: Math.max(-limit, Math.min(limit, ref)) };
+    setDisplayedRef(obj.channelId, obj.ref);
+  }
   // Cancel timers before issuing a stop, so later ticks cannot restore a target.
   if (obj.type === 'stopAll' || obj.type === 'resetChannels') stopAllPrograms('已停止');
   if (obj.type === 'unbind' || (obj.type === 'enable' && !obj.enable)) stopProgram(obj.channelId, '已停机');
@@ -614,11 +641,154 @@ function fmt(v, digits = 1) {
   return v.toFixed(digits);
 }
 
+// Keep live-region text stable while telemetry arrives at 10 Hz.
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function setupBlockReason() {
+  if (ws.readyState !== 1) return ws.readyState === 0 ? '正在连接上位机服务，请稍候。' : '上位机服务已断开，请确认程序正在运行后重新加载页面。';
+  if (!serialConnected) return '请先选择控制板的 USB 串口，点击「连接」。';
+  if (!boardOnline) return '串口已打开，但控制板尚未应答。请检查控制板供电、USB 数据线和固件，再同步清单或重新连接。';
+  if (!channelsReady) return channelResetError || '正在清理旧测试通道，请等待板端确认。';
+  if (!inventoryReceived) return '控制板已应答，正在同步电机清单；若长时间未更新，请点击「同步清单」。';
+  return '';
+}
+
+function renderGuidance() {
+  const service = ws.readyState === 1;
+  const blocked = setupBlockReason();
+  const confirmed = channelIds().filter(i => sessionChannels.has(i) && telemetryByChannel.has(i));
+  const online = confirmed.filter(i => telemetryByChannel.get(i).online && hasFreshTelemetry(i));
+  const active = online.filter(i => telemetryByChannel.get(i).enabled);
+  const state = (id, text, ok) => {
+    const el = $(id);
+    setText(el, text);
+    el.classList.toggle('is-ready', ok);
+  };
+  state('#serviceState', service ? '服务 · 已连接' : ws.readyState === 0 ? '服务 · 连接中' : '服务 · 已断开', service);
+  state('#boardState', boardOnline ? '控制板 · 已应答' : serialConnected ? '控制板 · 等待应答' : '控制板 · 未连接', service && serialConnected && boardOnline);
+  state('#feedbackState', !boardOnline || !confirmed.length ? '电机反馈 · 未就绪' : `电机反馈 · ${online.length}/${confirmed.length} 在线`, boardOnline && online.length > 0);
+  setText($('#connectionMessage'), blocked || '控制板与清单已就绪。登记成功不代表电机在线，绑定后会检查实际反馈。');
+  $('#refreshPorts').disabled = !service;
+  $('#portSelect').disabled = !service || serialConnected;
+  $('#openPort').disabled = !service || serialConnected || !$('#portSelect').value;
+  $('#closePort').disabled = !service || !serialConnected;
+  $('#rescan').disabled = !service || !serialConnected || !!channelResetPending;
+  const addReason = blocked || (pendingMotor ? '正在等待电机增删应答，请稍候。' : '');
+  $('#addMotor').disabled = !!addReason;
+  $('#addFirstMotor').disabled = !!addReason;
+  $('#openAddMotor').disabled = !!addReason;
+  $('#addMotor').title = addReason || '按实际型号与 ID 向控制板登记电机';
+  $('#openAddMotor').title = addReason || '添加电机';
+  setText($('#addAvailability'), blocked ? '请先完成控制板连接与清单同步，才能添加电机。' : addReason);
+  $('#addAvailability').hidden = !addReason;
+  setText($('#motorEmptyText'), !serialConnected ? '连接后读取电机清单' : !inventoryReceived ? '等待同步电机清单' : '尚未登记电机');
+
+  let step = 0;
+  let title = '连接控制板，开始测试';
+  let message = blocked;
+  let action = '选择串口';
+  let target = '#portSelect';
+  if (!service) {
+    title = ws.readyState === 0 ? '正在连接上位机服务' : '上位机服务已断开';
+    action = ws.readyState === 0 ? '请稍候' : '重新加载';
+    target = 'reload';
+  } else if (!serialConnected) {
+    const hasPorts = !!$('#portSelect').value;
+    message = hasPorts ? '选择控制板对应的 USB 串口，然后点击「连接」。串口打开后还需等待控制板应答。'
+      : '未发现可用串口时，请检查控制板供电和 USB 数据线，再刷新串口列表。';
+    action = hasPorts ? '选择串口' : '刷新串口';
+    target = hasPorts ? '#portSelect' : '#refreshPorts';
+  } else if (blocked) {
+    title = channelResetError ? '连接尚未就绪' : !boardOnline ? '等待控制板应答' : '正在准备测试通道';
+    action = '查看连接状态';
+    target = '#connectionMessage';
+  } else if (!inventory.length) {
+    step = 1;
+    title = pendingMotor ? '正在等待电机登记结果' : '添加第一颗电机';
+    message = '按电机铭牌选择型号，CAN 总线和电调 ID 按实际设置填写。添加只登记配置，不会使电机转动。';
+    action = pendingMotor ? '等待应答' : '添加电机';
+    target = 'add';
+  } else if (!confirmed.length) {
+    step = 2;
+    const waiting = channelIds().find(i => sessionChannels.has(i));
+    title = waiting === undefined ? '电机已登记，接下来绑定通道' : '正在等待绑定后的反馈';
+    message = waiting === undefined ? '在通道中选择要控制的电机，点击标题行的「绑定」。绑定用于指定这个通道控制哪颗电机。'
+      : '尚未收到本通道遥测，暂不能使能。请等待反馈；长时间无应答时，可解绑重试或重新连接。';
+    action = '前往通道';
+    target = ch(waiting ?? channelIds()[0]);
+  } else {
+    step = 3;
+    const i = active[0] ?? online[0] ?? confirmed[0];
+    const stale = !online.length && confirmed.some(id => !hasFreshTelemetry(id));
+    title = active.length ? '电机已使能，观察实际响应' : online.length ? '反馈已就绪，可以开始测试'
+      : stale ? '通道反馈中断，等待最新遥测' : '通道已绑定，电机反馈离线';
+    message = active.length ? '在曲线中对比目标与实测反馈。测试结束点击通道「停机」；顶部急停可立即停止全部电机。'
+      : online.length ? '首次测试可保持目标为 0，点击「使能」，再手动设置适合当前负载的小目标。非零目标下使能会立即执行该目标。'
+      : stale ? '通道遥测未更新，当前运行状态无法确认。请检查通信；需要停止全部电机时，点击顶部急停。'
+      : '暂时无法使能。请检查电机供电、CAN 接线、所选总线及电调 ID；反馈恢复后，需手动使能。';
+    action = active.length ? '查看运行通道' : online.length ? '前往测试' : '查看离线通道';
+    target = ch(i);
+  }
+  for (const [i, el] of [...document.querySelectorAll('.workflow-steps li')].entries()) {
+    el.dataset.state = i < step || (i === 3 && active.length && !blocked) ? 'done' : i === step ? 'current' : 'pending';
+    if (i === step && el.dataset.state !== 'done') el.setAttribute('aria-current', 'step');
+    else el.removeAttribute('aria-current');
+    setText(el.querySelector('small'), i === 0 ? step > 0 ? '连接已确认' : serialConnected ? '等待板端应答' : '选择 USB 串口'
+      : i === 1 ? step > 1 ? '清单已同步' : '型号与 ID'
+      : i === 2 ? step > 2 ? '绑定已确认' : '选择控制对象'
+      : el.dataset.state === 'done' ? '输出已使能' : '观察实际反馈');
+  }
+  setText($('#guideTitle'), title);
+  setText($('#guideMessage'), message);
+  const button = $('#guideAction');
+  setText(button, action);
+  button.disabled = ws.readyState === 0 || (!!pendingMotor && target === 'add');
+  button.onclick = () => {
+    if (target === 'reload') return location.reload();
+    if (target === 'add') return setAddFormOpen(true);
+    const el = typeof target === 'string' ? $(target) : target;
+    if (!el) return;
+    el.scrollIntoView({ block: 'center' });
+    const focus = el.matches('.channel') ? el.querySelector('[data-role="motor"]:enabled')
+      ?? el.querySelector('[data-role="enable"]:enabled') ?? el.querySelector('[data-role="channelHint"]') : el;
+    if (focus && !focus.matches('button, input, select')) focus.tabIndex = -1;
+    focus?.focus({ preventScroll: true });
+    if (target === '#refreshPorts') el.click();
+  };
+}
+
+function renderChannelGuidance(i) {
+  const el = ch(i);
+  if (!el) return;
+  const r = role => el.querySelector(`[data-role="${role}"]`);
+  const t = telemetryByChannel.get(i);
+  let message = setupBlockReason();
+  if (!message) {
+    message = pendingUnbindChannels.has(i) ? '正在解绑，等待板端确认；本通道控制暂不可用。'
+      : pendingLoopChanges.has(i) ? '正在确认闭环切换；确认前控制已锁定，超时后请解绑重试。'
+      : pendingPidApplies.has(i) ? 'PID 应答尚未确认，暂不能设置目标或重新使能；请查看参数区的应用结果。'
+      : !sessionChannels.has(i) ? (r('motor').value === '' ? '先选择要控制的电机，再点击标题行的「绑定」。' : '已选择电机，点击标题行的「绑定」后等待实际反馈。')
+      : !t ? '已发送绑定请求，等待板端遥测；尚不能使能。长时间无应答时，请解绑重试或重新连接。'
+      : !hasFreshTelemetry(i) ? '通道反馈已中断，当前运行状态无法确认，暂不能使能或设置目标。请检查通信；需要停止时点击顶部急停。'
+      : !t.online ? '使能不可用：未收到电机反馈。请核对电机供电、CAN 接线、总线和电调 ID；恢复后需手动使能。'
+      : t.enabled ? '电机已使能。观察目标与实测曲线，测试结束点击「停机」。'
+      : Number(r('num').value) !== 0 ? `当前未使能。点击「使能」后将立即执行 ${r('num').value} ${r('unit').textContent} 的目标，请先确认。`
+      : '反馈已就绪，当前未使能。首次可先以零目标使能，再手动设置小目标观察响应。';
+  }
+  setText(r('channelHint'), message);
+  r('channelHint').classList.toggle('is-blocked', !!setupBlockReason() || !!(t && (!t.online || !hasFreshTelemetry(i))));
+  r('bind').title = r('bind').disabled ? message : '把所选电机指定给本通道；绑定后仍需使能';
+  r('enable').title = r('enable').disabled ? message : t?.enabled ? '停止本通道电机并取消自动输出' : '使能后立即执行目标框中的数值';
+  setText(r('chartEmptyText'), sessionChannels.has(i) ? '已请求绑定，等待板端遥测' : '选择电机并绑定后显示实际反馈');
+}
+
 function renderChannel(i) {
   const el = ch(i);
   if (!el) return;
   const t = telemetryByChannel.get(i);
-  el.dataset.state = !t ? 'idle' : !boardOnline || !t.online ? 'offline' : t.enabled ? 'running' : 'bound';
+  el.dataset.state = !t ? 'idle' : !boardOnline || !t.online || !hasFreshTelemetry(i) ? 'offline' : t.enabled ? 'running' : 'bound';
 
   const badge = el.querySelector('[data-role="status"]');
   if (!t) {
@@ -626,6 +796,9 @@ function renderChannel(i) {
     badge.className = 'badge';
   } else if (!boardOnline) {
     badge.textContent = '数据中断';
+    badge.className = 'badge offline';
+  } else if (!hasFreshTelemetry(i)) {
+    badge.textContent = '反馈中断';
     badge.className = 'badge offline';
   } else if (!t.online) {
     badge.textContent = '离线 · 自动重连中';
@@ -652,6 +825,8 @@ function renderChannel(i) {
   r('unit').textContent = speedUnit;
   r('slider').min = String(positionMode ? -360 : -(spec?.range || 6000));
   r('slider').max = String(positionMode ? 360 : (spec?.range || 6000));
+  r('num').min = r('slider').min;
+  r('num').max = r('slider').max;
   r('slider').step = positionMode ? '0.1' : '0.001';
   r('num').step = positionMode ? '0.1' : '0.001';
   r('num').title = positionMode ? '相对本次使能零点的转子角度（deg），范围 ±360°' : '精确输入目标转速后下发';
@@ -661,14 +836,15 @@ function renderChannel(i) {
   if (!t) r('chart').removeAttribute('title');
   getChartIfExists(i)?.setUnits(speedUnit, feedbackUnit);
   const controllable = canControlChannel(i);
-  r('bind').disabled = !channelsReady || !!t;
-  r('motor').disabled = !channelsReady || !!t;
-  r('unbind').disabled = !channelsReady || !sessionChannels.has(i);
+  r('bind').disabled = !!setupBlockReason() || sessionChannels.has(i) || !!t;
+  r('motor').disabled = !!setupBlockReason() || sessionChannels.has(i) || !!t;
+  r('unbind').disabled = !channelsReady || !sessionChannels.has(i) || pendingUnbindChannels.has(i);
   for (const role of ['enable', 'zero', 'num', 'slider']) r(role).disabled = !controllable;
   const loopLockReason = pendingLoopChanges.has(i) ? '正在确认闭环切换；超时后请解绑重试' :
     pendingUnbindChannels.has(i) ? '正在解绑，等待板端确认' :
     !sessionChannels.has(i) ? '' :
     !channelsReady ? '测试通道未就绪，请等待清理完成或重新连接' :
+    !boardOnline || !hasFreshTelemetry(i) ? '未收到最新通道反馈，请检查连接并等待反馈恢复' :
     !serverSupportsLoop ? '后台未支持闭环切换，请重启 Node 服务后刷新网页' :
     !firmwareSupportsLoop ? (firmwareVersion ? `当前固件 ${firmwareVersion} 不支持绑定后切换，请更新到 1.6` :
       '未收到有效固件心跳，闭环切换暂不可用；请确认已烧录 1.6 并重连') : '';
@@ -690,6 +866,28 @@ function renderChannel(i) {
   r('pidQuery').disabled = !controllable || pendingPidApplies.has(i);
   r('enable').disabled = !controllable || !t?.online || (pendingPidApplies.has(i) && !t?.enabled);
   renderProgram(i);
+  renderChannelGuidance(i);
+  const [fwMajor, fwMinor] = String(firmwareVersion ?? '0.0').split('.').map(Number);
+  const speedMode = !!((boundLoopMasks.get(i) ?? readLoopMask(i)) & LoopType.SPEED_LOOP) && !positionMode;
+  const sharedRamp = fwMajor > 1 || (fwMajor === 1 && fwMinor >= 18);
+  const legacyFastZero = currentChannelKind(i) === MotorKind.DM &&
+    (fwMajor > 1 || (fwMajor === 1 && fwMinor >= 17));
+  const fastZero = !!spec && speedMode && (sharedRamp || legacyFastZero);
+  const accel = spec?.unit === 'rpm' ? 30000 : 100;
+  const zeroDecel = accel * 2;
+  const accelUnit = spec?.unit === 'rpm' ? 'rpm/s' : 'rad/s²';
+  const rampHint = fastZero
+    ? `普通变速/反向按 ${accel} ${accelUnit} 过渡，目标为 0 时按 ${zeroDecel} ${accelUnit} 快速制动并保持使能；自动输出同样适用，曲线虚线表示最终目标。「停机」立即撤销使能。 `
+    : speedMode && currentChannelKind(i) === MotorKind.DM && fwMajor === 1 && fwMinor === 16
+      ? '速度目标按加减速限幅过渡（默认 10 rad/s²），自动输出同样适用；曲线虚线表示最终目标。「归零」平滑减速，「停机」立即执行。 ' : '';
+  r('zero').textContent = fastZero ? '快速归零' : '归零';
+  r('zero').classList.toggle('quick-zero', fastZero);
+  r('zero').title = positionMode ? '将目标设为本次使能的 0°，返回该零点；不重新定义零点'
+    : fastZero ? `快速制动至 0 ${spec.unit}，保持速度闭环使能；停机按钮会撤销使能`
+    : '把目标设为 0 并下发；电机仍保持当前使能状态';
+  setText(r('targetHelp'), positionMode
+    ? '每次从停机切换到使能，以当前位置为 0°；「归零」返回本次零点。M2006/M3508 显示转子角度，未换算输出轴角度。'
+    : `${spec?.speedLimitHint ? spec.speedLimitHint + ' ' : ''}${rampHint}输入目标后按 Enter 或移开焦点下发；滑块松手时下发。未使能时可预填目标，点击使能执行；非零目标会立即转动。`);
 
   /*
    * 数字读数行已于 2026-10-13 移除 —— 曲线已呈现这些量的走势,
@@ -731,7 +929,7 @@ function renderChannel(i) {
    *   是因为 renderChannel 还会在解绑、断连时以 t=null 被调用,
    *   此时不喂点、只重绘,曲线会自然停住而不是被 0 值拉一条直线到底。
    */
-  if (t?.online && boardOnline) {
+  if (t?.online && boardOnline && hasFreshTelemetry(i)) {
     const canvas = el.querySelector('[data-role="chart"]');
     if (canvas) {
       const c = ensureChart(i, canvas);
@@ -988,7 +1186,7 @@ function currentChannelKind(i) {
 function pidOutputSpec(kind, loop) {
   if (needsRxId(kind)) {
     if (loop === 0) return { unit: 'N·m', max: kind === MotorKind.DM8009P ? 54 : 7 };
-    if (loop === 2) return { unit: 'rad/s', max: kind === MotorKind.DM8009P ? 45 : 30 };
+    if (loop === 2) return { unit: 'rad/s', max: [MotorKind.DM, MotorKind.DM8009P].includes(kind) ? MOTOR_SPEC[MotorKindLabel[kind]].range : 30 };
     return { unit: '', max: null };
   }
   return { unit: kind ? (loop === 2 ? 'deg/s' : 'raw') : '', max: null };
@@ -1006,8 +1204,15 @@ function updatePidUnits(i, kind, loop) {
   else output.max = String(spec.max);
   output.title = kind === MotorKind.DM && loop === 0
     ? '额定转矩 3 N·m，峰值 7 N·m；峰值不能作为持续工作转矩'
+    : [MotorKind.DM, MotorKind.DM8009P].includes(kind) && loop === 2
+    ? `位置环输出目标速度，允许范围 0～${spec.max} rad/s；按 24 V 空载转速上限设置`
     : spec.max === null ? `PID 输出的绝对值上限${spec.unit ? `（${spec.unit}）` : ''}`
     : `允许范围 0～${spec.max} ${spec.unit}（当前 MIT 协议量程上限，非建议工作值）`;
+  const help = el.querySelector('[data-role="pidOutputHelp"]');
+  help.hidden = !kind || loop !== 2;
+  help.textContent = loop === 2
+    ? `位置环输出的是目标速度（${spec.unit}），目标位置使用 deg。${[MotorKind.DM, MotorKind.DM8009P].includes(kind) ? `24 V 下最大追踪速度限幅为 ${spec.max} rad/s，与速度模式上限一致；带载可达转速更低。` : ''}`
+    : '';
 }
 
 /**
@@ -1090,9 +1295,11 @@ function initPidPanel(i) {
 
 function bindEvents() {
   $('#refreshPorts').onclick = () => send({ type: 'listPorts' });
+  $('#portSelect').onchange = () => renderGuidance();
   $('#openPort').onclick = () => {
     const path = $('#portSelect').value;
     if (!path) return alert('请先选择串口');
+    $('#connectionError').hidden = true;
     send({ type: 'openSerial', path, baud: 115200 });
   };
   $('#closePort').onclick = () => send({ type: 'closeSerial' });
@@ -1102,6 +1309,10 @@ function bindEvents() {
   };
 
   $('#openAddMotor').onclick = () => setAddFormOpen($('#addForm').hidden);
+  $('#addFirstMotor').onclick = () => {
+    setAddFormOpen(true);
+    $('#addForm').scrollIntoView({ block: 'center' });
+  };
   $('#cancelAddMotor').onclick = () => setAddFormOpen(false);
   $('#addForm').onkeydown = (event) => {
     if (event.key === 'Escape') setAddFormOpen(false);
@@ -1212,7 +1423,7 @@ function bindEvents() {
     const r = (role) => el.querySelector(`[data-role="${role}"]`);
 
     r('bind').onclick = () => {
-      if (!channelsReady) return;
+      if (setupBlockReason() || sessionChannels.has(i)) return;
       if (r('motor').value === '') return alert('请先选择电机');
       const idx = Number(r('motor').value);
       const m = inventory[idx];
@@ -1244,6 +1455,8 @@ function bindEvents() {
       });
       // 绑定的同时把该型号的默认 PID 填进面板,用户点"应用"即可生效
       initPidPanel(i);
+      renderChannel(i);
+      renderGuidance();
     };
 
     /*
@@ -1252,7 +1465,10 @@ function bindEvents() {
      *   (M3508 Kp=20 / M2006 Kp=10 / 6020 Kp=50)。不跟着换,
      *   会出现"下拉框选了 M2006,面板里却还摆着 M3508 的参数"。
      */
-    r('motor').onchange = () => initPidPanel(i);
+    r('motor').onchange = () => {
+      initPidPanel(i);
+      renderChannel(i);
+    };
 
     /* 建鱼骨图(懒创建,只在通道真正渲染时才建实例) */
     ensureFishbone(i);
@@ -1279,6 +1495,7 @@ function bindEvents() {
       /* 先停机:安全动作不依赖解绑帧是否被接受 */
       send({ type: 'enable', channelId: i, enable: false });
       send({ type: 'unbind', channelId: i });
+      renderChannel(i);
       /* 界面状态等 unbindAck 到达后再清,见 ws.onmessage 的 'unbindAck' */
     };
 
@@ -1302,7 +1519,9 @@ function bindEvents() {
     r('presetStop').onclick = () => stopProgram(i, '已停止 · 目标已归零', true);
     slider.oninput = () => {
       num.value = slider.value;
+      renderChannelGuidance(i);
     };
+    num.oninput = () => renderChannelGuidance(i);
     // 松手时才下发,避免拖动时刷屏
     slider.onchange = () => send({ type: 'setRef', channelId: i, ref: Number(slider.value) });
     num.onchange = () => {
@@ -1436,7 +1655,7 @@ function bindEvents() {
       }
       if (spec.max !== null && MaxOut > spec.max) {
         pidMsg.className = 'hint error';
-        pidMsg.textContent = `${MotorKindLabel[kind]} ${loop === 0 ? '速度' : '位置'}环输出限幅须为 0～${spec.max} ${spec.unit}；当前填写 ${MaxOut} ${spec.unit}，未下发`;
+        pidMsg.textContent = `${MotorKindLabel[kind]} ${loop === 0 ? '速度' : '位置'}环输出限幅须为 0～${spec.max} ${spec.unit}${kind === MotorKind.DM8009P && loop === 2 ? '（24 V 空载转速上限）' : ''}；当前填写 ${MaxOut} ${spec.unit}，未下发`;
         return;
       }
       send({ type: 'pidSet', channelId: i, loop, pid: { Kp, Ki, Kd, MaxOut, IntegralLimit, scaledLimits: needsRxId(kind) } });
@@ -1471,6 +1690,7 @@ ws.onclose = () => {
   firmwareVersion = null;
   serialConnected = false;
   serialPath = null;
+  inventoryReceived = false;
   clearTimeout(channelResetTimer);
   channelResetPending = null;
   clearInterval(inventoryTimer);
@@ -1549,10 +1769,11 @@ ws.onmessage = (ev) => {
     }
     case 'ports': {
       const sel = $('#portSelect');
+      const selected = sel.value;
       sel.innerHTML = '';
       if (!msg.ports.length) {
         sel.innerHTML = '<option value="">未发现串口</option>';
-        return;
+        break;
       }
       for (const p of msg.ports) {
         const opt = document.createElement('option');
@@ -1560,6 +1781,7 @@ ws.onmessage = (ev) => {
         opt.textContent = p.manufacturer ? `${p.path} (${p.manufacturer})` : p.path;
         sel.appendChild(opt);
       }
+      if ([...sel.options].some(opt => opt.value === selected)) sel.value = selected;
       break;
     }
 
@@ -1568,6 +1790,9 @@ ws.onmessage = (ev) => {
       serialConnected = !!msg.open;
       serialPath = msg.open ? msg.path : null;
       if (sameConnection) break;
+      inventoryReceived = false;
+      $('#connectionError').hidden = true;
+      $('#fwText').textContent = '';
       firmwareSupportsLoop = false;
       firmwareVersion = null;
       clearTimeout(channelResetTimer);
@@ -1588,10 +1813,11 @@ ws.onmessage = (ev) => {
 
     case 'heartbeat': {
       const d = msg.data;
+      const versionChanged = firmwareVersion !== d.fwVersion;
       firmwareVersion = d.fwVersion;
       const [major, minor] = String(d.fwVersion).split('.').map(Number);
       const supported = major > 1 || (major === 1 && minor >= 5);
-      const changed = firmwareSupportsLoop !== supported;
+      const changed = versionChanged || firmwareSupportsLoop !== supported || !boardOnline;
       firmwareSupportsLoop = supported;
       noteBoardResponse();
       if (changed) for (const i of channelIds()) renderChannel(i);
@@ -1604,6 +1830,8 @@ ws.onmessage = (ev) => {
 
     case 'inventory': {
       noteBoardResponse();
+      inventoryReceived = true;
+      $('#connectionError').hidden = true;
       // 板端登记的电机清单:界面只能从中选择,不会虚报不存在的电机
       inventory = msg.data.items.map((m) => ({
         ...m,
@@ -1630,7 +1858,10 @@ ws.onmessage = (ev) => {
        *   下拉框的 value 设成实际电机索引,currentChannelKind() 靠它取 kind。
        *   顺序反了会读不到 kind,PID 面板被隐藏。
        */
-      for (const i of channelIds()) initPidPanel(i);
+      for (const i of channelIds()) {
+        initPidPanel(i);
+        renderChannel(i);
+      }
 
       /*
        * 拿到清单即视为握手完成。
@@ -1732,6 +1963,7 @@ ws.onmessage = (ev) => {
         setLink(true, `通道 ${d.channelId} 已解绑`);
       } else {
         /* 失败:界面保持原样,并说明原因,避免"看起来解绑了其实没解" */
+        renderChannel(d.channelId);
         setLink(true, `通道 ${d.channelId} 解绑失败: ${MBResultText[d.result] ?? d.result}`);
       }
       break;
@@ -1867,13 +2099,15 @@ ws.onmessage = (ev) => {
         break;
       }
       setLink(false, '出错');
-      alert(msg.message);
+      setText($('#connectionError'), `${msg.message}。请检查当前连接与配置后重试。`);
+      $('#connectionError').hidden = false;
       break;
     }
 
     default:
       break;
   }
+  renderGuidance();
 };
 
 function setLink(ok, text) {
@@ -1889,9 +2123,10 @@ function setLink(ok, text) {
 
 function updateWorkspaceStatus() {
   $('#motorCount').textContent = String(inventory.length).padStart(2, '0');
-  const active = [...telemetryByChannel.values()].filter((t) => t.online && t.enabled).length;
+  const active = [...telemetryByChannel].filter(([i, t]) => t.online && t.enabled && hasFreshTelemetry(i)).length;
   $('#activeCount').textContent = boardOnline && document.body.dataset.link === 'online'
     ? String(active).padStart(2, '0') : '--';
+  renderGuidance();
 }
 
 /**

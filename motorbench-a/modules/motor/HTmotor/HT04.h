@@ -60,6 +60,7 @@ typedef struct
     float *speed_feedforward_ptr;
     float *current_feedforward_ptr;
     float pid_ref;
+    SpeedRamp_s speed_ramp;
 
     Motor_Working_Type_e stop_flag; // 启停标志
 

@@ -1,6 +1,6 @@
 {
   "name": "motor-bench-host",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "大疆 A 板电机测试台 · 上位机(串口桥 + Web UI)",
   "type": "module",
   "private": true,
@@ -12,6 +12,7 @@
     "test:desktop": "node desktop_test.js",
     "test": "node selftest.js",
     "test:http": "node --test http_test.js",
+    "test:guidance": "node guidance_test.cjs",
     "test:integration": "node integration_test.js",
     "test:motor-state": "node motor_state_test.js",
     "test:setpoint": "node --test setpoint_test.js",

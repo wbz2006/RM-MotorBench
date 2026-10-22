@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101211" />
     <title>MOTORBENCH / 电机测试台</title>
-    <link rel="stylesheet" href="style.css?v=20261019-dm4310-defaults" />
+    <link rel="stylesheet" href="style.css?v=20261021-speed-controls" />
   </head>
   <body>
     <a class="skip-link" href="#channels">跳转到电机通道</a>
@@ -52,6 +52,20 @@
         </div>
       </section>
 
+      <section class="workflow" aria-label="测试步骤引导">
+        <ol class="workflow-steps">
+          <li data-step="connect" aria-current="step"><span class="step-number">01</span><span>连接控制板</span><small>等待应答</small></li>
+          <li data-step="add"><span class="step-number">02</span><span>添加电机</span><small>型号与 ID</small></li>
+          <li data-step="bind"><span class="step-number">03</span><span>绑定通道</span><small>选择控制对象</small></li>
+          <li data-step="test"><span class="step-number">04</span><span>使能并测试</span><small>观察实际反馈</small></li>
+        </ol>
+        <div class="workflow-next">
+          <div role="status" aria-live="polite" aria-atomic="true"><strong id="guideTitle">正在连接上位机服务</strong><p id="guideMessage">连接成功后，选择控制板的 USB 串口。</p></div>
+          <button id="guideAction" class="ghost" disabled>请稍候</button>
+        </div>
+        <details class="context-help first-test-help"><summary>第一次测试怎么做？</summary><p>连接控制板 → 按实际型号、CAN 接口和电调 ID 添加电机 → 选择电机并绑定 → 保持目标为 0，点击使能 → 手动设置适合当前负载的小目标，观察曲线 → 点击停机。默认 PID 是调试起点，可在闭环配置中按需调整。</p><p>随时可点击顶部急停；本页面获得键盘焦点时，空格也会停止全部电机。</p></details>
+      </section>
+
       <div class="section-heading"><h2><span>01</span> 设备接入</h2><span>DEVICE SETUP</span></div>
 
     <section class="panel setup" id="setup" aria-label="设备接入与电机管理">
@@ -64,6 +78,9 @@
         <button id="openPort" class="primary" title="打开所选串口">连接</button>
         <button id="closePort" class="ghost" title="关闭串口">关闭</button>
         <button id="rescan" class="ghost" title="从板端同步电机列表">同步清单</button>
+        <div class="connection-status" aria-label="通信状态"><span id="serviceState">服务 · 连接中</span><span id="boardState">控制板 · 未连接</span><span id="feedbackState">电机反馈 · 未就绪</span></div>
+        <p id="connectionMessage" class="setup-message" role="status" aria-live="polite">连接控制板后，等待板端应答。</p>
+        <p id="connectionError" class="setup-message error" role="status" hidden></p>
       </div>
       <span class="setup-sep" aria-hidden="true"></span>
       <div class="motor-registry" role="region" aria-labelledby="registryTitle">
@@ -71,11 +88,13 @@
           <div><span class="group-marker" aria-hidden="true">≡</span><h3 id="registryTitle">电机列表</h3><span class="registry-count" id="registryCount">00</span></div>
           <button id="openAddMotor" class="registry-add" aria-label="添加电机" aria-controls="addForm" aria-expanded="false" title="添加电机">＋</button>
         </div>
-        <div class="registry-empty" id="motorListEmpty"><span aria-hidden="true">[ — ]</span><strong>尚未登记电机</strong><span>点击右上角 ＋ 添加电机</span></div>
+        <div class="registry-empty" id="motorListEmpty"><span aria-hidden="true">[ — ]</span><strong id="motorEmptyText">尚未登记电机</strong><button id="addFirstMotor" class="ghost" aria-controls="addForm">添加第一颗电机</button></div>
+        <p id="addAvailability" class="setup-message" role="status">请先连接控制板，再登记电机。</p>
         <ul id="motorList" class="motor-list" aria-label="已登记电机"></ul>
         <span id="registryMsg" class="hint" role="status" aria-live="polite"></span>
         <div id="addForm" class="registry-form" role="group" aria-label="添加电机" hidden>
           <div class="registry-form-heading"><strong>添加电机</strong><span>NEW MOTOR</span></div>
+          <p class="registry-form-note">登记是告诉控制板有哪些电机，不会使电机转动；断电后需重新登记。</p>
           <label>型号
             <!--
               @attention 2026-10-19:当前只放达妙与大疆两系。
@@ -100,6 +119,7 @@
           <label id="addRxIdWrap" hidden>反馈 ID / RX
             <span class="id-input"><span class="id-prefix">0x</span><input id="addRxId" type="text" value="" placeholder="302" autocomplete="off" spellcheck="false" aria-label="反馈 ID 十六进制" /></span>
           </label>
+          <p id="addIdHelp" class="registry-form-note">CAN 总线按实际接线选择，电调 ID 与电调上的设置一致。</p>
           <div class="registry-form-actions"><button id="cancelAddMotor" class="ghost">取消</button><button id="addMotor" class="primary">添加电机</button></div>
           <span id="addMsg" class="hint" role="status" aria-live="polite"></span>
         </div>
@@ -124,7 +144,7 @@
 
     <div class="section-heading channels-heading"><h2><span>02</span> 通道控制</h2><span>CONTROL CHANNELS</span></div>
     <main id="channels" class="channels" aria-label="电机控制通道"></main>
-    <p id="channelsEmpty" class="registry-empty">尚未登记电机。添加电机后将自动生成对应数量的通道。</p>
+    <div id="channelsEmpty" class="channels-empty"><strong>每颗电机，一个测试通道</strong><p>添加电机后会自动生成通道。选择电机并绑定，再使能并设置目标，即可在曲线中观察响应。</p><span>绑定控制对象 → 使能输出 → 观察曲线 → 停机</span></div>
 
     <template id="calculatorTpl">
       <div class="calculator-body">
@@ -192,6 +212,7 @@
           <span class="badge" data-role="status">未绑定</span>
         </header>
 
+        <p class="channel-hint" data-role="channelHint" role="status" aria-live="polite">选择电机后，点击标题行的「绑定」。</p>
         <div class="bind-row">
           <select data-role="motor" class="motor-select" aria-label="选择通道电机">
             <option value="">选择电机…</option>
@@ -236,6 +257,7 @@
             <div class="subsection-heading"><span>闭环配置</span><span>CONTROL LOOP</span></div>
             <div class="loop-fishbone" data-role="loopPicker"></div>
             <p class="hint error" data-role="loopStatus" role="status" hidden></p>
+            <details class="context-help"><summary>如何选择闭环与 PID？</summary><p>左键点击节点切换闭环，右键点击节点选择要整定的 PID。位置环会联动速度环；达妙电机的电流环由电调内部控制。</p><p>修改 PID 会请求本通道停机并清零目标。「应用到电机」收到成功回执后，会自动以零目标使能。「恢复默认值」只填表，仍需点击应用。</p></details>
 
             <!--
               PID 整定 —— 常驻显示(未绑定电机时各控件为 disabled)。
@@ -254,6 +276,7 @@
                 <label><span>输出限幅 <span data-role="pMaxOutUnit"></span></span><input data-role="pMaxOut" type="number" step="1" min="0" value="0" disabled /></label>
                 <label><span>积分限幅 <span data-role="pIntLimUnit"></span></span><input data-role="pIntLim" type="number" step="1" min="0" value="0" disabled /></label>
               </div>
+              <p class="control-help" data-role="pidOutputHelp" hidden></p>
               <!--
                 动作行:**状态消息与「应用到电机」同一行**(2026-10-14 用户要求)。
                 消息(pidMsg)一直在本行内(DOM 顺序:应用到电机 → 恢复默认值 → 消息),
@@ -327,7 +350,7 @@
               视觉上就是四个角各缺一小块、露出背景色,看着像"图标画歪了"。
               内缩 2px 后描边完整落在框内,四角干净。
           -->
-          <div class="chart-empty" data-role="chartEmpty"><svg viewBox="0 0 64 40" fill="none" aria-hidden="true"><path d="M2 20h15l8-13 12 26 9-13h16" /></svg><span>等待遥测数据</span><small>WAITING FOR SIGNAL</small></div>
+          <div class="chart-empty" data-role="chartEmpty"><svg viewBox="0 0 64 40" fill="none" aria-hidden="true"><path d="M2 20h15l8-13 12 26 9-13h16" /></svg><span data-role="chartEmptyText">绑定电机后显示实际反馈</span><small>WAITING FOR SIGNAL</small></div>
           <div class="chart-foot">
             <!--
               滤波开关(2026-10-13 用户要求:电流和转速波动太大)。
@@ -366,6 +389,7 @@
             <button data-role="enable" class="enable" title="使能后电机才会跟随设定值转动">使能</button>
             <button data-role="zero" class="ghost" title="把设定值归零并下发">归零</button>
           </div>
+          <p class="control-help" data-role="targetHelp">输入目标后按 Enter 或移开焦点下发；拖动滑块在松手时下发。非零目标下使能，电机会立即执行该目标。</p>
           <div class="channel-tools">
             <div class="tool-tabs" role="tablist" aria-label="通道工具">
               <button data-role="presetTab" role="tab" aria-selected="true">自动输出</button>
@@ -448,13 +472,13 @@
 
     <footer class="hint">
       <p>
-        <span class="footer-label">SYS / SAFETY · UI 20261019-dm4310-defaults</span> 电机登记并绑定后，需显式使能才会跟随目标。
+        <span class="footer-label">SYS / SAFETY · UI 20261021-speed-controls</span> 电机登记并绑定后，需显式使能才会跟随目标。
         <strong>未使能前电机不出力</strong>;约 1.5 秒收不到上位机心跳,A 板会自动全停;
         页面处于焦点时，按空格立即全停（输入框内同样有效）；关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
       </p>
     </footer>
     </div>
 
-    <script type="module" src="ui.js?v=20261019-dm4310-defaults"></script>
+    <script type="module" src="ui.js?v=20261021-speed-controls"></script>
   </body>
 </html>
