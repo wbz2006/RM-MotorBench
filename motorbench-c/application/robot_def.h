@@ -5,11 +5,12 @@
 #define MOTOR_BENCH_APP
 #define MOTOR_BENCH_DEFAULT_CONFIG
 
-/* C board snapshot: USB CDC is the only enabled host link. */
+/* Select exactly one host link. UART uses UART7 at 115200 baud. */
 #define MOTOR_BENCH_LINK_USB
+/* #define MOTOR_BENCH_LINK_UART */
 
-#if defined(MOTOR_BENCH_LINK_UART)
-#error "C board motor bench supports USB CDC only"
+#if defined(MOTOR_BENCH_LINK_USB) == defined(MOTOR_BENCH_LINK_UART)
+#error "Select exactly one motor bench host link"
 #endif
 
 #define MOTOR_BENCH_QUIET_LOG

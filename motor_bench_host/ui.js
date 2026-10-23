@@ -59,6 +59,10 @@ let channelResetTimer = null;
 let channelResetAttempts = 0;
 let serverSupportsReset = false;
 let serverSupportsLoop = false;
+let serverSupportsPositionStep = false;
+let firmwareSupportsPositionStep = false;
+let firmwareSupportsShaftPosition = false;
+let firmwareSupportsPositionReady = false;
 let firmwareSupportsLoop = false;
 let firmwareVersion = null;
 let channelResetError = '';
@@ -379,6 +383,7 @@ function buildChannels(count = inventory.length) {
     boundLoopMasks.delete(i);
     telemetryByChannel.delete(i);
     pidStateByChannel.delete(i);
+    channelCalculators.get(i)?.destroy();
     channelCalculators.delete(i);
     dropChart(i);
     dropFishbone(i);
@@ -402,7 +407,16 @@ function buildChannels(count = inventory.length) {
       r(`${name}Tab`).setAttribute('aria-controls', r(`${name}Panel`).id);
       r(`${name}Panel`).setAttribute('aria-labelledby', r(`${name}Tab`).id);
     }
-    channelCalculators.set(i, initCalculator(r('calculatorContent'), `ch${i}`, (result, write) => fillCalculatedTarget(i, result, write)));
+    channelCalculators.set(i, initCalculator(r('calculatorContent'), `ch${i}`,
+      (result, write) => fillCalculatedTarget(i, result, write), {
+        getState: () => loaderTestState(i),
+        selectPosition: () => ensureFishbone(i)?.onChange(readLoopMask(i) | LoopType.ANGLE_LOOP | LoopType.SPEED_LOOP),
+        enable: () => { setDisplayedRef(i, 0); send({ type: 'enable', channelId: i, enable: true, ref: 0 }); },
+        trigger: step => send({ type: 'positionStep', channelId: i, ...step }),
+        displayTarget: target => setDisplayedRef(i, target),
+        disable: () => { if (ws.readyState === 1) send({ type: 'enable', channelId: i, enable: false }); },
+        onLockChange: () => renderProgram(i),
+      }));
     added.push(i);
   }
   $('#channelsEmpty').hidden = n !== 0;
@@ -421,6 +435,19 @@ function ch(i) {
 /* ---------------- 指令发送 ---------------- */
 
 function send(obj) {
+  const calculator = channelCalculators.get(obj.channelId);
+  if (obj.type === 'setRef' && calculator?.positionLocked) return;
+  if (obj.type === 'positionStep') {
+    const state = loaderTestState(obj.channelId);
+    if (!calculator?.positionLocked || state.reason || !state.positionMode || !state.enabled) return;
+  }
+  if (calculator?.positionLocked && ['unbind', 'setLoop', 'pidSet', 'enable'].includes(obj.type))
+    calculator.stopPositionTest('控制状态已更改 · 测试已退出', false);
+  if (obj.type === 'closeSerial' || obj.type === 'removeMotor') {
+    for (const item of channelCalculators.values()) {
+      if (item.positionLocked) item.stopPositionTest('连接或电机已更改 · 测试已停机', true);
+    }
+  }
   if (obj.type === 'stopAll' || obj.type === 'resetChannels' || obj.type === 'closeSerial') {
     for (const i of pendingPidApplies.keys()) cancelPidResume(i);
   }
@@ -431,9 +458,9 @@ function send(obj) {
     } else cancelPidResume(obj.channelId);
   }
   if (pendingPidApplies.has(obj.channelId) &&
-      (obj.type === 'setRef' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
+      (obj.type === 'setRef' || obj.type === 'positionStep' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
   if (pendingLoopChanges.has(obj.channelId) &&
-      (obj.type === 'setRef' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
+      (obj.type === 'setRef' || obj.type === 'positionStep' || obj.type === 'pidSet' || (obj.type === 'enable' && obj.enable))) return;
   // Number inputs do not enforce HTML min/max when sending commands.
   // Cover manual targets, enable-with-target, and automatic outputs at the same boundary.
   if ((obj.type === 'setRef' || (obj.type === 'enable' && obj.enable)) && obj.ref !== undefined &&
@@ -454,6 +481,22 @@ function send(obj) {
 }
 
 /* ---------------- 自动转速输出 ---------------- */
+
+function loaderTestState(i) {
+  const t = telemetryByChannel.get(i);
+  const mask = boundLoopMasks.get(i) ?? readLoopMask(i);
+  const reason = !serverSupportsPositionStep ? '请重启新版上位机服务以支持位置步进' :
+    !firmwareSupportsPositionStep || !firmwareSupportsShaftPosition || !firmwareSupportsPositionReady ? '请烧录支持输出轴到位容差的新版固件（A 1.22 / C 1.16）' :
+    !canControlChannel(i) || !t?.online || performance.now() - t.receivedAt > 500 ? '请检查连接，等待最新电机反馈' :
+    pendingPidApplies.has(i) ? '请等待 PID 应用完成' :
+    document.hidden ? '请返回当前页面' :
+    !Number.isFinite(t.angle) || !Number.isFinite(t.ref) ? '位置反馈无效' : '';
+  const positionMode = !!(mask & LoopType.ANGLE_LOOP);
+  const kind = currentChannelKind(i);
+  const builtInRatio = kind === MotorKind.M2006 ? 36 : kind === MotorKind.M3508 ? 19 : 1;
+  return { reason, positionMode, enabled: !!t?.enabled, tolerance: 1, // MB_POSITION_READY_TOLERANCE_DEG, in output-shaft degrees.
+    builtInRatio, angle: t?.angle, ref: t?.ref, receivedAt: t?.receivedAt };
+}
 
 function canRunProgram(i) {
   const t = telemetryByChannel.get(i);
@@ -505,6 +548,8 @@ function fillCalculatedTarget(i, result, write) {
 
 function selectChannelTool(i, name) {
   const el = ch(i);
+  if (name !== 'calculator' && channelCalculators.get(i)?.positionLocked)
+    channelCalculators.get(i).stopPositionTest('已切换工具 · 测试已停机', true);
   el.dataset.tool = name;
   renderChannel(i);
   if (name === 'calculator') channelCalculators.get(i)?.fill();
@@ -528,6 +573,7 @@ function renderProgram(i) {
   const el = ch(i);
   if (!el) return;
   const running = setpointPrograms.has(i);
+  const positionLocked = channelCalculators.get(i)?.positionLocked;
   const positionMode = !!((boundLoopMasks.get(i) ?? readLoopMask(i)) & LoopType.ANGLE_LOOP);
   const mode = el.querySelector('[data-role="presetMode"]').value;
   el.querySelector('[data-role="presetPanel"]').dataset.running = String(running);
@@ -540,7 +586,15 @@ function renderProgram(i) {
   el.querySelector('[data-role="presetStart"]').disabled = running || !canRunProgram(i);
   el.querySelector('[data-role="presetStart"]').textContent = running ? '正在输出…' : '▶ 启动预设';
   el.querySelector('[data-role="presetStop"]').disabled = !running;
-  for (const role of ['num', 'slider']) el.querySelector(`[data-role="${role}"]`).disabled = running || !canControlChannel(i) || pendingPidApplies.has(i);
+  for (const role of ['num', 'slider']) el.querySelector(`[data-role="${role}"]`).disabled = running || positionLocked || !canControlChannel(i) || pendingPidApplies.has(i);
+  el.querySelector('[data-role="zero"]').disabled = positionLocked || !canControlChannel(i);
+  if (positionLocked) {
+    const num = el.querySelector('[data-role="num"]');
+    const slider = el.querySelector('[data-role="slider"]');
+    num.removeAttribute('min');
+    num.removeAttribute('max');
+    slider.min = slider.max = slider.value = num.value;
+  }
 }
 
 function stopProgram(i, message, zero = false) {
@@ -558,6 +612,9 @@ function stopAllPrograms(message, disable = false) {
   for (const i of [...setpointPrograms.keys()]) {
     stopProgram(i, message);
     if (disable && ws.readyState === 1) send({ type: 'enable', channelId: i, enable: false });
+  }
+  for (const calculator of channelCalculators.values()) {
+    if (calculator.positionLocked) calculator.stopPositionTest(message, disable);
   }
 }
 
@@ -618,6 +675,11 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     for (const i of pendingPidApplies.keys()) cancelPidResume(i);
     stopAllPrograms('页面已转入后台 · 自动输出已停止', true);
+  }
+});
+window.addEventListener('blur', () => {
+  for (const calculator of channelCalculators.values()) {
+    if (calculator.positionLocked) calculator.stopPositionTest('窗口失去焦点 · 测试已停机', true);
   }
 });
 
@@ -829,7 +891,7 @@ function renderChannel(i) {
   r('num').max = r('slider').max;
   r('slider').step = positionMode ? '0.1' : '0.001';
   r('num').step = positionMode ? '0.1' : '0.001';
-  r('num').title = positionMode ? '相对本次使能零点的转子角度（deg），范围 ±360°' : '精确输入目标转速后下发';
+  r('num').title = positionMode ? `相对本次使能零点的${firmwareSupportsShaftPosition ? '输出轴' : '转子（旧固件）'}角度（deg），范围 ±360°` : '精确输入目标转速后下发';
   r('num').setAttribute('aria-label', positionMode ? '目标位置角度' : '目标转速数值');
   r('slider').setAttribute('aria-label', positionMode ? '目标位置角度' : '目标转速');
   renderChannelTools(i, positionMode);
@@ -886,7 +948,7 @@ function renderChannel(i) {
     : fastZero ? `快速制动至 0 ${spec.unit}，保持速度闭环使能；停机按钮会撤销使能`
     : '把目标设为 0 并下发；电机仍保持当前使能状态';
   setText(r('targetHelp'), positionMode
-    ? '每次从停机切换到使能，以当前位置为 0°；「归零」返回本次零点。M2006/M3508 显示转子角度，未换算输出轴角度。'
+    ? `每次从停机切换到使能，以当前位置为 0°；「归零」返回本次零点。${firmwareSupportsShaftPosition ? '位置输入及曲线均为减速箱输出轴角度；M2006 内置 36:1、M3508 内置 19:1 已换算。' : '旧固件：M2006/M3508 仍为转子角度，请更新固件至 A 1.20 / C 1.14。'}`
     : `${spec?.speedLimitHint ? spec.speedLimitHint + ' ' : ''}${rampHint}输入目标后按 Enter 或移开焦点下发；滑块松手时下发。未使能时可预填目标，点击使能执行；非零目标会立即转动。`);
 
   /*
@@ -1514,6 +1576,11 @@ function bindEvents() {
       };
     }
     r('presetMode').onchange = () => renderProgram(i);
+    r('calculatorType').onchange = () => {
+      channelCalculators.get(i)?.setType(r('calculatorType').value);
+      r('calculatorWriteStatus').hidden = r('calculatorType').value !== 'loader';
+      renderProgram(i);
+    };
     r('presetInfinite').onchange = () => renderProgram(i);
     r('presetStart').onclick = () => startProgram(i);
     r('presetStop').onclick = () => stopProgram(i, '已停止 · 目标已归零', true);
@@ -1523,8 +1590,11 @@ function bindEvents() {
     };
     num.oninput = () => renderChannelGuidance(i);
     // 松手时才下发,避免拖动时刷屏
-    slider.onchange = () => send({ type: 'setRef', channelId: i, ref: Number(slider.value) });
+    slider.onchange = () => {
+      if (!channelCalculators.get(i)?.positionLocked) send({ type: 'setRef', channelId: i, ref: Number(slider.value) });
+    };
     num.onchange = () => {
+      if (channelCalculators.get(i)?.positionLocked) return;
       slider.value = num.value;
       send({ type: 'setRef', channelId: i, ref: Number(num.value) });
     };
@@ -1545,6 +1615,7 @@ function bindEvents() {
     };
 
     r('zero').onclick = () => {
+      if (channelCalculators.get(i)?.positionLocked) return;
       cancelPidResume(i);
       stopProgram(i, '已停止 · 目标已归零');
       slider.value = '0';
@@ -1686,6 +1757,10 @@ ws.onopen = () => {
 ws.onclose = () => {
   serverSupportsReset = false;
   serverSupportsLoop = false;
+  serverSupportsPositionStep = false;
+  firmwareSupportsPositionStep = false;
+  firmwareSupportsShaftPosition = false;
+  firmwareSupportsPositionReady = false;
   firmwareSupportsLoop = false;
   firmwareVersion = null;
   serialConnected = false;
@@ -1760,6 +1835,7 @@ ws.onmessage = (ev) => {
     case 'hello': {
       serverSupportsReset = msg.capabilities?.includes('resetChannels') === true;
       serverSupportsLoop = msg.capabilities?.includes('setLoop') === true;
+      serverSupportsPositionStep = msg.capabilities?.includes('positionStep') === true;
       if (!serverSupportsReset) {
         channelResetError = '后台版本过旧 · 请重启上位机服务';
         showRegistryMsg(channelResetError, true);
@@ -1794,6 +1870,9 @@ ws.onmessage = (ev) => {
       $('#connectionError').hidden = true;
       $('#fwText').textContent = '';
       firmwareSupportsLoop = false;
+      firmwareSupportsPositionStep = false;
+      firmwareSupportsShaftPosition = false;
+      firmwareSupportsPositionReady = false;
       firmwareVersion = null;
       clearTimeout(channelResetTimer);
       channelResetPending = null;
@@ -1815,6 +1894,9 @@ ws.onmessage = (ev) => {
       const d = msg.data;
       const versionChanged = firmwareVersion !== d.fwVersion;
       firmwareVersion = d.fwVersion;
+      firmwareSupportsPositionStep = !!(d.boardFlags & 0x02);
+      firmwareSupportsShaftPosition = !!(d.boardFlags & 0x04);
+      firmwareSupportsPositionReady = !!(d.boardFlags & 0x08);
       const [major, minor] = String(d.fwVersion).split('.').map(Number);
       const supported = major > 1 || (major === 1 && minor >= 5);
       const changed = versionChanged || firmwareSupportsLoop !== supported || !boardOnline;
@@ -1992,6 +2074,11 @@ ws.onmessage = (ev) => {
       status.textContent = ok ? '闭环已切换，目标已归零；请重新使能' :
         `闭环切换失败：${MBResultText[d.result] ?? d.result}`;
       if (ok) send({ type: 'pidQuery', channelId: d.channelId });
+      break;
+    }
+
+    case 'positionStepAck': {
+      channelCalculators.get(msg.data.channelId)?.positionAck(msg.data);
       break;
     }
 

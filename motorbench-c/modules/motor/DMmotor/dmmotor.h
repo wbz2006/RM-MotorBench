@@ -10,10 +10,23 @@
 
 #define DM_P_MIN  (-12.5f)
 #define DM_P_MAX  12.5f
-#define DM_V_MIN  (-45.0f)
-#define DM_V_MAX  45.0f
-#define DM_T_MIN  (-18.0f)
-#define DM_T_MAX   18.0f
+/* DM-J4310-2EC V1.1: MIT spans read from the user's tuning assistant.
+ * Protocol TMAX is an encoding span, not the motor's working torque. */
+#define DM_V_MIN  (-30.0f)
+#define DM_V_MAX  30.0f
+#define DM_T_MIN  (-10.0f)
+#define DM_T_MAX   10.0f
+#define DM4310_RATED_TORQUE 3.0f
+#define DM4310_PEAK_TORQUE  7.0f
+/* DM8009P keeps its independent, previously verified MIT spans. */
+#define DM8009P_V_MAX 45.0f
+#define DM8009P_T_MAX 54.0f
+
+typedef enum
+{
+    DM_MODEL_4310 = 0,
+    DM_MODEL_8009P,
+} DMMotorModel_e;
 
 typedef struct 
 {
@@ -49,10 +62,16 @@ typedef struct
     float *speed_feedforward_ptr;
     float *current_feedforward_ptr;
     float pid_ref;
+    DMMotorModel_e model;
+    float p_max;
+    float v_max;
+    float t_max;
     Motor_Working_Type_e stop_flag;
     CANInstance *motor_can_instace;
     DaemonInstance *daemon;
     uint32_t lost_cnt;
+    uint32_t last_disable_ms;
+    uint32_t last_query_ms;
 }DMMotorInstance;
 
 typedef enum
@@ -64,6 +83,8 @@ typedef enum
 }DMMotor_Mode_e;
 
 DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config);
+/** Each instance keeps its own MIT limits; legacy init defaults to DM4310. */
+DMMotorInstance *DMMotorInitWithModel(Motor_Init_Config_s *config, DMMotorModel_e model);
 /** Stop and remove the instance from control, CAN and daemon registries. */
 void DMMotorDestroy(DMMotorInstance *motor);
 

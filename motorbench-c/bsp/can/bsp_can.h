@@ -59,12 +59,14 @@ void CANSetDLC(CANInstance *_instance, uint8_t length);
  * @brief transmit mesg through CAN device,通过can实例发送消息
  *        发送前需要向CAN实例的tx_buff写入发送数据
  * 
- * @attention 超时时间不应该超过调用此函数的任务的周期,否则会导致任务阻塞
+ * @attention 邮箱满时最多等待 250 us；旧帧积压时立即返回。1 仅表示入队。
  * 
- * @param timeout 超时时间,单位为ms;后续改为us,获得更精确的控制
+ * @param timeout 0 为不等待，非零最多等待 250 us（兼容旧接口）
  * @param _instance* can instance owned by module
  */
 uint8_t CANTransmit(CANInstance *_instance,uint8_t timeout);
+/** Poll before motor control: discard unacknowledged frames older than 10 ms. */
+void CANServiceTask(void);
 
 /**
  * @brief 注销一个 CAN 实例,并释放它占用的接收过滤器

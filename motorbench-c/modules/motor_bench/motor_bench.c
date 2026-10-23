@@ -482,7 +482,7 @@ uint8_t MotorBenchRegisterMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t mo
         LOGERROR("[motor_bench] inventory full (%d)", MB_CHANNEL_MAX);
         return MB_ERR_NO_RESOURCE;
     }
-    if (!instance || (can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_HT)
+    if (!instance || (can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_DM8009P)
     {
         LOGERROR("[motor_bench] register failed: bad param kind=%d bus=%d id=%d", (int)kind, can_bus, motor_id);
         return MB_ERR_BAD_PARAM;
@@ -553,12 +553,23 @@ void MotorBenchSetMotorFactory(MB_MotorFactory_t factory, MB_MotorDestroy_t dest
 
 /**
  * @brief 预估某配置会产生的 rx_id,用于在真正创建前发现冲突
- * @return rx_id;kind 不属于 DJI 系时返回 0(表示不占用 DJI 的 ID 段)
+ * @return rx_id;0 表示该型号不占用可预测的 ID 段(跳过预检)
  *
- * @note 规则来自 dji_motor.c 的 MotorSenderGrouping():
- *       GM6020      : rx_id = 0x204 + tx_id
- *       M3508/M2006 : rx_id = 0x200 + tx_id
- *       两者区间重叠(0x205~0x208),所以**不能挂在同一条总线上**。
+ * @note 规则来自各驱动的初始化实现,**必须与驱动保持一致**:
+ *       dji_motor.c  MotorSenderGrouping():
+ *         GM6020      : rx_id = 0x204 + tx_id
+ *         M3508/M2006 : rx_id = 0x200 + tx_id
+ *         两者区间重叠(0x205~0x208),所以**不能挂在同一条总线上**。
+ *       LK9025.c  LKMotorInit():
+ *         LK9025      : rx_id = 0x140 + tx_id   ← 驱动内部改写,与用户填的不同
+ *       dmmotor.c / HT04.c:
+ *         DM / HT     : rx_id 由调用方显式指定(建电机请求里带),
+ *                       不适用"由 motor_id 推导"的公式,故返回 0 跳过预检 ——
+ *                       它们的冲突由 CANRegister() 的 rx_id 重复检查兜底。
+ *
+ * @attention 2026-10-19 补入 LK 的 0x140 段:此前 LK 落在 default 分支返回 0,
+ *   预检完全跳过它,而它实际占用 0x140+tx_id。若与别的电机撞了,
+ *   要等 CANRegister 失败才知道,提示还是"滤波器已用完"这种不相干的原因。
  */
 static uint16_t MotorBenchPredictRxId(MB_MotorKind_e kind, uint8_t motor_id)
 {
@@ -569,8 +580,11 @@ static uint16_t MotorBenchPredictRxId(MB_MotorKind_e kind, uint8_t motor_id)
     case MB_MOTOR_M3508:
     case MB_MOTOR_M2006:
         return (uint16_t)(0x200 + motor_id);
+    case MB_MOTOR_LK:
+        /* 与 LK9025.c 的 LKMotorInit() 保持一致 */
+        return (uint16_t)(0x140 + motor_id);
     default:
-        return 0; /* DM / LK / HT 不占 DJI 的 0x200 段 */
+        return 0; /* DM / HT 的 rx_id 由请求显式指定,不按 motor_id 推导 */
     }
 }
 
@@ -605,9 +619,12 @@ static uint8_t MotorBenchCheckRxIdFree(MB_MotorKind_e kind, uint8_t can_bus, uin
             /*
              * 用 ASCII 打印这条规则 —— RTT Viewer 按本机代码页解码,
              * 中文会变乱码,而这恰恰是最需要看清的一行。
+             *
+             * @note 2026-10-19 起 LK 也参与本判定(0x140+id),
+             *   所以文案从"6020/3508 两条规则"改为列出全部三段。
              */
-            LOGERROR("[motor_bench] rule: 6020 rx=0x204+id, 3508/2006 rx=0x200+id; "
-                     "ranges overlap -> put them on DIFFERENT CAN buses");
+            LOGERROR("[motor_bench] rule: 6020 rx=0x204+id, 3508/2006 rx=0x200+id, "
+                     "LK9025 rx=0x140+id; overlapping ranges must go on DIFFERENT CAN buses");
             return MB_ERR_DUPLICATE;
         }
     }
@@ -620,26 +637,30 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
         *out_ch = 0xFF;
 
     /* 1. 基本参数 */
-    if ((can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_HT || motor_id == 0)
+    if ((can_bus != 1 && can_bus != 2) || kind == MB_MOTOR_NONE || kind > MB_MOTOR_DM8009P || motor_id == 0)
     {
         LOGERROR("[motor_bench] add rejected: bad param kind=%d bus=%d id=%d", (int)kind, can_bus, motor_id);
         return MB_ERR_BAD_PARAM;
     }
 
     /*
-     * rx_id 合法性(2026-10-17 新增)。
+     * rx_id 合法性(2026-10-17 新增,2026-10-19 扩展到 HT)。
      *
-     * @attention 只对 DM 系要求 rx_id 有效 —— DJI 系的 rx_id 由驱动
-     *   内部按 0x200+id+1 / 0x204+id+1 计算,上位机传什么都会被忽略。
-     *   但**必须显式要求 DJI 系传 0**,否则用户随手填一个值,
+     * @attention 需要 rx_id 非零的型号:DM 两型 + HT04。
+     *   - DM:MIT 协议,发送/接收两个独立 ID,上位机必须都给;
+     *   - HT:HTMotorInit() 直接拿 can_init_config.rx_id 建过滤器,
+     *     不内部改写,所以同样要显式给。
+     *   其余型号(DJI 三型 + LK)的 rx_id 由驱动内部计算,上位机传什么都被忽略。
+     *
+     *   但**必须显式要求这些型号传 0**,否则用户随手填一个值,
      *   界面上会误以为它生效了,而实际完全没有作用 ——
      *   这种"看起来配了、其实没生效"的静默忽略比报错更难排查。
      */
-    if (kind == MB_MOTOR_DM)
+    if (MotorBenchIsDMKind(kind) || kind == MB_MOTOR_HT)
     {
         if (rx_id == 0 || rx_id > 0x7ff)
         {
-            LOGERROR("[motor_bench] add rejected: DM needs a non-zero rx_id (feedback ID)");
+            LOGERROR("[motor_bench] add rejected: kind %d needs a non-zero rx_id (feedback ID)", (int)kind);
             return MB_ERR_BAD_PARAM;
         }
     }
@@ -663,7 +684,9 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
     /* 2. 重复:同一总线上已有相同 (kind, bus, id) */
     for (uint8_t i = 0; i < mb_inventory_used; i++)
     {
-        if (mb_inventory[i].is_used && mb_inventory[i].kind == kind &&
+        if (mb_inventory[i].is_used &&
+            (mb_inventory[i].kind == kind ||
+             (MotorBenchIsDMKind(kind) && MotorBenchIsDMKind(mb_inventory[i].kind))) &&
             mb_inventory[i].can_bus == can_bus && mb_inventory[i].motor_id == motor_id)
         {
             LOGERROR("[motor_bench] add rejected: bus%d id%d already exists", can_bus, motor_id);
@@ -713,9 +736,26 @@ uint8_t MotorBenchAddMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_i
  *   DM 允许"同一个 motor_id 配不同 rx_id"吗?不允许出现在清单里 ——
  *   添加阶段已用 (bus,motor_id) 判重,所以 rx_id 在这里只是**确认键**:
  *   传错值会找不到目标,返回 NOT_PROVISIONED,而不是误删别的电机。
+ *
+ * @attention 2026-10-19:LK9025 / HT04 **拒绝移除**。
+ *   两个驱动库都没有提供"销毁实例"接口(对比:DJI 有 DJIMotorDestroy、
+ *   DM 有 DMMotorDestroy,都会把实例从各自的静态数组里摘掉并递减 idx)。
+ *   LK 的 LKMotorControl() 与 HT 的 HTMotorTask 都按驱动内部的
+ *   静态实例表遍历,free 掉实例后那个表里仍留着悬空指针 ——
+ *   下一拍控制任务就会解引用已释放内存。
+ *   因此在固件层直接拒绝,返回 MB_ERR_UNSUPPORTED,
+ *   由上位机把"该型号需重新上电"提示给用户,而不是让板子跑飞。
  */
 uint8_t MotorBenchRemoveMotor(MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, uint16_t rx_id)
 {
+    if (kind == MB_MOTOR_LK || kind == MB_MOTOR_HT)
+    {
+        LOGERROR("[motor_bench] remove rejected: kind %d cannot be removed at runtime "
+                 "(driver has no instance-destroy interface; power-cycle to clear)",
+                 (int)kind);
+        return MB_ERR_UNSUPPORTED;
+    }
+
     for (uint8_t i = 0; i < mb_inventory_used; i++)
     {
         if (mb_inventory[i].is_used && mb_inventory[i].kind == kind &&
@@ -780,7 +820,7 @@ uint8_t MotorBenchGetInventory(uint8_t idx, MB_InventoryItemPublic_s *out)
 
 uint8_t MotorBenchBind(uint8_t channel_id, MB_MotorKind_e kind, uint8_t can_bus, uint8_t motor_id, Closeloop_Type_e outer_loop)
 {
-    if (kind == MB_MOTOR_DM && !(outer_loop & (ANGLE_LOOP | SPEED_LOOP)))
+    if (MotorBenchIsDMKind(kind) && !(outer_loop & (ANGLE_LOOP | SPEED_LOOP)))
         return MB_ERR_UNSUPPORTED;
     if (channel_id >= MB_CHANNEL_MAX)
     {
@@ -944,7 +984,14 @@ void MotorBenchForceStopInstance(MB_MotorKind_e kind, void *instance)
         DJIMotorStop((DJIMotorInstance *)instance);
         break;
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
         DMMotorStop((DMMotorInstance *)instance);
+        break;
+    case MB_MOTOR_LK:
+        LKMotorStop((LKMotorInstance *)instance);
+        break;
+    case MB_MOTOR_HT:
+        HTMotorStop((HTMotorInstance *)instance);
         break;
     default:
         break;
@@ -963,7 +1010,14 @@ static uint8_t MotorBenchEnableInstance(MB_MotorKind_e kind, void *instance, uin
         enable ? DJIMotorEnable((DJIMotorInstance *)instance) : DJIMotorStop((DJIMotorInstance *)instance);
         return 1;
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
         enable ? DMMotorEnable((DMMotorInstance *)instance) : DMMotorStop((DMMotorInstance *)instance);
+        return 1;
+    case MB_MOTOR_LK:
+        enable ? LKMotorEnable((LKMotorInstance *)instance) : LKMotorStop((LKMotorInstance *)instance);
+        return 1;
+    case MB_MOTOR_HT:
+        enable ? HTMotorEnable((HTMotorInstance *)instance) : HTMotorStop((HTMotorInstance *)instance);
         return 1;
     default:
         LOGERROR("[motor_bench] kind %d not wired for enable", (int)kind);
@@ -983,7 +1037,14 @@ static uint8_t MotorBenchSetRefInstance(MB_MotorKind_e kind, void *instance, flo
         DJIMotorSetRef((DJIMotorInstance *)instance, ref);
         return 1;
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
         DMMotorSetRef((DMMotorInstance *)instance, ref);
+        return 1;
+    case MB_MOTOR_LK:
+        LKMotorSetRef((LKMotorInstance *)instance, ref);
+        return 1;
+    case MB_MOTOR_HT:
+        HTMotorSetRef((HTMotorInstance *)instance, ref);
         return 1;
     default:
         LOGERROR("[motor_bench] kind %d not wired for setref", (int)kind);
@@ -1012,10 +1073,27 @@ static uint8_t MotorBenchSetLoopInstance(MB_MotorKind_e kind, void *instance, Cl
         return 1;
 
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
         if (!(loop & (ANGLE_LOOP | SPEED_LOOP)))
             return 0;
         DMMotorOuterLoop((DMMotorInstance *)instance, loop);
         return 1;
+
+    case MB_MOTOR_HT:
+        /* HT04 有 HTMotorOuterLoop(),与 DM 同样要求带速度环 */
+        if (!(loop & (ANGLE_LOOP | SPEED_LOOP)))
+            return 0;
+        HTMotorOuterLoop((HTMotorInstance *)instance, loop);
+        return 1;
+
+    case MB_MOTOR_LK:
+        /*
+         * LK9025 **没有**切环接口(LK9025.h 只有 SetRef/Stop/Enable/IsOnline),
+         * 其 outer_loop_type 在建实例时由 BenchBuildLKConfig 写死。
+         * 这里明确返回 0,让上层给用户一个"不支持"的回执,
+         * 而不是静默接受一个不会生效的请求。
+         */
+        return 0;
 
     default:
         LOGERROR("[motor_bench] kind %d not wired for loop switch", (int)kind);
@@ -1031,10 +1109,19 @@ uint8_t MotorBenchSetLoop(uint8_t channel_id, Closeloop_Type_e loop)
     if (!loop || (loop & ~ALL_THREE_LOOP) || ((loop & ANGLE_LOOP) && !(loop & SPEED_LOOP)))
         return MB_ERR_BAD_PARAM;
     MB_MotorChannel_s *ch = &mb_channels[channel_id];
-    if (ch->kind == MB_MOTOR_DM && !(loop & SPEED_LOOP))
+    if (MotorBenchIsDMKind(ch->kind) && !(loop & SPEED_LOOP))
         return MB_ERR_UNSUPPORTED;
-    if (ch->kind != MB_MOTOR_DM && ch->kind != MB_MOTOR_GM6020 &&
-        ch->kind != MB_MOTOR_M3508 && ch->kind != MB_MOTOR_M2006)
+    /*
+     * 允许切环的型号:DJI 三型 + DM 两型 + HT04。
+     * @attention LK9025 **不在其列** —— 它没有切环接口
+     *   (LK9025.h 只有 SetRef/Stop/Enable/IsOnline),
+     *   outer_loop_type 建实例时就写死了。放它过去只会得到
+     *   SetLoopInstance 返回 0,与在这里直接拒绝是同一结果,
+     *   但提前拒绝能让日志更准确地说明原因。
+     */
+    if (ch->kind != MB_MOTOR_GM6020 && ch->kind != MB_MOTOR_M3508 &&
+        ch->kind != MB_MOTOR_M2006 && !MotorBenchIsDMKind(ch->kind) &&
+        ch->kind != MB_MOTOR_HT)
         return MB_ERR_UNSUPPORTED;
 
     MotorBenchSetEnable(channel_id, 0);
@@ -1051,6 +1138,15 @@ uint8_t MotorBenchSetLoop(uint8_t channel_id, Closeloop_Type_e loop)
     return MB_OK;
 }
 
+/* Public position degrees refer to the gearbox output shaft. Drivers and
+ * position_zero retain rotor degrees, so PID tuning and speed units stay intact. */
+static float MotorBenchPositionRatio(MB_MotorKind_e kind)
+{
+    if (kind == MB_MOTOR_M2006) return 36.0f;
+    if (kind == MB_MOTOR_M3508) return 19.0f;
+    return 1.0f;
+}
+
 uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
 {
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
@@ -1058,13 +1154,19 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
 
     MB_MotorChannel_s *ch = &mb_channels[channel_id];
     /* Stop and every disabled -> enabled edge discard any previous target. */
+    if (enable)
+    {
+        MB_TelemetryItem_s feedback;
+        if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1))
+            return MB_ERR_BAD_PARAM;
+    }
     if (enable && !ch->status_bit_enable && (ch->outer_loop & ANGLE_LOOP))
     {
         MB_TelemetryItem_s feedback;
         if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1) || !isfinite(feedback.measure_angle))
             return MB_ERR_BAD_PARAM;
         /* GetMeasure reports angle relative to the previous origin. */
-        ch->position_zero += feedback.measure_angle;
+        ch->position_zero += feedback.measure_angle * MotorBenchPositionRatio(ch->kind);
     }
     if (!enable || !ch->status_bit_enable)
     {
@@ -1171,12 +1273,13 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
     float to_send = need_rpm_conv ? limited * RPM_2_ANGLE_PER_SEC : limited;
     if (outer & ANGLE_LOOP)
     {
-        /* Position targets are relative degrees, never rpm. */
+        /* Relative output-shaft degrees -> absolute driver degrees. */
         LIMIT_MIN_MAX(limited, -360.0f, 360.0f);
-        to_send = limited + mb_channels[channel_id].position_zero;
-        if (mb_channels[channel_id].kind == MB_MOTOR_DM)
+        to_send = limited * MotorBenchPositionRatio(mb_channels[channel_id].kind) + mb_channels[channel_id].position_zero;
+        if (MotorBenchIsDMKind(mb_channels[channel_id].kind))
         {
-            LIMIT_MIN_MAX(to_send, DM_P_MIN * RAD_2_DEGREE, DM_P_MAX * RAD_2_DEGREE);
+            DMMotorInstance *m = (DMMotorInstance *)mb_channels[channel_id].motor_ptr;
+            LIMIT_MIN_MAX(to_send, -m->p_max * RAD_2_DEGREE, m->p_max * RAD_2_DEGREE);
             limited = to_send - mb_channels[channel_id].position_zero;
         }
     }
@@ -1190,6 +1293,44 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
      *   存换算后的值会让界面显示 22140 这种吓人的数字。
      */
     mb_channels[channel_id].ref_cmd = limited;
+    return MB_OK;
+}
+
+/* Single/double feeder actions use the same total-angle target as shoot.c.
+ * Reject out-of-range moves instead of silently truncating the requested count. */
+uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *target)
+{
+    if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used || !target ||
+        !isfinite(delta_deg) || fabsf(delta_deg) < 0.001f || fabsf(delta_deg) > MB_POSITION_STEP_MAX_DEG)
+        return MB_ERR_BAD_PARAM;
+    MB_MotorChannel_s *ch = &mb_channels[channel_id];
+    if (!(ch->outer_loop & ANGLE_LOOP))
+        return MB_ERR_UNSUPPORTED;
+    if (!ch->status_bit_enable)
+        return MB_ERR_NOT_ENABLED;
+    MB_TelemetryItem_s feedback;
+    if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1) ||
+        !isfinite(feedback.measure_angle))
+        return MB_ERR_FEEDBACK_UNAVAILABLE;
+    if (fabsf(feedback.measure_angle - ch->ref_cmd) > MB_POSITION_READY_TOLERANCE_DEG)
+        return MB_ERR_POSITION_BUSY;
+    float relative = feedback.measure_angle + delta_deg;
+    float absolute = relative * MotorBenchPositionRatio(ch->kind) + ch->position_zero;
+    /* Raw encoder totals include all prior speed/feeder tests. Only the
+     * target relative to this enable origin is bounded here; a large raw
+     * origin must not reject an otherwise legal move after re-enabling. */
+    if (!isfinite(relative) || !isfinite(absolute) || fabsf(relative) > MB_POSITION_TARGET_MAX_DEG)
+        return MB_ERR_POSITION_RANGE;
+    if (MotorBenchIsDMKind(ch->kind))
+    {
+        DMMotorInstance *m = (DMMotorInstance *)ch->motor_ptr;
+        if (fabsf(absolute) > m->p_max * RAD_2_DEGREE)
+            return MB_ERR_POSITION_RANGE;
+    }
+    if (!MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, absolute))
+        return MB_ERR_UNSUPPORTED;
+    ch->ref_cmd = relative;
+    *target = relative;
     return MB_OK;
 }
 
@@ -1243,13 +1384,14 @@ uint8_t MotorBenchGetMeasure(uint8_t channel_id, MB_TelemetryItem_s *out)
             break;
         out->measure_speed = m->measure.speed_aps / 6.0f; /* aps -> rpm */
         out->measure_torque = (float)m->measure.real_current;
-        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? m->measure.total_angle - ch->position_zero : m->measure.angle_single_round;
+        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? (m->measure.total_angle - ch->position_zero) / MotorBenchPositionRatio(ch->kind) : m->measure.angle_single_round;
         out->temperature = (int8_t)m->measure.temperature;
         /* 先判空再调用,避免 daemon 未注册时解引用空指针 */
         out->status |= (m->daemon && DaemonIsOnline(m->daemon)) ? 0x01 : 0x00;
         break;
     }
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
     {
         DMMotorInstance *m = (DMMotorInstance *)ch->motor_ptr;
         if (!m)
@@ -1260,6 +1402,34 @@ uint8_t MotorBenchGetMeasure(uint8_t channel_id, MB_TelemetryItem_s *out)
         if (ch->outer_loop & ANGLE_LOOP)
             out->measure_angle -= ch->position_zero;
         out->status |= (m->daemon && DaemonIsOnline(m->daemon)) ? 0x01 : 0x00;
+        break;
+    }
+    case MB_MOTOR_LK:
+    {
+        LKMotorInstance *m = (LKMotorInstance *)ch->motor_ptr;
+        if (!m)
+            break;
+        /* LK 的速度单位是 rad/s(与 DM 一致),不是 DJI 的 rpm */
+        out->measure_speed = m->measure.speed_rads;
+        out->measure_torque = (float)m->measure.real_current;
+        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? m->measure.total_angle - ch->position_zero : m->measure.angle_single_round;
+        out->temperature = (int8_t)m->measure.temperature;
+        out->status |= (m->daemon && DaemonIsOnline(m->daemon)) ? 0x01 : 0x00;
+        break;
+    }
+    case MB_MOTOR_HT:
+    {
+        HTMotorInstance *m = (HTMotorInstance *)ch->motor_ptr;
+        if (!m)
+            break;
+        /* HT 的速度单位是 rad/s;角度是多圈角度(rad),转 deg 上报 */
+        out->measure_speed = m->measure.speed_rads;
+        out->measure_torque = m->measure.real_current;
+        out->measure_angle = m->measure.total_angle * RAD_2_DEGREE;
+        if (ch->outer_loop & ANGLE_LOOP)
+            out->measure_angle -= ch->position_zero;
+        /* HT 的 measure 里没有温度字段,保持 -128(未知) */
+        out->status |= (m->motor_daemon && DaemonIsOnline(m->motor_daemon)) ? 0x01 : 0x00;
         break;
     }
     default:
@@ -1458,6 +1628,17 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
             break;
         case MB_FRAME_MOTOR_SET:
             MotorBenchHandleSetRef(payload, payload_len);
+            break;
+        case MB_FRAME_POSITION_STEP:
+            if (payload_len == 7)
+            {
+                float delta, target = 0.0f;
+                memcpy(&delta, &payload[3], sizeof(delta));
+                uint8_t ack[8] = {payload[0], payload[1], payload[2], 0};
+                ack[3] = MotorBenchPositionStep(payload[0], delta, &target);
+                memcpy(&ack[4], &target, sizeof(target));
+                MotorBenchSendTypedFrame(MB_FRAME_POSITION_STEP_ACK, ack, sizeof(ack));
+            }
             break;
         case MB_FRAME_MOTOR_ENABLE:
             MotorBenchHandleEnable(payload, payload_len);
@@ -1722,17 +1903,19 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
         break;
     }
     case MB_MOTOR_DM:
+    case MB_MOTOR_DM8009P:
     {
         DMMotorInstance *m = (DMMotorInstance *)inst;
         if (!m) return MB_ERR_BAD_PARAM;
         if (loop == MB_PID_LOOP_SPEED)
         {
-            if (max_out > DM_T_MAX) return MB_ERR_BAD_PARAM;
+            float torque_limit = ch->kind == MB_MOTOR_DM ? DM4310_PEAK_TORQUE : m->t_max;
+            if (max_out > torque_limit) return MB_ERR_BAD_PARAM;
             target = &m->speed_PID;
         }
         else if (loop == MB_PID_LOOP_ANGLE)
         {
-            if (max_out > DM_V_MAX) return MB_ERR_BAD_PARAM;
+            if (max_out > m->v_max) return MB_ERR_BAD_PARAM;
             target = &m->angle_PID;
         }
         else
@@ -1740,11 +1923,43 @@ uint8_t MotorBenchSetPid(uint8_t channel_id, uint8_t loop, float kp, float ki, f
         break;
     }
     case MB_MOTOR_LK:
+    {
+        /*
+         * 岭芯 LK9025 —— 2026-10-19 接入 PID 读写。
+         * @note 三环 PID 直接放在实例上(不经 motor_controller 中转),
+         *   与 DJI 的布局不同,取值时要注意。
+         */
+        LKMotorInstance *m = (LKMotorInstance *)inst;
+        if (!m)
+            return MB_ERR_BAD_PARAM;
+        if (loop == MB_PID_LOOP_SPEED)
+            target = &m->speed_PID;
+        else if (loop == MB_PID_LOOP_CURRENT)
+            target = &m->current_PID;
+        else if (loop == MB_PID_LOOP_ANGLE)
+        {
+            target = &m->angle_PID;
+            /* 与 DJI 同理:位置环要生效,close_loop 必须有 ANGLE 位 */
+            m->motor_settings.close_loop_type |= ANGLE_LOOP;
+        }
+        break;
+    }
     case MB_MOTOR_HT:
     {
-        /* LK/HT 的三环结构在各自驱动内部,这里不直接改,
-         * 由后续按型号扩展;当前返回明确的不支持码而非静默丢弃。 */
-        return MB_ERR_UNSUPPORTED;
+        /* 海泰 HT04 —— 2026-10-19 接入 PID 读写。布局与 LK 相同 */
+        HTMotorInstance *m = (HTMotorInstance *)inst;
+        if (!m)
+            return MB_ERR_BAD_PARAM;
+        if (loop == MB_PID_LOOP_SPEED)
+            target = &m->speed_PID;
+        else if (loop == MB_PID_LOOP_CURRENT)
+            target = &m->current_PID;
+        else if (loop == MB_PID_LOOP_ANGLE)
+        {
+            target = &m->angle_PID;
+            m->motor_settings.close_loop_type |= ANGLE_LOOP;
+        }
+        break;
     }
     default:
         return MB_ERR_UNSUPPORTED;
@@ -1795,19 +2010,34 @@ uint8_t MotorBenchQueryPid(uint8_t channel_id)
     rep.channel_id = channel_id;
     rep.kind = (uint8_t)ch->kind;
 
-    if (ch->kind == MB_MOTOR_LK || ch->kind == MB_MOTOR_HT)
-    {
-        /* 非 DJI 系暂无逐环读取接口,回一个空报表让上位机知道"查了但没数据" */
-        MotorBenchSendTypedFrame(MB_FRAME_PID_REPORT, (const uint8_t *)&rep, sizeof(rep));
-        return MB_ERR_UNSUPPORTED;
-    }
-
-    if (!ch->motor_ptr)
-        return MB_ERR_BAD_PARAM;
-
     const PIDInstance *srcs[3];
     float limit_scale = 1.0f;
-    if (ch->kind == MB_MOTOR_DM)
+
+    if (ch->kind == MB_MOTOR_LK || ch->kind == MB_MOTOR_HT)
+    {
+        /*
+         * 2026-10-19:LK/HT 已接入,三环 PID 与 DJI/DM 一样可直接读取。
+         * @note 这两个型号的 PID 直接挂在实例上(不经 motor_controller),
+         *   所以单独一个分支;读取布局与 DJI 相同(都是 speed/current/angle)。
+         */
+        if (!ch->motor_ptr)
+            return MB_ERR_BAD_PARAM;
+        if (ch->kind == MB_MOTOR_LK)
+        {
+            LKMotorInstance *m = (LKMotorInstance *)ch->motor_ptr;
+            srcs[0] = &m->speed_PID;
+            srcs[1] = &m->current_PID;
+            srcs[2] = &m->angle_PID;
+        }
+        else
+        {
+            HTMotorInstance *m = (HTMotorInstance *)ch->motor_ptr;
+            srcs[0] = &m->speed_PID;
+            srcs[1] = &m->current_PID;
+            srcs[2] = &m->angle_PID;
+        }
+    }
+    else if (MotorBenchIsDMKind(ch->kind))
     {
         DMMotorInstance *m = (DMMotorInstance *)ch->motor_ptr;
         srcs[0] = &m->speed_PID;
@@ -1864,7 +2094,7 @@ static void MotorBenchSendHeartbeatAck(void)
     ack.fw_version_minor = MB_FW_VERSION_MINOR;
     ack.uptime_s = (uint16_t)(HAL_GetTick() / 1000);
     ack.motor_inventory_count = mb_inventory_used;
-    ack.board_flags = MotorBenchAnyMotorOnline() ? 0x01 : 0x00;
+    ack.board_flags = (MotorBenchAnyMotorOnline() ? 0x01 : 0x00) | MB_CAP_POSITION_STEP | MB_CAP_SHAFT_POSITION | MB_CAP_POSITION_READY;
 
     uint8_t *p = (uint8_t *)&ack;
     /* CRC 覆盖 type + len + body(len),与 buildFrame() 的规则一致 */
@@ -1876,6 +2106,29 @@ static void MotorBenchSendHeartbeatAck(void)
 
 void MotorBenchTask(void)
 {
+    /* Drivers latch STOP on feedback loss, even if feedback returned between
+     * control and this task. Keep bindings/PID, discard the old test target. */
+    for (uint8_t i = 0; i < MB_CHANNEL_MAX; i++)
+    {
+        MB_MotorChannel_s *ch = &mb_channels[i];
+        if (!ch->is_used || !ch->status_bit_enable)
+            continue;
+        MB_TelemetryItem_s feedback;
+        Motor_Working_Type_e stopped;
+        if (MotorBenchIsDMKind(ch->kind))
+            stopped = ((DMMotorInstance *)ch->motor_ptr)->stop_flag;
+        else if (ch->kind == MB_MOTOR_M2006 || ch->kind == MB_MOTOR_M3508 || ch->kind == MB_MOTOR_GM6020)
+            stopped = ((DJIMotorInstance *)ch->motor_ptr)->stop_flag;
+        else
+            continue;
+        if (stopped == MOTOR_STOP ||
+            (MotorBenchGetMeasure(i, &feedback) == MB_OK && !(feedback.status & 1)))
+        {
+            MotorBenchSetEnable(i, 0);
+            MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, 0.0f);
+            LOGWARNING("[motor_bench] ch%u offline: stopped; reconnect requires manual enable", i);
+        }
+    }
     /*
      * 先把 USB 接收队列里积压的数据全部解析掉。
      * @attention 这一步必须在任务上下文做,且要先于任何耗时动作 ——

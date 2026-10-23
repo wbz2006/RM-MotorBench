@@ -26,6 +26,8 @@ import {
   LoopType,
   buildBind,
   buildSetRef,
+  buildPositionStep,
+  parsePositionStepAck,
   buildEnable,
   buildAllStop,
   buildHeartbeat,
@@ -170,6 +172,14 @@ function handleCommand(cmd) {
     case 'setRef':
       writeToSerial(buildSetRef(cmd.channelId, Number(cmd.ref)));
       break;
+    case 'positionStep':
+      try {
+        writeToSerial(buildPositionStep(cmd.channelId, cmd.requestId, cmd.delta));
+      } catch {
+        broadcast({ type: 'positionStepAck', data: { channelId: cmd.channelId,
+          requestId: cmd.requestId, result: MBResult.BAD_PARAM, target: 0 } });
+      }
+      break;
     case 'enable':
       if (cmd.enable) {
         const ref = Number(cmd.ref ?? 0);
@@ -204,7 +214,7 @@ function handleCommand(cmd) {
 
 wss.on('connection', (ws) => {
   broadcast({ type: 'clients', count: wss.clients.size });
-  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels', 'setLoop'] }));
+  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels', 'setLoop', 'positionStep'] }));
   // A page reload does not close the Node-owned USB serial connection.
   ws.send(JSON.stringify({ type: 'serial', open: !!serialPort?.isOpen,
     path: serialPort?.path, baud: serialPort?.baudRate }));
@@ -395,6 +405,9 @@ async function openSerial(portPath, baud) {
         } else if (fr.type === FrameType.LOOP_SET_ACK) {
           const ack = parseLoopSetAck(fr.payload);
           if (ack) broadcast({ type: 'loopAck', data: ack });
+        } else if (fr.type === FrameType.POSITION_STEP_ACK) {
+          const ack = parsePositionStepAck(fr.payload);
+          if (ack) broadcast({ type: 'positionStepAck', data: ack });
         }
       }
     });

@@ -528,6 +528,12 @@ void DJIMotorControl()
         motor = dji_motor_instance[i];
         group = motor->sender_group;
         num = motor->message_num;
+        if (motor->stop_flag != MOTOR_STOP && (!motor->daemon || !DaemonIsOnline(motor->daemon)))
+        {
+            /* Feedback recovery must never resume a previous test target. */
+            DJIMotorStop(motor);
+            motor->motor_controller.pid_ref = 0.0f;
+        }
         if (motor->stop_flag == MOTOR_STOP)
         {
             memset(sender_assignment[group].tx_buff + 2 * num, 0, sizeof(uint16_t));

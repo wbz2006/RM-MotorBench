@@ -16,7 +16,8 @@
     "test:integration": "node integration_test.js",
     "test:motor-state": "node motor_state_test.js",
     "test:setpoint": "node --test setpoint_test.js",
-    "test:calculator": "node --test calculator_test.js"
+    "test:calculator": "node --test calculator_test.js",
+    "test:loader": "node loader_test.cjs"
   },
   "dependencies": {
     "serialport": "^12.0.0",

@@ -1,12 +1,14 @@
 import { calculateLoaderSpeed } from './calculator.js';
+import { initLoaderTest } from './loader-test-ui.js';
 
 const format = value => value !== 0 && Math.abs(value) < 0.001
   ? value.toExponential(3)
   : String(Number(value.toFixed(3)));
 
 /** Each channel owns its inputs and results; onResult only fills its local target. */
-export function initCalculator(host, prefix, onResult) {
+export function initCalculator(host, prefix, onResult, positionAdapter) {
   host.appendChild(document.getElementById('calculatorTpl').content.cloneNode(true));
+  const speedBody = host.querySelector('.calculator-body');
   const get = name => host.querySelector(`[data-calc="${name}"]`);
   for (const input of host.querySelectorAll('[data-calc]')) input.id = `${prefix}-${input.dataset.calc}`;
   for (const label of host.querySelectorAll('[data-calc-for]')) label.htmlFor = `${prefix}-${label.dataset.calcFor}`;
@@ -19,6 +21,7 @@ export function initCalculator(host, prefix, onResult) {
   const prompt = get('calcPrompt');
   const sign = get('calcSign');
   let direction = 1;
+  let type = 'loader';
 
   function update(write = false) {
     let result = null;
@@ -45,7 +48,7 @@ export function initCalculator(host, prefix, onResult) {
       error.textContent = e.message;
       error.hidden = false;
     }
-    onResult(result, write);
+    if (type === 'loader') onResult(result, write);
   }
 
   inputs.forEach(input => input.addEventListener('input', () => update(true)));
@@ -57,5 +60,20 @@ export function initCalculator(host, prefix, onResult) {
     update(true);
   });
   update();
-  return { refresh: () => update(), fill: () => update(true) };
+  const position = initLoaderTest(host, positionAdapter);
+  return {
+    get positionLocked() { return position.locked; },
+    refresh: () => type === 'loader' ? update() : position.refresh(),
+    fill: () => type === 'loader' ? update(true) : position.refresh(),
+    setType(value) {
+      type = value;
+      speedBody.hidden = type !== 'loader';
+      position.show(type === 'loaderPosition');
+      onResult(null, false);
+      if (type === 'loader') update(true);
+    },
+    stopPositionTest: (message, disable) => position.stop(message, disable),
+    positionAck: ack => position.acknowledge(ack),
+    destroy: () => position.destroy(),
+  };
 }

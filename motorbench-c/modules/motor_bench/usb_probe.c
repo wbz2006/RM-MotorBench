@@ -13,7 +13,7 @@
  */
 #include "usb_probe.h"
 #include "bsp_log.h"
-#include "stm32f4xx.h"
+#include "stm32f407xx.h"
 
 /** RTT 上行缓冲容量(BUFFER_SIZE_UP),仅用于说明 */
 #define PROBE_RTT_UP_SIZE 1024u

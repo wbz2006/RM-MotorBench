@@ -8,7 +8,7 @@ import vm from 'node:vm';
 import { MotorKindLabel } from './protocol.js';
 import assert from 'node:assert/strict';
 import { firmwareRoot } from './firmware_test_paths.js';
-import { FrameParser, FrameType, buildEnable, buildSetRef, buildMotorAdd, buildMotorRemove, buildAllStop, buildUnbind, buildHeartbeat, buildSetPid, buildSetLoop, parseHeartbeatAck, parseLoopSetAck, parsePidReport, parseInventory, parseTelemetry, MotorKind, PID_DEFAULTS } from './protocol.js';
+import { FrameParser, FrameType, buildEnable, buildSetRef, buildPositionStep, parsePositionStepAck, buildMotorAdd, buildMotorRemove, buildAllStop, buildUnbind, buildHeartbeat, buildSetPid, buildSetLoop, parseHeartbeatAck, parseLoopSetAck, parsePidReport, parseInventory, parseTelemetry, MotorKind, PID_DEFAULTS } from './protocol.js';
 
 const root = firmwareRoot;
 const supportsAutoReconnect = fs.readFileSync(path.join(root, 'bsp/can/bsp_can.h'), 'utf8').includes('CANServiceTask');
@@ -678,6 +678,111 @@ static int dm_telemetry(void) {
     print_wire("DM_TELEMETRY_WIRE");
     return failures ? 1 : 0;
 }
+static int feeder_steps(void) {
+    MotorBenchInitUSB();
+    Motor_Init_Config_s config = {0};
+    BenchBuildDJIConfig(&config, M2006, &hcan1, 3);
+    DJIMotorInstance *a = DJIMotorInit(&config);
+    CHECK(MotorBenchRegisterMotor(MB_MOTOR_M2006, 1, 3, 0, SPEED_LOOP, a) == MB_OK);
+    /* Feeder step path must preserve large geared moves and reject mid-move retriggers. */
+    CHECK(MotorBenchBind(0, MB_MOTOR_M2006, 1, 3, ALL_THREE_LOOP) == MB_OK);
+    a->daemon->temp_count = 10;
+    float feeder_target = 0;
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_NOT_ENABLED);
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    float feeder_origin = a->measure.total_angle;
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_OK && feeder_target == 45);
+    CHECK(fabsf(a->motor_controller.pid_ref - feeder_origin - 1620) < 0.01f);
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_POSITION_BUSY);
+    a->measure.total_angle = feeder_origin + 1620;
+    CHECK(MotorBenchPositionStep(0, 90, &feeder_target) == MB_OK && feeder_target == 135);
+    a->measure.total_angle = feeder_origin + 4860;
+    CHECK(MotorBenchPositionStep(0, -45, &feeder_target) == MB_OK && feeder_target == 90);
+    a->measure.total_angle = feeder_origin + 3240;
+    for (unsigned n = 0; n < 8; ++n) {
+        CHECK(MotorBenchPositionStep(0, 1620, &feeder_target) == MB_OK);
+        a->measure.total_angle = feeder_origin + feeder_target * 36;
+    }
+    CHECK(feeder_target > 12000); /* No silent truncation by the generic reference limit. */
+    CHECK(MotorBenchPositionStep(0, NAN, &feeder_target) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchPositionStep(0, 0, &feeder_target) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchPositionStep(0, 36001, &feeder_target) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchPositionStep(0, 45, NULL) == MB_ERR_BAD_PARAM);
+    a->daemon->temp_count = 0;
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_FEEDBACK_UNAVAILABLE);
+    a->daemon->temp_count = 10;
+    CHECK(MotorBenchSetRef(0, 10000) == MB_OK && ref(0) == 360); /* Manual guard retained. */
+    a->measure.total_angle = feeder_origin + 360 * 36;
+    receive_hex("${buildHeartbeat().toString('hex')}");
+    receive_hex("${buildPositionStep(0, 123, 45).toString('hex')}");
+    CHECK(ref(0) == 405);
+    print_wire("POSITION_STEP_WIRE");
+    /* A real low-gain position loop stopped ~0.81 output degrees short.
+     * Retrigger must use output degrees like browser completion, not 5 rotor degrees. */
+    a->measure.total_angle = feeder_origin + (405.0f - 0.81f) * 36.0f;
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_OK);
+    CHECK(fabsf(feeder_target - 449.19f) < 0.01f);
+    CHECK(fabsf(a->motor_controller.pid_ref - feeder_origin - feeder_target * 36) < 0.05f);
+    a->measure.total_angle = feeder_origin + (feeder_target - 1.1f) * 36.0f;
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_POSITION_BUSY);
+    CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_NOT_ENABLED);
+    CHECK(MotorBenchSetLoop(0, SPEED_LOOP) == MB_OK);
+    CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_UNSUPPORTED);
+    /* Raw encoder history must not invalidate a fresh relative zero. */
+    for (int direction = -1; direction <= 1; direction += 2) {
+        CHECK(MotorBenchSetLoop(0, ALL_THREE_LOOP) == MB_OK);
+        a->measure.total_angle = direction * 2160000.0f;
+        CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+        MB_TelemetryItem_s t;
+        CHECK(MotorBenchGetMeasure(0, &t) == MB_OK && t.measure_angle == 0 && t.ref == 0);
+        float raw_origin = a->measure.total_angle;
+        CHECK(MotorBenchPositionStep(0, 2880, &feeder_target) == MB_OK);
+        CHECK(feeder_target == 2880);
+        CHECK(a->motor_controller.pid_ref == raw_origin + 2880 * 36);
+        CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    }
+    CHECK(MotorBenchSetLoop(0, ALL_THREE_LOOP) == MB_OK);
+    a->measure.total_angle = 0;
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    for (unsigned group = 0; group < 16; ++group) {
+        CHECK(MotorBenchPositionStep(0, 2880, &feeder_target) == MB_OK);
+        CHECK(feeder_target == (group + 1) * 2880);
+        a->measure.total_angle = feeder_target * 36;
+    }
+    CHECK(a->measure.total_angle > MB_POSITION_TARGET_MAX_DEG);
+    CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    CHECK(MotorBenchPositionStep(0, 80, &feeder_target) == MB_OK && feeder_target == 80);
+    CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    /* Retain the relative session limit even after removing the raw-history limit. */
+    CHECK(MotorBenchSetLoop(0, ALL_THREE_LOOP) == MB_OK);
+    a->measure.total_angle = 0;
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    for (unsigned group = 0; group < 27; ++group) {
+        CHECK(MotorBenchPositionStep(0, 36000, &feeder_target) == MB_OK);
+        a->measure.total_angle = feeder_target * 36;
+    }
+    float retained_ref = ref(0), retained_driver_ref = a->motor_controller.pid_ref;
+    CHECK(MotorBenchPositionStep(0, 36000, &feeder_target) == MB_ERR_POSITION_RANGE);
+    CHECK(ref(0) == retained_ref && a->motor_controller.pid_ref == retained_driver_ref);
+    CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    CHECK(MotorBenchUnbind(0) == MB_OK);
+    /* A physical MIT span still bounds DM steps even though DJI raw history no longer does. */
+    memset(&config, 0, sizeof(config));
+    BenchBuildDMConfig(&config, &hcan1, 6, 0x302);
+    DMMotorInstance *d = DMMotorInit(&config);
+    CHECK(MotorBenchRegisterMotor(MB_MOTOR_DM, 1, 6, 0x302, SPEED_LOOP, d) == MB_OK);
+    CHECK(MotorBenchBind(1, MB_MOTOR_DM, 1, 6, ALL_THREE_LOOP) == MB_OK);
+    d->daemon->temp_count = 10;
+    CHECK(MotorBenchSetEnable(1, 1) == MB_OK);
+    float held_dm_ref = d->pid_ref;
+    CHECK(MotorBenchPositionStep(1, d->p_max * RAD_2_DEGREE + 1, &feeder_target) == MB_ERR_POSITION_RANGE);
+    CHECK(d->pid_ref == held_dm_ref && ref(1) == 0);
+    CHECK(MotorBenchSetEnable(1, 0) == MB_OK);
+    CHECK(MotorBenchUnbind(1) == MB_OK);
+    return failures ? 1 : 0;
+}
 static int position_control(const char *speed_pid, const char *angle_pid, const char *bad_pid) {
     MotorBenchInitUSB();
     Motor_Init_Config_s config = {0};
@@ -699,15 +804,15 @@ static int position_control(const char *speed_pid, const char *angle_pid, const 
         CHECK(fabsf(a->motor_controller.pid_ref - origin) < 0.01f);
         CHECK(MotorBenchSetRef(0, 30) == MB_OK);
         tick();
-        CHECK(fabsf(a->motor_controller.angle_PID.Err - 30) < 0.01f);
-        CHECK(fabsf(a->motor_controller.speed_PID.Ref - 120) < 0.01f);
+        CHECK(fabsf(a->motor_controller.angle_PID.Err - 1080) < 0.01f);
+        CHECK(fabsf(a->motor_controller.speed_PID.Ref - 600) < 0.01f);
         CHECK(output(a) > 0); /* Position PID executes with every legal mask. */
-        a->measure.total_angle = origin + 30;
+        a->measure.total_angle = origin + 30 * 36;
         a->measure.real_current = 0;
         tick();
         CHECK(a->motor_controller.angle_PID.Output == 0);
         CHECK(abs(output(a)) < 2);
-        a->measure.total_angle = origin + 40;
+        a->measure.total_angle = origin + 40 * 36;
         tick(); CHECK(output(a) < 0); /* Overshoot must reverse correction. */
         MB_TelemetryItem_s t;
         CHECK(MotorBenchGetMeasure(0, &t) == MB_OK);
@@ -1221,6 +1326,7 @@ int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "shared-speed-ramp")) return shared_speed_ramp(atoi(argv[2]));
 #endif
 #endif
+    if (argc == 2 && !strcmp(argv[1], "feeder-steps")) return feeder_steps();
     if (argc == 5 && !strcmp(argv[1], "position")) return position_control(argv[2], argv[3], argv[4]);
     if (argc == 4 && !strcmp(argv[1], "rx")) return receive_add(argv[2], argv[3]);
     if (argc == 4 && (!strcmp(argv[1], "reset") || !strcmp(argv[1], "reset-split"))) {
@@ -1393,7 +1499,7 @@ try {
       MotorKindLabel, LoopType:{ANGLE_LOOP:4}, boundLoopMasks:new Map([[0,2]]),
       MOTOR_SPEC:{[MotorKindLabel[MotorKind.DM]]:{range:20.94}},
       pendingLoopChanges:new Map(), pendingUnbindChannels:new Set(),
-      ws:{readyState:1,send:value=>commands.push(JSON.parse(value))},
+      ws:{readyState:1,send:value=>commands.push(JSON.parse(value))}, channelCalculators:new Map(),
       serialConnected:true, boardOnline:true, document:{hidden:false},
       performance:{now:()=>100}, clearTimeout:()=>{},
       telemetryByChannel:new Map([[0,{online:true,receivedAt:99}]]),
@@ -1641,6 +1747,16 @@ int main(void) {
   const exe = path.join(tmp, 'motor_state.exe');
   execFileSync(compiler, ['-std=gnu11', '-O1', '-ffunction-sections', '-fdata-sections',
     ...includes, main, ...sources, '-Wl,--gc-sections', '-lm', '-o', exe], { env, stdio: 'pipe' });
+  {
+    const output = execFileSync(exe, ['feeder-steps'], { env, encoding: 'utf8', stdio: 'pipe' });
+    const stepWire = output.match(/POSITION_STEP_WIRE ([0-9a-f]+)/)?.[1];
+    const stepFrames = new FrameParser().push(Buffer.from(stepWire, 'hex'));
+    assert.deepEqual(stepFrames.filter(f => f.type === FrameType.POSITION_STEP_ACK).map(f => parsePositionStepAck(f.payload)),
+      [{ channelId: 0, requestId: 123, result: 0, target: 405 }]);
+    assert.equal(parseHeartbeatAck(stepFrames.find(f => f.type === FrameType.HEARTBEAT).payload).boardFlags & 14, 14);
+    console.log('PASS single/double large-angle position steps, reverse, busy/offline/stopped guards, firmware ACK, 0.81 output-degree residual, repeated double shots across 1M rotor degrees, large origins, relative limit and retained manual limit');
+  }
+  if (!process.argv.includes('--feeder-only')) {
   let failed = false;
   if (supportsDmSpeedRamp) {
     for (const kind of [1, 2, 3, 4, 5, 6, 7])
@@ -1708,7 +1824,7 @@ int main(void) {
     const fwMinor = Number(fwHeader.match(/#define MB_FW_VERSION_MINOR (\d+)/)[1]);
     assert.equal(heartbeat.payload.length, 8);
     assert.deepEqual(parseHeartbeatAck(heartbeat.payload), {
-      fwVersion: `${fwMajor}.${fwMinor}`, inventoryCount: 3, boardFlags: 1,
+      fwVersion: `${fwMajor}.${fwMinor}`, inventoryCount: 3, boardFlags: 15,
       anyMotorOnline: true, uptimeS: 1, seq: heartbeat.payload.readUInt16LE(6),
     });
     const fragments = new FrameParser();
@@ -1761,6 +1877,7 @@ int main(void) {
     assert.deepEqual(resetAcks.map(f => [f.payload[0], f.payload[1]]),
       Array.from({ length: 8 }, (_, i) => [i, i === 0 || i === 7 ? 0 : 1]));
     process.stdout.write(resetOutput.split('\n').filter(line => !line.includes('_WIRE')).join('\n'));
+  }
   }
 } catch (error) {
   process.stderr.write(String(error.stderr ?? error.stack));

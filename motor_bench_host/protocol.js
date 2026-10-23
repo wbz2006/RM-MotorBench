@@ -30,6 +30,7 @@ export const FrameType = {
   PID_QUERY: 0x0b,
   MOTOR_UNBIND: 0x0c,
   LOOP_SET: 0x0d,
+  POSITION_STEP: 0x0e,
   TELEMETRY: 0x81,
   INVENTORY_REPORT: 0x82,
   MOTOR_ADD_ACK: 0x8a,
@@ -37,6 +38,7 @@ export const FrameType = {
   PID_SET_ACK: 0x8c,
   UNBIND_ACK: 0x8d,
   LOOP_SET_ACK: 0x8e,
+  POSITION_STEP_ACK: 0x8f,
 };
 
 /** 电机种类,需与固件 MB_MotorKind_e 一致 */
@@ -393,6 +395,26 @@ export function buildSetRef(channelId, ref) {
   return buildFrame(FrameType.MOTOR_SET, payload);
 }
 
+/** Bounded position increment: channel(1), request ID(2), output-shaft degrees(4). */
+export function buildPositionStep(channelId, requestId, delta) {
+  if (!Number.isInteger(channelId) || channelId < 0 || channelId > 7 ||
+      !Number.isInteger(requestId) || requestId < 0 || requestId > 65535 ||
+      !Number.isFinite(delta) || Math.abs(delta) < 0.001 || Math.abs(delta) > 36000)
+    throw new Error('位置步进参数无效');
+  const payload = Buffer.alloc(7);
+  payload[0] = channelId;
+  payload.writeUInt16LE(requestId, 1);
+  payload.writeFloatLE(delta, 3);
+  return buildFrame(FrameType.POSITION_STEP, payload);
+}
+
+export function parsePositionStepAck(payload) {
+  if (payload.length !== 8) return null;
+  const target = payload.readFloatLE(4);
+  if (!Number.isFinite(target)) return null;
+  return { channelId: payload[0], requestId: payload.readUInt16LE(1), result: payload[3], target };
+}
+
 /**
  * 使能/停止
  * @param {number} channelId
@@ -449,6 +471,9 @@ export const MBResult = {
   NOT_ENABLED: 4,
   UNSUPPORTED: 5,
   NO_RESOURCE: 6,
+  POSITION_BUSY: 7,
+  FEEDBACK_UNAVAILABLE: 8,
+  POSITION_RANGE: 9,
 };
 
 /** 返回码 → 给人看的原因(直接用于界面提示) */
@@ -462,6 +487,9 @@ export const MBResultText = {
   [MBResult.NOT_ENABLED]: '通道未使能',
   [MBResult.UNSUPPORTED]: '当前固件不支持该操作、电机类型或控制环',
   [MBResult.NO_RESOURCE]: '资源不足:该 CAN 总线的滤波器已用完(每条总线最多 14 颗)',
+  [MBResult.POSITION_BUSY]: '上一位置目标尚未到位（输出轴误差超过 1°），请检查位置/速度 PID 和负载',
+  [MBResult.FEEDBACK_UNAVAILABLE]: '板端位置反馈离线或无效，请检查 CAN 连接与电机反馈',
+  [MBResult.POSITION_RANGE]: '相对本次零点的累计目标超出范围，或超过电调实际位置量程',
 };
 
 /**

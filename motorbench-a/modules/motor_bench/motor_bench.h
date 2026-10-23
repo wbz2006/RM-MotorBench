@@ -35,7 +35,7 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 18
+#define MB_FW_VERSION_MINOR 22
 
 /* Speed-mode target shaping, independent of PID and motor protocol spans. */
 #define MB_SPEED_ACCEL_RAD 100.0f
@@ -60,6 +60,15 @@
 /** 心跳应答负载长度:major/minor/inventory/flags(4) + uptime(2) + seq(2) */
 #define MB_HEARTBEAT_ACK_CRC_LEN 8
 
+/** Feeder action bounds and heartbeat capability bit. */
+#define MB_POSITION_STEP_MAX_DEG 36000.0f
+#define MB_POSITION_TARGET_MAX_DEG 1000000.0f
+#define MB_CAP_POSITION_STEP 0x02u
+#define MB_CAP_SHAFT_POSITION 0x04u
+#define MB_CAP_POSITION_READY 0x08u
+/* Output-shaft degrees, shared by firmware retrigger gate and host readiness. */
+#define MB_POSITION_READY_TOLERANCE_DEG 1.0f
+
 /** 参考值安全限幅,防止误输入打飞电机 */
 #define MB_REF_LIMIT_POS 12000.0f
 #define MB_REF_LIMIT_NEG (-12000.0f)
@@ -74,6 +83,9 @@ typedef enum
     MB_ERR_NOT_ENABLED = 4,     /* 通道未使能,拒绝非零参考值 */
     MB_ERR_UNSUPPORTED = 5,     /* 该电机种类尚未接入 */
     MB_ERR_NO_RESOURCE = 6,     /* 清单已满 */
+    MB_ERR_POSITION_BUSY = 7,   /* Previous position target is outside ready tolerance. */
+    MB_ERR_FEEDBACK_UNAVAILABLE = 8, /* Missing, offline or invalid position feedback. */
+    MB_ERR_POSITION_RANGE = 9,  /* Relative target or physical position span exceeded. */
 } MB_Result_e;
 
 /** 帧类型 */
@@ -102,6 +114,7 @@ typedef enum
     MB_FRAME_PID_QUERY = 0x0B, /* 请求上报单通道三套 PID 参数 */
     MB_FRAME_MOTOR_UNBIND = 0x0C, /* 解绑通道(释放 is_used,否则无法改绑) */
     MB_FRAME_LOOP_SET = 0x0D,     /* channel_id, loop_mask; stop and change bound channel */
+    MB_FRAME_POSITION_STEP = 0x0E, /* channel, request_id(u16), delta_output_deg(float) */
     MB_FRAME_TELEMETRY = 0x81,    /* 板端遥测上报(仅板端发出) */
     MB_FRAME_INVENTORY_REPORT = 0x82, /* 电机清单应答(仅板端发出) */
     MB_FRAME_MOTOR_ADD_ACK = 0x8A,   /* 建电机结果应答(仅板端发出) */
@@ -109,6 +122,7 @@ typedef enum
     MB_FRAME_PID_SET_ACK = 0x8C,     /* PID 写入结果应答(仅板端发出) */
     MB_FRAME_UNBIND_ACK = 0x8D,      /* 解绑结果应答(仅板端发出) */
     MB_FRAME_LOOP_SET_ACK = 0x8E,    /* channel_id, requested loop_mask, result */
+    MB_FRAME_POSITION_STEP_ACK = 0x8F, /* channel, request_id(u16), result, target(float) */
 } MB_FrameType_e;
 
 /** 支持的电机种类,与 motor_def.h / 各驱动一一对应 */
@@ -146,7 +160,7 @@ typedef struct
     Closeloop_Type_e outer_loop;
     uint8_t status_bit_enable;  /* 1=该通道已使能 */
     float ref_cmd;              /* 最近一次下发的参考值,用于上报 */
-    float position_zero;        /* Position origin in degrees, captured on each enable. */
+    float position_zero;        /* Position origin in driver degrees (DJI rotor), captured on each enable. */
 } MB_MotorChannel_s;
 
 /* ============================================================
@@ -206,7 +220,7 @@ typedef struct
     float ref;            /* 当前参考值 */
     float measure_speed;  /* 转速(rpm)或角速度(rad/s),取决于 kind */
     float measure_torque; /* 电流(A)或转矩(N·m) */
-    float measure_angle;  /* 单圈角度(deg) */
+    float measure_angle;  /* deg: position loop = relative gearbox output; other loops = driver angle. */
     int8_t temperature;   /* 温度,未知为 -128 */
 } MB_TelemetryItem_s;
 
@@ -651,6 +665,9 @@ uint8_t MotorBenchSetLoop(uint8_t channel_id, Closeloop_Type_e loop);
  * @attention 未使能时只接受零值;非零值须先使能,再显式下发。值限幅到 ±MB_REF_LIMIT_*。
  */
 uint8_t MotorBenchSetRef(uint8_t channel_id, float ref);
+
+/** Output-shaft degree increment from live feedback; manual targets stay limited to +/-360 degrees. */
+uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *target);
 
 /**
  * @brief 运行期设置某通道某环的 PID 参数

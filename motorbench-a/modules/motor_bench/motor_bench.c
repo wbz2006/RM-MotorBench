@@ -1138,6 +1138,15 @@ uint8_t MotorBenchSetLoop(uint8_t channel_id, Closeloop_Type_e loop)
     return MB_OK;
 }
 
+/* Public position degrees refer to the gearbox output shaft. Drivers and
+ * position_zero retain rotor degrees, so PID tuning and speed units stay intact. */
+static float MotorBenchPositionRatio(MB_MotorKind_e kind)
+{
+    if (kind == MB_MOTOR_M2006) return 36.0f;
+    if (kind == MB_MOTOR_M3508) return 19.0f;
+    return 1.0f;
+}
+
 uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
 {
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used)
@@ -1157,7 +1166,7 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
         if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1) || !isfinite(feedback.measure_angle))
             return MB_ERR_BAD_PARAM;
         /* GetMeasure reports angle relative to the previous origin. */
-        ch->position_zero += feedback.measure_angle;
+        ch->position_zero += feedback.measure_angle * MotorBenchPositionRatio(ch->kind);
     }
     if (!enable || !ch->status_bit_enable)
     {
@@ -1270,9 +1279,9 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
         to_send = limited * RAD_2_DEGREE;
     if (outer & ANGLE_LOOP)
     {
-        /* Position targets are relative degrees, never rpm. */
+        /* Relative output-shaft degrees -> absolute driver degrees. */
         LIMIT_MIN_MAX(limited, -360.0f, 360.0f);
-        to_send = limited + mb_channels[channel_id].position_zero;
+        to_send = limited * MotorBenchPositionRatio(mb_channels[channel_id].kind) + mb_channels[channel_id].position_zero;
         if (MotorBenchIsDMKind(mb_channels[channel_id].kind))
         {
             DMMotorInstance *m = (DMMotorInstance *)mb_channels[channel_id].motor_ptr;
@@ -1290,6 +1299,44 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
      *   存换算后的值会让界面显示 22140 这种吓人的数字。
      */
     mb_channels[channel_id].ref_cmd = limited;
+    return MB_OK;
+}
+
+/* Single/double feeder actions use the same total-angle target as shoot.c.
+ * Reject out-of-range moves instead of silently truncating the requested count. */
+uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *target)
+{
+    if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used || !target ||
+        !isfinite(delta_deg) || fabsf(delta_deg) < 0.001f || fabsf(delta_deg) > MB_POSITION_STEP_MAX_DEG)
+        return MB_ERR_BAD_PARAM;
+    MB_MotorChannel_s *ch = &mb_channels[channel_id];
+    if (!(ch->outer_loop & ANGLE_LOOP))
+        return MB_ERR_UNSUPPORTED;
+    if (!ch->status_bit_enable)
+        return MB_ERR_NOT_ENABLED;
+    MB_TelemetryItem_s feedback;
+    if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1) ||
+        !isfinite(feedback.measure_angle))
+        return MB_ERR_FEEDBACK_UNAVAILABLE;
+    if (fabsf(feedback.measure_angle - ch->ref_cmd) > MB_POSITION_READY_TOLERANCE_DEG)
+        return MB_ERR_POSITION_BUSY;
+    float relative = feedback.measure_angle + delta_deg;
+    float absolute = relative * MotorBenchPositionRatio(ch->kind) + ch->position_zero;
+    /* Raw encoder totals include all prior speed/feeder tests. Only the
+     * target relative to this enable origin is bounded here; a large raw
+     * origin must not reject an otherwise legal move after re-enabling. */
+    if (!isfinite(relative) || !isfinite(absolute) || fabsf(relative) > MB_POSITION_TARGET_MAX_DEG)
+        return MB_ERR_POSITION_RANGE;
+    if (MotorBenchIsDMKind(ch->kind))
+    {
+        DMMotorInstance *m = (DMMotorInstance *)ch->motor_ptr;
+        if (fabsf(absolute) > m->p_max * RAD_2_DEGREE)
+            return MB_ERR_POSITION_RANGE;
+    }
+    if (!MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, absolute))
+        return MB_ERR_UNSUPPORTED;
+    ch->ref_cmd = relative;
+    *target = relative;
     return MB_OK;
 }
 
@@ -1343,7 +1390,7 @@ uint8_t MotorBenchGetMeasure(uint8_t channel_id, MB_TelemetryItem_s *out)
             break;
         out->measure_speed = m->measure.speed_aps / 6.0f; /* aps -> rpm */
         out->measure_torque = (float)m->measure.real_current;
-        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? m->measure.total_angle - ch->position_zero : m->measure.angle_single_round;
+        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? (m->measure.total_angle - ch->position_zero) / MotorBenchPositionRatio(ch->kind) : m->measure.angle_single_round;
         out->temperature = (int8_t)m->measure.temperature;
         /* 先判空再调用,避免 daemon 未注册时解引用空指针 */
         out->status |= (m->daemon && DaemonIsOnline(m->daemon)) ? 0x01 : 0x00;
@@ -1587,6 +1634,17 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
             break;
         case MB_FRAME_MOTOR_SET:
             MotorBenchHandleSetRef(payload, payload_len);
+            break;
+        case MB_FRAME_POSITION_STEP:
+            if (payload_len == 7)
+            {
+                float delta, target = 0.0f;
+                memcpy(&delta, &payload[3], sizeof(delta));
+                uint8_t ack[8] = {payload[0], payload[1], payload[2], 0};
+                ack[3] = MotorBenchPositionStep(payload[0], delta, &target);
+                memcpy(&ack[4], &target, sizeof(target));
+                MotorBenchSendTypedFrame(MB_FRAME_POSITION_STEP_ACK, ack, sizeof(ack));
+            }
             break;
         case MB_FRAME_MOTOR_ENABLE:
             MotorBenchHandleEnable(payload, payload_len);
@@ -2043,7 +2101,7 @@ static void MotorBenchSendHeartbeatAck(void)
     ack.fw_version_minor = MB_FW_VERSION_MINOR;
     ack.uptime_s = (uint16_t)(HAL_GetTick() / 1000);
     ack.motor_inventory_count = mb_inventory_used;
-    ack.board_flags = MotorBenchAnyMotorOnline() ? 0x01 : 0x00;
+    ack.board_flags = (MotorBenchAnyMotorOnline() ? 0x01 : 0x00) | MB_CAP_POSITION_STEP | MB_CAP_SHAFT_POSITION | MB_CAP_POSITION_READY;
 
     uint8_t *p = (uint8_t *)&ack;
     /* CRC 覆盖 type + len + body(len),与 buildFrame() 的规则一致 */
