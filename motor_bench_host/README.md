@@ -11,8 +11,8 @@
 
 ### Windows 桌面便携版
 
-发布文件为 `dist/MotorBench-1.1.0-Windows-x64.exe`（Windows 10/11，64 位）。
-也可从 [GitHub Releases](https://github.com/wbz2006/RM-MotorBench/releases/tag/host-v1.1.0) 下载。
+发布文件为 `dist/MotorBench-1.1.1-Windows-x64.exe`（Windows 10/11，64 位）。
+也可从 [GitHub Releases](https://github.com/wbz2006/RM-MotorBench/releases/tag/host-v1.1.1) 下载。
 直接双击进入独立的电机调试窗口，无需安装 Node.js，也不用另外打开浏览器。
 EXE 内置 Electron、网页界面及串口依赖，可离线使用；电机控制仍需连接主板。
 关闭窗口时，后台先请求电机全停并关闭串口，再退出。重复启动会激活已有窗口。
@@ -29,7 +29,7 @@ npm run build:exe     # 生成 dist 下的单文件便携版
 npm run test:desktop  # 检查打包后的窗口、资源、串口枚举与退出
 ```
 
-对外分发 `MotorBench-1.1.0-Windows-x64.exe` 即可。便携 EXE 会在启动时将运行文件
+对外分发 `MotorBench-1.1.1-Windows-x64.exe` 即可。便携 EXE 会在启动时将运行文件
 解压到临时目录，因此首次启动比后续启动慢。当前发布包未做代码签名。
 
 ### 浏览器开发模式

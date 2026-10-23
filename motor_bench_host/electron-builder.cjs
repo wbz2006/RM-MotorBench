@@ -20,6 +20,10 @@ module.exports = {
   win: {
     target: [{ target: 'portable', arch: ['x64'] }],
     artifactName: 'MotorBench-${version}-Windows-x64.exe',
-    signAndEditExecutable: false,
+    icon: 'assets/icon.ico',
+    // Edit PE resources so the portable executable and taskbar use the app icon.
+    signAndEditExecutable: true,
+    // Preserve the existing unsigned release behavior while editing resources.
+    signExecutable: false,
   },
 };

@@ -10,9 +10,12 @@ import WebSocket from 'ws';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const { version } = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
-const artifact = `MotorBench-${version}-Windows-x64.exe`;
+// Allow release candidates to be tested without replacing the normal dist artifact.
+const artifactPath = process.env.MOTORBENCH_DESKTOP_EXE
+  ? path.resolve(process.env.MOTORBENCH_DESKTOP_EXE)
+  : path.join(root, 'dist', `MotorBench-${version}-Windows-x64.exe`);
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), '电机测试台 发布验证-'));
-const executable = path.join(temp, artifact);
+const executable = path.join(temp, path.basename(artifactPath));
 let child;
 let cdp;
 let exited = false;
@@ -30,7 +33,7 @@ async function until(check, description, timeout = 60000) {
 }
 
 try {
-  await fs.writeFile(executable, await fs.readFile(path.join(root, 'dist', artifact)));
+  await fs.writeFile(executable, await fs.readFile(artifactPath));
   const probe = net.createServer();
   await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));
   const debugPort = probe.address().port;

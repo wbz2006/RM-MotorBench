@@ -10,7 +10,7 @@
 
 | | 桌面便携版（推荐给机械组） | 浏览器版 |
 |---|---|---|
-| 形态 | 单个 `MotorBench-1.1.0-Windows-x64.exe` | `npm start` + 浏览器 |
+| 形态 | 单个 `MotorBench-1.1.1-Windows-x64.exe` | `npm start` + 浏览器 |
 | 前置依赖 | 无（内置 Electron / 网页 / 串口依赖，可离线） | Node.js 22.12+ |
 | 打开方式 | 双击，进入独立调试窗口 | 手动打开 `http://127.0.0.1:3000` |
 | 端口 | 自动选空闲端口，**不占 3000** | 固定 3000（可 `--port` 改） |
@@ -210,7 +210,7 @@ npm run test:desktop       # 检查打包后的窗口、资源、串口枚举与
 ```powershell
 cd motor_bench_host
 npm ci
-npm run build:exe          # 生成 dist/MotorBench-1.1.0-Windows-x64.exe
+npm run build:exe          # 生成 dist/MotorBench-1.1.1-Windows-x64.exe
 ```
 
 ---
