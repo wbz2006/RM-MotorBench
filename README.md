@@ -25,7 +25,7 @@
 
 | | 桌面便携版（推荐给机械组） | 浏览器版 |
 |---|---|---|
-| 形态 | 单个 `MotorBench-1.1.1-Windows-x64.exe` | `npm start` + 浏览器 |
+| 形态 | 单个 `MotorBench-1.2.0-Windows-x64.exe` | `npm start` + 浏览器 |
 | 前置依赖 | 无（内置 Electron / 网页 / 串口依赖，可离线） | Node.js 22.12+ |
 | 打开方式 | 双击，进入独立调试窗口 | 手动打开 `http://127.0.0.1:3000` |
 | 端口 | 自动选空闲端口，**不占 3000** | 固定 3000（可 `--port` 改） |
@@ -184,7 +184,7 @@ npm run test:integration   # 与固件 CRC 表逐字节交叉校验（需 gcc/cl
 npm run test:motor-state   # 编译真实固件控制路径,验证启停/积分残留/增删电机
 npm run test:desktop       # 检查打包后的窗口、资源、串口枚举与退出
 
-npm ci && npm run build:exe   # 打包 dist/MotorBench-1.1.1-Windows-x64.exe（首次需联网下载工具）
+npm ci && npm run build:exe   # 打包 dist/MotorBench-1.2.0-Windows-x64.exe（首次需联网下载工具）
 ```
 
 ## 已知限制

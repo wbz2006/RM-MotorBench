@@ -87,7 +87,7 @@ try {
   const checked = await command('Runtime.evaluate', {
     awaitPromise: true, returnByValue: true,
     expression: `(async () => {
-      const assets = ['index.html', 'ui.js', 'style.css', 'protocol.js', 'chart.js', 'fishbone.js', 'setpoint.js', 'calculator.js', 'calculator-ui.js'];
+      const assets = ['index.html', 'ui.js', 'style.css', 'protocol.js', 'chart.js', 'fishbone.js', 'setpoint.js', 'calculator.js', 'calculator-ui.js', 'loader-test-ui.js'];
       for (const asset of assets) {
         const response = await fetch('/' + asset);
         if (!response.ok || !(await response.text()).length) throw new Error('Missing asset: ' + asset);
