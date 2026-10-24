@@ -100,6 +100,25 @@ export class MotorChart {
     this._dpr = 1;
     this.speedUnit = 'rpm';
     this.torqueUnit = 'raw';
+    this._pointer = null;
+
+    this.tooltip = document.createElement('div');
+    this.tooltip.className = 'chart-tooltip';
+    this.tooltip.hidden = true;
+    canvas.after(this.tooltip);
+    this._onPointerMove = event => {
+      const rect = canvas.getBoundingClientRect();
+      this._pointer = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      this.schedule();
+    };
+    this._onPointerLeave = () => {
+      this._pointer = null;
+      this.tooltip.hidden = true;
+      this.schedule();
+    };
+    canvas.addEventListener('pointermove', this._onPointerMove);
+    canvas.addEventListener('pointerleave', this._onPointerLeave);
+    canvas.addEventListener('pointercancel', this._onPointerLeave);
 
     /*
      * 滤波状态。ref(设定值)不过滤 —— 它是我们自己的指令,
@@ -117,6 +136,7 @@ export class MotorChart {
       ref: css.getPropertyValue('--muted').trim() || '#7a869a',
       grid: css.getPropertyValue('--line').trim() || '#2a3241',
       text: css.getPropertyValue('--text').trim() || '#e6edf3',
+      cursor: css.getPropertyValue('--chart-cursor').trim() || '#ff9f43',
     };
 
     this._ro = new ResizeObserver(() => this.resize());
@@ -126,6 +146,8 @@ export class MotorChart {
 
   /** 按 CSS 尺寸重设画布像素,并按 devicePixelRatio 放大避免模糊 */
   resize() {
+    this._pointer = null;
+    this.tooltip.hidden = true;
     const rect = this.canvas.getBoundingClientRect();
     const w = Math.max(120, rect.width || 600);
     const h = Math.max(80, rect.height || CHART_CSS_H);
@@ -229,6 +251,7 @@ export class MotorChart {
     const plotH = Math.max(10, H - padT - padB);
 
     ctx.clearRect(0, 0, W, H);
+    this.tooltip.hidden = true;
 
     const pts = this.data.slice(-this.window);
 
@@ -330,6 +353,60 @@ export class MotorChart {
     ctx.fillStyle = this.colors.torque;
     ctx.textAlign = 'right';
     ctx.fillText(this.torqueUnit, W - 2, padT + 8);
+
+    this._drawCursor(buckets, xOf, yOfSpeed, yOfTorque, { padL, padT, plotW, plotH });
+  }
+
+  /** 游标与屏幕上的折线插值,读数使用同一套滤波、降采样和双轴映射。 */
+  _drawCursor(pts, xOf, yOfSpeed, yOfTorque, { padL, padT, plotW, plotH }) {
+    if (!this._pointer) return;
+    const { x, y } = this._pointer;
+    if (x < padL || x > padL + plotW || y < padT || y > padT + plotH) return;
+
+    const ctx = this.ctx;
+    ctx.strokeStyle = this.colors.cursor;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+
+    // 未填满窗口的右侧没有曲线,不把末尾数据外推到空白区域。
+    if (x > xOf(pts.length - 1)) return;
+    const index = ((x - padL) / plotW) * (this.window - 1);
+    const left = Math.min(pts.length - 1, Math.floor(index));
+    const a = pts[left];
+    const b = pts[Math.min(left + 1, pts.length - 1)];
+    const mix = key => a[key] + (b[key] - a[key]) * (index - left);
+    const speed = mix('speed');
+    const torque = mix('torque');
+    const ref = mix('ref');
+    if (![speed, torque, ref].every(Number.isFinite)) return;
+
+    for (const [value, yOf, color] of [
+      [ref, yOfSpeed, this.colors.ref],
+      [torque, yOfTorque, this.colors.torque],
+      [speed, yOfSpeed, this.colors.speed],
+    ]) {
+      ctx.beginPath();
+      ctx.arc(x, yOf(value), 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = this.colors.cursor;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    const format = value => Number(value.toFixed(3)).toString();
+    const primary = this.speedUnit === 'deg' ? '实测位置' : '实测转速';
+    this.tooltip.textContent = `${primary}  ${format(speed)} ${this.speedUnit}\n反馈  ${format(torque)} ${this.torqueUnit}\n设定值  ${format(ref)} ${this.speedUnit}`;
+    this.tooltip.hidden = false;
+    // 优先放在游标右上方,靠近边缘时翻到左侧并限制在画布内。
+    const width = this.tooltip.offsetWidth;
+    const height = this.tooltip.offsetHeight;
+    const leftPx = x + 12 + width <= this.cssW ? x + 12 : x - width - 12;
+    this.tooltip.style.left = `${this.canvas.offsetLeft + Math.max(0, leftPx)}px`;
+    this.tooltip.style.top = `${this.canvas.offsetTop + Math.max(padT, Math.min(y - height - 12, padT + plotH - height))}px`;
   }
 
   /**
@@ -383,6 +460,10 @@ export class MotorChart {
   }
 
   destroy() {
+    this.canvas.removeEventListener('pointermove', this._onPointerMove);
+    this.canvas.removeEventListener('pointerleave', this._onPointerLeave);
+    this.canvas.removeEventListener('pointercancel', this._onPointerLeave);
+    this.tooltip.remove();
     this._ro?.disconnect();
     if (this._raf !== null) cancelAnimationFrame(this._raf);
   }

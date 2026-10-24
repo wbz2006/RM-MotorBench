@@ -1,7 +1,17 @@
 # MotorBench A 板固件
 
-本目录是当前固件主工程，基于 STM32F427IIH6、CubeMX 和 CMake/Ninja。旧的
-`../basic_framework_atype_usb-master` 保留为实机可用的 Makefile 参考工程。
+本目录是当前固件主工程，基于 STM32F427IIH6、CubeMX 和 CMake/Ninja。
+旧 Makefile 工程已从当前目录结构移除，需要时可从 Git 历史查看。
+
+## 当前固件 1.26：固化 M2006 位置环参数
+
+A、C、MC02 三套工程的电机控制、默认 PID、位置／拨弹测试、断线恢复与快速归零已对齐。
+心跳新增 `MB_CAP_SPEED_RAMP`（`0x10`），网页按能力显示速度模式的黄色“快速归零”，并保留旧固件兼容。
+1.24 使用心跳 `board_flags` 的 bits 5-6 明确上报板型，A 板为 `0x20`、C 板为 `0x40`、MC02 为 `0x60`；旧固件显示通用“控制板在线”。
+1.26 将用户实机确认的 M2006 位置环参数设为默认：Kp=4、Ki=5、Kd=0、MaxOut=6000 deg/s、IntegralLimit=1000 deg/s，保留积分限幅。网页初始值和“恢复默认值”同步；新建电机实例自动采用，后续仍可整定。
+1.25 新增步进容差能力位 `0x80`：网页与固件共用容差，DJI 进入容差时停止微小追位、保留速度环制动，下一组从原目标累计。内置减速比由网页复选框显式选择，协议角度仍为输出轴度；普通手动位置控制不使用拨弹死区。
+完整对照和保留的板级差异见 [固件功能对照](../docs/FIRMWARE_PARITY.md)。
+运行 `motor_bench_host` 中的 `npm run test:firmware-parity` 可检查后续功能遗漏。
 
 ## 固件 1.18：所有已接入电机共用速度过渡与快速归零
 

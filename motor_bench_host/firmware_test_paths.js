@@ -1,10 +1,10 @@
-// Development defaults to A; select the independent C snapshot for migration checks.
+// Development defaults to A; select C or MC02 for migration checks.
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const project = process.env.MOTORBENCH_FIRMWARE ?? 'motorbench-a';
-if (!['motorbench-a', 'motorbench-c'].includes(project)) {
-  throw new Error('MOTORBENCH_FIRMWARE must be motorbench-a or motorbench-c');
+if (!['motorbench-a', 'motorbench-c', 'motorbench-mc02'].includes(project)) {
+  throw new Error('MOTORBENCH_FIRMWARE must be motorbench-a, motorbench-c or motorbench-mc02');
 }
 
 export const firmwareRelativeRoot = `../${project}/`;

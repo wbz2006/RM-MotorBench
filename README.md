@@ -1,12 +1,27 @@
 # RM-MotorBench · RoboMaster 实验室电机测试台
 
-> 多用途复合电机测试台
+> 多用途复合电机测试台 —— 换电机不烧固件、不改配置，网页上点几下就能测。
 
-一套面向 RoboMaster 实验室的电机测试台：通过**浏览器页面**设定电机种类与转速，指令经 **USB 虚拟串口**下发到永久烧录固件的开发板（**大疆 A 型或 C 型**均可），由开发板驱动 CAN 总线上的常见无刷电机，并**实时回传**转速、电流、温度。
+![RM-MotorBench 整机接线一览：电池 → 分电板 → 开发板 C 型 → CAN 电机（C610 + M2006），开发板 USB 连电脑](docs/images/overview-photo.png)
 
-**核心特性：换电机不需要改配置表、不需要重新烧固件。** 按电调拨码开关上的实际 ID，在网页上现场添加即可。
+网页设定电机种类与转速，指令经 **USB 虚拟串口**下发到永久烧录固件的开发板（支持**大疆 A 型、C 型及达妙 MC02**；MC02 已完成源码迁移和编译，待实机验证），
+由开发板驱动 CAN 总线上的常见无刷电机，转速、电流、温度**实时回传**。
+实验室里机械组想测一颗电机，不用再找电控组改代码、烧板子 —— 配置全在网页上，测试变成点几下的事；
+也适合发射机构简单测试（射频换算 + 拨弹盘实测）和自旋靶车（正弦/阶梯速度输出）这类场景。
 
-上位机提供**两种并行的使用方式**，功能完全相同，按需选择：
+## 核心特性
+
+- **免烧固件换电机**：按电调拨码 ID 在网页现场添加/删除，板端动态建电机
+- **多开发板支持**：多板各自独立固件工程，上位机同一套
+- **速度 / 位置 / 电流三环**：闭环在线切换，PID 网页整定并写入电机
+- **测试工具内建**：实时曲线、正弦/阶梯自动转速输出、射频→转速计算器、单发/双发拨弹位置测试
+- **安全设计**：心跳断链约 1.5s 自动全停；未使能不出力；关页面/关服务下发全停；空格急停
+- **支持型号**：大疆 M3508 / M2006 / GM6020，达妙 DM4310 / DM8009P
+  （岭芯 LK9025、海泰 HT04 底层已接入，待实机验证后开放下拉选项）
+
+## 两种使用方式
+
+功能完全相同、可同时运行，按需选择：
 
 | | 桌面便携版（推荐给机械组） | 浏览器版 |
 |---|---|---|
@@ -16,146 +31,116 @@
 | 端口 | 自动选空闲端口，**不占 3000** | 固定 3000（可 `--port` 改） |
 | 适用 | 日常测电机、分发给机械组 | 改代码、调试上位机本身 |
 
-两者可以**同时运行**：桌面版用随机空闲端口，不会和浏览器版的 3000 冲突。
-下载见 [GitHub Releases](https://github.com/wbz2006/RM-MotorBench/releases)；
-配套固件源码和烧录说明见 [`motorbench-a`](motorbench-a) 与 [`motorbench-c`](motorbench-c)。
-
----
-
-## 为什么做这个
-
-实验室里电机型号多（M3508 / M2006 / GM6020 / 达妙 DM-4310…），机械组想测一颗电机好坏，传统流程是找电控组改代码、重新烧板子。本项目把"配置"从固件里搬到了网页上，让测试变成点几下的事。
-
-同样适用于多种简单的电机使用场景，如**发射机构的简单测试**：搭好拨弹盘后，用上位机的射频换算器，根据每圈发数和减速比换算电机转速，再给 M2006（或 M3508）设定转速，实测拨弹盘性能；**简单的自旋靶车**：单电机固定点旋转，本上位机可生成正弦或阶梯速度输出。
-
----
+下载见 [GitHub Releases](https://github.com/wbz2006/RM-MotorBench/releases)。
 
 ## 系统架构
 
-```
-浏览器 ──WebSocket──> Node 服务 ──USB 虚拟串口──> 开发板 ──CAN──> 电机
-                                                 │
-                                            遥测实时回传
-```
+![系统架构：上位机经 Node 服务与 USB 虚拟串口连接多块开发板，由 CAN 驱动电机并实时回传遥测](docs/images/architecture.png)
 
 | 环节 | 实现 |
 |---|---|
 | 前端 | 原生 Web UI（无框架依赖） |
 | 桥接 | Node + WebSocket + serialport |
-| 传输 | USB OTG FS（CDC 虚拟串口） |
-| 控制 | A 板 STM32F427IIH6 / C 板 STM32F407IGH6 |
+| 传输 | USB CDC 虚拟串口（MC02 使用 HS 外设的全速模式） |
+| 控制 | A 板 STM32F427IIH6 / C 板 STM32F407IGH6 / MC02 STM32H723VGT6 |
 | 驱动 | CAN 总线，支持常见的无刷电机 |
 
----
-
-## 目录结构
+## 目录与文档
 
 | 目录 | 说明 |
 |---|---|
-| [`motorbench-a`](motorbench-a) | **固件主工程**。CubeMX + CMake/Ninja，电机测试台、USB CDC 与动态建电机 |
-| [`motorbench-c`](motorbench-c) | **C板的固件工程** |
-| [`basic_framework_atype_usb-master`](basic_framework_atype_usb-master) | 保留的旧 Makefile 工程，作为已验证可用的参考版本 |
-| [`motor_bench_host`](motor_bench_host) | **上位机**。Node 服务（WebSocket 桥接串口）+ 原生 Web UI；含 Electron 桌面版打包配置 |
-| `电机测试台方案.md` | 完整方案文档（设计推导、协议定义、排查记录） |
-
----
+| [`motorbench-a`](motorbench-a) | **固件主工程**（A 板）。CubeMX + CMake/Ninja，后续开发来源，[固件说明](motorbench-a/README.md) |
+| [`motorbench-c`](motorbench-c) | **C 板固件**。从 A 板迁入的独立快照，不自动同步，[迁移与验证说明](motorbench-c/README.md) |
+| [`motorbench-mc02`](motorbench-mc02) | **MC02 固件**。H723 / FDCAN / USB CDC 独立工程，[迁移与验证说明](motorbench-mc02/README.md) |
+| [`motor_bench_host`](motor_bench_host) | **上位机**。含 Electron 打包配置与详细使用教程，[上位机说明](motor_bench_host/README.md) |
+| [`docs`](docs) | 三板功能对照与文档配图，[固件对照](docs/FIRMWARE_PARITY.md) |
+| [`tools`](tools) | Windows 启动器与文档配图维护脚本，[使用说明](tools/README.md) |
+| `启动电机测试台.bat` | 双击启动浏览器版上位机 |
 
 ## 快速开始
 
-### 1. 编译并烧录固件
+### ① 编译并烧录固件
 
-本项目**同时支持 A 板与 C 板**，两者用各自的工程、各自烧录，上位机是同一套。
+在 VS Code 中打开 `motorbench-a`（A 板）、`motorbench-c`（C 板）或 `motorbench-mc02`（MC02），装好
+**STM32CubeIDE for Visual Studio Code** 扩展（首次使用在其工具管理里装 CMake / Ninja /
+ARM GCC / ST-Link·J-Link），接好供电与 SWD，在「运行和调试」选对应配置按 F5 ——
+编译、下载、运行一步完成。**各板固件不可混用。**
 
-| | A 板 | C 板 |
-|---|---|---|
-| 工程目录 | `motorbench-a` | `motorbench-c` |
-| 主控 | STM32F427IIH6 | STM32F407IGH6 |
-| 调试配置 | `STM32Cube: MotorBench ST-Link` / `J-Link` | `STM32Cube: MotorBench C ST-Link` / `C J-Link` |
-| 产物 | `build/Debug/basic_framework_ATYPE.{elf,hex,bin}` | `build/Debug/basic_framework.{elf,hex,bin}` |
-
-**操作步骤（两板相同）**：在 VS Code 中打开对应工程目录，装好
-**STM32CubeIDE for Visual Studio Code** 扩展（STMicroelectronics 出品），
-编译和烧录均在 VS Code 中完成：
-
-- **烧录 + 调试**：接好开发板电源、SWD 和调试器，「运行和调试」里选上表对应的配置，按 F5
-
-首次使用请在扩展的工具管理界面安装所需的构建/调试工具
-（CMake、Ninja、ARM GCC、ST-Link/J-Link GDB Server）。
-
-> 两板固件**不可混用**（主控与外设不同）。C 板工程是 2026-10-18 从 A 板工作区迁入的阶段快照，
-> 不自动同步 A 板后续开发，详见 [C 板迁移与验证说明](motorbench-c/README.md)。
-
-如果偏好命令行（CI / 脚本化场景），在对应工程目录下执行：
+命令行（可选，CI / 脚本场景）：
 
 ```powershell
-cd motorbench-a        # 或 cd motorbench-c
+cd motorbench-a        # 或 motorbench-c / motorbench-mc02
 cmake --preset Debug
 cmake --build --preset Debug --parallel
 ```
 
-详见 [A 板固件说明](motorbench-a/README.md)。
+详细步骤与调试配置见 [A 板固件说明](motorbench-a/README.md) / [C 板固件说明](motorbench-c/README.md) / [MC02 固件说明](motorbench-mc02/README.md)。三套工程当前功能与验证范围见 [固件功能对照](docs/FIRMWARE_PARITY.md)。
 
-### 2. 启动上位机（两种方式任选）
+### ② 启动上位机
 
-**方式 A：桌面便携版（推荐，无需环境配置）**
+**桌面版**：下载 Release 里的 `MotorBench-x.x.x-Windows-x64.exe` 双击即可，无需装 Node.js；
+关闭窗口自动全停并退出，重复双击只激活已有窗口。
 
-下载 Release 里的 `MotorBench-x.x.x-Windows-x64.exe`，双击即可。
-它会拉起一个独立的「电机测试台」窗口，内部已经带好网页界面和串口依赖，**不用装 Node.js，也不用另开浏览器**。
-
-- 关闭窗口时，后台会先请求电机全停、关闭串口，再退出
-- 重复双击不会开第二个窗口，而是激活已有窗口
-- 端口自动选空闲端口，不会和下面方式 B 的 3000 端口冲突，**两者可同时开**
-
-**方式 B：浏览器版**
+**浏览器版**：
 
 ```powershell
 cd motor_bench_host
 npm install
-npm start
+npm start             # 打开 http://127.0.0.1:3000
 ```
 
-浏览器打开 **http://127.0.0.1:3000**
+改 `server.js` / `protocol.js` 后需重启 Node 服务；只改 HTML/CSS/网页脚本刷新即可。
 
-改 `server.js` 或 `protocol.js` 后要重启 Node 服务；只改 HTML/CSS/网页脚本时刷新即可。
-只刷新网页**不会**更新后台已加载的代码。
+### ③ 添加电机并测试
 
-> 两种方式功能完全一致，共用同一套逻辑
+![上位机界面：① 连接控制板 ② ＋ 添加电机 ③ 电机通道卡片 ④ 全部急停](docs/images/ui-annotated.png)
 
-### 3. 使用流程（已添加较详细使用教程）
+1. XT30 接 **24V** 电源，USB 线接开发板 Micro-USB
+2. 网页选串口 → 打开（Windows 设备管理器里产品名 `Motor Bench CDC`，普通 USB 线即可）
+3. 右上角 `＋` 添加电机：型号 / 总线 / 电调 ID（按电调拨码实际值填）
+4. 通道卡片里选电机 → 绑定 → 使能 → 拖动滑块设转速
+5. 列表行末 `×` 移除电机；结束时「停机」或按空格急停
 
-1. XT30 接 **24V** 电源
-2. USB 线接 开发板 Micro-USB
-3. 网页/程序选择串口 → 打开
-4. 右上角 `＋` 添加电机：型号 / 总线 / 电调 ID
-5. 通道卡片里选电机 → 绑定 → 使能 → 拖动滑块设转速
-6. 列表里每行末尾 `×` 可移除该电机
-
----
+更多操作细节（拨弹测试、PID 整定、自动输出、计算器、页面引导）见
+[上位机说明](motor_bench_host/README.md)。
 
 ## ⚠️ CAN ID 规则（重要）
+
+同一 CAN 总线的反馈 ID 不能重复：
 
 | 电机 | 反馈 ID |
 |---|---|
 | GM6020 | `0x204 + ID` |
 | M3508 / M2006 | `0x200 + ID` |
 
-两段区间**重叠**（`0x205~0x208`），所以：
+两段区间在 `0x205~0x208` **重叠**：GM6020 的 ID 1~4 与 M3508/M2006 的 ID 5~8 互相冲突。
+添加前页面会列出冲突对象和当前型号可用的 ID；也可以把冲突电机接到不同 CAN 总线。
 
-同一 CAN 总线的反馈 ID 不能重复：GM6020 ID 1～4 分别与 M3508/M2006 ID 5～8 冲突。
-添加前，页面会提示冲突对象并列出**当前型号**可用的 ID；也可以将冲突电机接到不同 CAN 总线。
-
----
+**达妙 DM-4310 / DM8009P** 走 MIT 协议，TX（控制指令）与 RX（反馈）是两个独立 ID，
+界面上按十六进制分别填（例如 TX `06`、RX `302`）；大疆系只填 1~8 拨码 ID，
+反馈 ID 由固件按 `0x200+ID` / `0x204+ID` 推算。
 
 ## 硬件连接
 
+下图即全部动力接线：24V 电源经 XT30 进板，CAN 出板接电调/电机——**最后补一条 USB 线连接板上 Micro-USB（丝印 USB）与电脑**即可；USB 只走数据，供电仍由 XT30 24V 提供。
+
+![开发板 C 型连接 M3508 电机（经 C620 电调）](docs/images/wiring-c-m3508.png)
+
+![开发板 C 型连接 GM6020 电机（CAN 直连）](docs/images/wiring-c-gm6020.png)
+
+> 图源：DJI《RoboMaster 开发板 C 型嵌入式软件教程文档》第 14 课"效果演示"（© 2020 DJI）。
+> A 板接线结构相同（XT30 供电 / CAN 到电调 / Micro-USB 上位），仅接口丝印位置不同。
+
+> 🐶 **接线前请电控过目**：XT30 反接、CAN H/L 互换、24V 短路——烧掉的都是真金白银，多问一句不亏。
+
+> ⚠️ **MC02 的 2-pin CAN 接口线序与大疆 A/C 板不一致**：给大疆板子压好的 CAN 线直接插到 MC02 上 H/L 是反的，接 MC02 时请按其接口丝印重新核对线序，不要沿用大疆板的线。
+
 | 接口 | 用途 |
 |---|---|
-| A板/C板+电机的XT30 | 供电 |
+| XT30 | A板/C板 + 电机的 24V 供电 |
 | Micro-USB | USB 通信（OTG FS，PA11/PA12） |
-| SWD（仅烧录程序使用） | 调试下载（PA13/PA14） |
+| SWD | 仅烧录程序使用（PA13/PA14） |
 | CAN1 / CAN2 | 接电机电调/电机本体 |
-
----
 
 ## 通信协议
 
@@ -167,7 +152,7 @@ npm start
 
 - `crc8` 覆盖 `type + len + body`
 - 支持流式重同步：帧头误判时右移一字节继续查找
-- 上位机与固件端均有 CRC 交叉校验测试
+- 上位机与固件端有 CRC 交叉校验测试（`npm run test:integration`）
 
 主要帧类型：
 
@@ -186,50 +171,32 @@ npm start
 | INVENTORY_REPORT | `0x82` | 上行 | 清单应答 |
 | MOTOR_ADD_ACK | `0x8A` | 上行 | 建/拆电机结果 |
 
-**达妙 DM-4310 的两个 ID**：DM 走 MIT 协议，发送与接收是独立 ID——
-`TX`（主机→电机的控制指令）与 `RX`（电调→主机的反馈，主机的 CAN 过滤器按它匹配）。
-界面上直接填十六进制，例如 TX `06`、RX `302`。DJI 系只需填 1~8 的电调拨码 ID，
-反馈 ID 由固件按 `0x200+ID` / `0x204+ID` 算出。
+闭环切换、拨弹步进等后续新增帧的完整定义见固件
+[协议头文件](motorbench-a/modules/motor_bench/motor_bench.h)与[三板功能对照](docs/FIRMWARE_PARITY.md)。
 
-**安全设计**：心跳中断约 1.5s 自动全停；通道未使能时拒绝写参考值；关闭网页/服务时下发全停。
-
----
-
-## 测试
+## 测试与打包
 
 ```powershell
 cd motor_bench_host
 npm test                   # 协议自测（含 DOM/CSS 契约与界面接线断言）
-npm run test:integration   # 与固件 CRC 表逐字节交叉校验
+npm run test:integration   # 与固件 CRC 表逐字节交叉校验（需 gcc/clang）
 npm run test:motor-state   # 编译真实固件控制路径,验证启停/积分残留/增删电机
 npm run test:desktop       # 检查打包后的窗口、资源、串口枚举与退出
+
+npm ci && npm run build:exe   # 打包 dist/MotorBench-1.1.1-Windows-x64.exe（首次需联网下载工具）
 ```
-
-桌面版打包（需 Node.js 22.12+，首次下载打包工具需联网）：
-
-```powershell
-cd motor_bench_host
-npm ci
-npm run build:exe          # 生成 dist/MotorBench-1.1.1-Windows-x64.exe
-```
-
----
 
 ## 已知限制
 
 - **电机清单不跨断电保留**：重新上电后板端清单为空，需在网页重新添加
 - PID 需按实际电机与负载整定，网页默认值只是起点
-- 同总线 6020 与 3508/2006 存在部分冲突（见上文 ID 规则）
-
----
+- 同总线 GM6020 与 M3508/M2006 的 ID 区间部分冲突（见上文规则）
 
 ## 致谢
 
 - 跃鹿 `basic_framework`：[Gitee](https://gitee.com/hnuyuelurm/basic_framework)
 - A 板适配版基础：[basic_framework_atype](https://gitee.com/hnuyuelurm/basic_framework_atype)
 
----
-
 ## 许可
 
-本项目基于 `basic_framework` 二次修改，请遵循原项目的许可要求。
+本项目基于 `basic_framework` 二次修改，原框架 MIT 许可见 [LICENSE](LICENSE)，第三方库保留各自许可文件。

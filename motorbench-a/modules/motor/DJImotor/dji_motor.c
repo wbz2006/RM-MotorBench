@@ -511,6 +511,7 @@ void DJIMotorChangeLoop(DJIMotorInstance *motor, Closeloop_Type_e loop)
 // 设置参考值
 void DJIMotorSetRef(DJIMotorInstance *motor, float ref)
 {
+    motor->position_deadband = 0.0f;
     motor->motor_controller.pid_ref = ref;
 }
 
@@ -574,7 +575,15 @@ void DJIMotorControl()
             else
                 pid_measure = measure->total_angle; // MOTOR_FEED,对total angle闭环,防止在边界处出现突跃
             // 更新pid_ref进入下一个环
-            pid_ref = PIDCalculate(&motor_controller->angle_PID, pid_measure, pid_ref);
+            if (motor->position_deadband > 0.0f && fabsf(pid_ref - pid_measure) <= motor->position_deadband)
+            {
+                /* Keep the nominal target, but brake through the speed loop
+                 * instead of crawling after the last fraction of a step. */
+                PIDReset(&motor_controller->angle_PID);
+                pid_ref = 0.0f;
+            }
+            else
+                pid_ref = PIDCalculate(&motor_controller->angle_PID, pid_measure, pid_ref);
         }
 
         // 计算速度环,(外层闭环为速度或位置)且(启用速度环)时会计算速度环

@@ -17,8 +17,8 @@
 #   无需重复声明。这里只处理"必须是 CRLF"和"绝不能转换"两类。
 
 # ---- 批处理脚本:仓库内保持 CRLF,禁止任何自动转换 ----
-*.bat   -text
-*.cmd   -text
+*.bat   -text whitespace=cr-at-eol
+*.cmd   -text whitespace=cr-at-eol
 
 # ---- 构建产物:绝不转换(换行符转换会直接损坏二进制) ----
 *.hex   -text

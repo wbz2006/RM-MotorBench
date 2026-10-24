@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101211" />
     <title>MOTORBENCH / 电机测试台</title>
-    <link rel="stylesheet" href="style.css?v=20261023-loader-range" />
+    <link rel="stylesheet" href="style.css?v=20261024-loader-control" />
   </head>
   <body>
     <a class="skip-link" href="#channels">跳转到电机通道</a>
@@ -30,13 +30,13 @@
     <header class="topbar" id="top">
       <div class="brand">
         <span class="brand-word">MOTOR<span>BENCH</span><span class="brand-cursor" aria-hidden="true">_</span></span>
-        <span class="hardware-tag">A-TYPE <span>/</span> USB</span>
+        <span class="hardware-tag">MULTI-BOARD <span>/</span> USB</span>
       </div>
       <div class="link-state">
         <span class="link-label"><span class="dot" id="linkDot"></span><span id="linkText">未连接</span></span>
         <span class="fw" id="fwText"></span>
       </div>
-      <button id="estop" class="estop" title="立即停止全部电机（快捷键：空格，页面需处于焦点）" aria-keyshortcuts="Space"><span class="stop-square" aria-hidden="true"></span>急停 <span>ALL STOP · SPACE</span></button>
+      <button id="estop" class="estop" title="立即停止全部电机（快捷键：空格，页面需处于焦点）" aria-keyshortcuts="Space"><span class="stop-square" aria-hidden="true"></span>全部急停 <kbd>空格 / SPACE</kbd></button>
     </header>
 
     <div class="workspace">
@@ -69,15 +69,24 @@
       <div class="section-heading"><h2><span>01</span> 设备接入</h2><span>DEVICE SETUP</span></div>
 
     <section class="panel setup" id="setup" aria-label="设备接入与电机管理">
-      <div class="setup-group" role="group" aria-label="连接 A 板">
+      <div class="setup-group" role="group" aria-label="连接控制板">
         <div class="group-heading"><span class="group-marker" aria-hidden="true">↳</span><strong>连接控制板</strong><span>SERIAL LINK</span></div>
         <label>串口
-          <select id="portSelect" title="选择 A 板的 USB 虚拟串口"><option value="">点击刷新…</option></select>
+          <select id="portSelect" title="选择控制板的 USB 串口；不确定时可展开下方教程"><option value="">点击刷新…</option></select>
         </label>
         <button id="refreshPorts" title="重新扫描本机串口">刷新</button>
         <button id="openPort" class="primary" title="打开所选串口">连接</button>
         <button id="closePort" class="ghost" title="关闭串口">关闭</button>
         <button id="rescan" class="ghost" title="从板端同步电机列表">同步清单</button>
+        <details class="context-help serial-help">
+          <summary>如何选择正确的串口？</summary>
+          <ol>
+            <li>右键点击 Windows 的“开始”图标，选择“设备管理器”。</li>
+            <li>展开“端口（COM 和 LPT）”，查看现有的 COM 端口。</li>
+            <li>插拔控制板的 USB 数据线，观察哪个端口在拔下时消失、插回时出现，记下它的 COM 编号（例如 COM5）。</li>
+            <li>回到本页，点击“刷新”，在“串口”中选择相同的 COM 编号，再点击“连接”。</li>
+          </ol>
+        </details>
         <div class="connection-status" aria-label="通信状态"><span id="serviceState">服务 · 连接中</span><span id="boardState">控制板 · 未连接</span><span id="feedbackState">电机反馈 · 未就绪</span></div>
         <p id="connectionMessage" class="setup-message" role="status" aria-live="polite">连接控制板后，等待板端应答。</p>
         <p id="connectionError" class="setup-message error" role="status" hidden></p>
@@ -149,29 +158,30 @@
     <template id="loaderTestTpl">
       <div class="loader-test" hidden>
         <div class="loader-test-settings">
-          <label>拨盘每圈发数 <span>发/圈</span><input data-test="rounds" type="number" min="1" step="1" placeholder="按实际拨盘填写" /></label>
-          <label>传动方式<select data-test="drive"><option value="direct">输出轴直连 · 1:1</option><option value="reduction">减速传动</option></select></label>
-          <label data-test="ratioWrap" hidden>外部减速比 <span>输出轴 : 拨盘</span><input data-test="ratio" type="number" min="0" step="any" value="1" /></label>
-          <label>每次触发<select data-test="shots"><option value="1">单发 · 1 发</option><option value="2">双发 · 2 发</option></select></label>
-          <label>转动方向<select data-test="direction"><option value="1">正向 +</option><option value="-1">反向 −</option></select></label>
-          <label>到位容差 <span>输出轴 ° · 0.001～1</span><input data-test="tolerance" type="number" min="0.001" max="1" step="0.001" value="1" /></label>
+          <label><span class="loader-field-title">拨盘每圈发数 <small>发/圈</small></span><input data-test="rounds" type="number" min="1" step="1" placeholder="按实际拨盘填写" /></label>
+          <label><span class="loader-field-title">传动方式</span><select data-test="drive"><option value="direct">直连 · 1:1</option><option value="reduction">外部减速传动</option></select></label>
+          <label data-test="ratioWrap" hidden><span class="loader-field-title">外部减速比 <small>轴 : 拨盘</small></span><input data-test="ratio" type="number" min="0" step="any" value="1" /></label>
+          <label><span class="loader-field-title">每次触发</span><select data-test="shots"><option value="1">单发 · 1 发</option><option value="2">双发 · 2 发</option></select></label>
+          <label><span class="loader-field-title">转动方向</span><select data-test="direction"><option value="1">正向 +</option><option value="-1">反向 −</option></select></label>
+          <label><span class="loader-field-title">到位容差 <small>步进 % · 0.1～10</small></span><input data-test="tolerance" type="number" min="0.1" max="10" step="0.1" value="5" /></label>
         </div>
-        <p class="calculator-note">单发输出轴角度 = 360° × 外部减速比 ÷ 每圈发数。M2006 内置 36:1、M3508 内置 19:1 已由固件换算，请勿重复填写；拨盘直接接输出轴时选直连。</p>
+        <label class="loader-gearbox" data-test="gearboxWrap" hidden><input data-test="gearbox" type="checkbox" /><span data-test="gearboxLabel">计入电机内置减速箱</span></label>
+        <p class="calculator-note" data-test="formula"></p>
         <p data-test="ratioHint" class="preset-status error" hidden></p>
         <div class="loader-test-readouts">
-          <span>单发输出轴角度 <output data-test="perShot">—</output>°</span>
-          <span>本次步进 <output data-test="delta">—</output>°</span>
-          <span>本次目标 <output data-test="target">—</output>°</span>
-          <span>实测位置 <output data-test="angle">—</output>°</span>
-          <span>剩余误差 <output data-test="positionError">—</output>°</span>
-          <span>判定容差 <output data-test="effectiveTolerance">—</output>°</span>
+          <span>单发角度 <span><output data-test="perShot">—</output>°</span></span>
+          <span>本次步进 <span><output data-test="delta">—</output>°</span></span>
+          <span>本次目标 <span><output data-test="target">—</output>°</span></span>
+          <span>实测位置 <span><output data-test="angle">—</output>°</span></span>
+          <span>剩余误差 <span><output data-test="positionError">—</output>°</span></span>
+          <span>判定容差 <span><output data-test="effectiveTolerance">—</output>°</span></span>
           <span>指令发数 <output data-test="requested">0</output></span>
           <span>到位发数 <output data-test="completed">0</output></span>
         </div>
         <div class="preset-actions"><button type="button" class="ghost" data-test="start">准备并开始测试</button><button type="button" class="ghost" data-test="stop" disabled>退出测试并停机</button></div>
         <button type="button" class="loader-test-pad" data-test="pad" disabled aria-label="拨弹测试触发区"><strong data-test="padLabel">鼠标左键按下触发</strong><span>每次按下执行一组 · 长按不重复 · 到位并松开后可再次触发</span></button>
         <p data-test="status" class="preset-status" role="status">填写参数后，使用上方按钮切换位置环、使能并开始测试。</p>
-        <p class="calculator-note">连续 3 帧进入到位容差后允许下一组，实际容差最多为本次步进的 10%。容差仅用于计数，电机仍保持原位置目标。测试期间锁定上方滑块、角度输入及归零按钮；空格急停始终有效。</p>
+        <p class="calculator-note">到位容差默认本次步进的 5%，连续两帧进入容差即可完成。DJI 电机在容差内停止微小追位，速度环继续制动；下一次从原目标累计，避免逐发丢失角度。测试期间锁定滑块、角度输入及归零；空格急停始终有效。</p>
       </div>
     </template>
 
@@ -362,7 +372,7 @@
             <button data-role="chartClear" class="ghost" title="清空历史采样">清空</button>
           </div>
           <canvas data-role="chart" width="600" height="170"
-                  role="img" aria-label="转速与电流实时曲线,数值变化见曲线走势"></canvas>
+                  role="img" aria-label="电机实时曲线，移动鼠标可通过橙色竖线读取各曲线交点值"></canvas>
           <!--
             空态占位:通道还没收到遥测时曲线是一片纯黑,看上去像坏了。
             用一行说明替代"看着像故障的空白"。
@@ -501,13 +511,11 @@
 
     <footer class="hint">
       <p>
-        <span class="footer-label">SYS / SAFETY · UI 20261023-loader-range</span> 电机登记并绑定后，需显式使能才会跟随目标。
-        <strong>未使能前电机不出力</strong>;约 1.5 秒收不到上位机心跳,A 板会自动全停;
-        页面处于焦点时，按空格立即全停（输入框内同样有效）；关闭本页面或按 Ctrl+C 退出服务时也会下发全停。
+        <span class="footer-label">UI 20261024-loader-control</span>
       </p>
     </footer>
     </div>
 
-    <script type="module" src="ui.js?v=20261023-loader-range"></script>
+    <script type="module" src="ui.js?v=20261024-loader-control"></script>
   </body>
 </html>

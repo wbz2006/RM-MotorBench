@@ -250,9 +250,14 @@ static uint8_t MotorBenchUsbPump(void)
          * 的 USB_OTG_INEndpointTypeDef:900h + ep_num*20h)。
          * 注意别写成 0x808 —— 那是 DSTS(设备状态),不是端点寄存器。
          */
-        volatile uint32_t *diepts0 = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x900);
-        volatile uint32_t *dieptsiz0 = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x910);
-        volatile uint32_t *dtxfsts = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x918);
+#if defined(STM32H723xx)
+        const uintptr_t usb_base = USB_OTG_HS_PERIPH_BASE;
+#else
+        const uintptr_t usb_base = USB_OTG_FS_PERIPH_BASE;
+#endif
+        volatile uint32_t *diepts0 = (volatile uint32_t *)(usb_base + 0x900);
+        volatile uint32_t *dieptsiz0 = (volatile uint32_t *)(usb_base + 0x910);
+        volatile uint32_t *dtxfsts = (volatile uint32_t *)(usb_base + 0x918);
 
         LOGINFO("[tx] pump chunk=%u ret=%u head=%u tail=%u DIEPTS0=0x%08X DIEPTSIZ0=0x%08X DTXFSTS=0x%08X",
                 chunk, tx_ret, mb_usb_tx_head, tail,
@@ -1129,6 +1134,7 @@ uint8_t MotorBenchSetLoop(uint8_t channel_id, Closeloop_Type_e loop)
         return MB_ERR_UNSUPPORTED;
     ch->outer_loop = loop;
     ch->position_zero = 0.0f; /* Next enable captures a fresh position origin. */
+    ch->position_step_tolerance = 0.0f;
     ch->ref_cmd = 0.0f;
     MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, 0.0f);
     /* Never mix samples collected in different units in the next telemetry. */
@@ -1175,6 +1181,7 @@ uint8_t MotorBenchSetEnable(uint8_t channel_id, uint8_t enable)
         if (!MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, zero_ref))
             return MB_ERR_UNSUPPORTED;
         ch->ref_cmd = 0.0f;
+        ch->position_step_tolerance = 0.0f;
     }
     if (!MotorBenchEnableInstance(ch->kind, ch->motor_ptr, enable))
         return MB_ERR_UNSUPPORTED;
@@ -1299,15 +1306,18 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref)
      *   存换算后的值会让界面显示 22140 这种吓人的数字。
      */
     mb_channels[channel_id].ref_cmd = limited;
+    mb_channels[channel_id].position_step_tolerance = 0.0f;
     return MB_OK;
 }
 
 /* Single/double feeder actions use the same total-angle target as shoot.c.
  * Reject out-of-range moves instead of silently truncating the requested count. */
-uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *target)
+static uint8_t MotorBenchPositionStepImpl(uint8_t channel_id, float delta_deg, float tolerance_deg, float *target, uint8_t extended)
 {
     if (channel_id >= MB_CHANNEL_MAX || !mb_channels[channel_id].is_used || !target ||
         !isfinite(delta_deg) || fabsf(delta_deg) < 0.001f || fabsf(delta_deg) > MB_POSITION_STEP_MAX_DEG)
+        return MB_ERR_BAD_PARAM;
+    if (extended && (!isfinite(tolerance_deg) || tolerance_deg <= 0.0f || tolerance_deg > fabsf(delta_deg) * 0.100001f))
         return MB_ERR_BAD_PARAM;
     MB_MotorChannel_s *ch = &mb_channels[channel_id];
     if (!(ch->outer_loop & ANGLE_LOOP))
@@ -1318,9 +1328,10 @@ uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *targe
     if (MotorBenchGetMeasure(channel_id, &feedback) != MB_OK || !(feedback.status & 1) ||
         !isfinite(feedback.measure_angle))
         return MB_ERR_FEEDBACK_UNAVAILABLE;
-    if (fabsf(feedback.measure_angle - ch->ref_cmd) > MB_POSITION_READY_TOLERANCE_DEG)
+    float ready_tolerance = ch->position_step_tolerance > 0.0f ? ch->position_step_tolerance : MB_POSITION_READY_TOLERANCE_DEG;
+    if (fabsf(feedback.measure_angle - ch->ref_cmd) > ready_tolerance)
         return MB_ERR_POSITION_BUSY;
-    float relative = feedback.measure_angle + delta_deg;
+    float relative = (extended ? ch->ref_cmd : feedback.measure_angle) + delta_deg;
     float absolute = relative * MotorBenchPositionRatio(ch->kind) + ch->position_zero;
     /* Raw encoder totals include all prior speed/feeder tests. Only the
      * target relative to this enable origin is bounded here; a large raw
@@ -1335,9 +1346,22 @@ uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *targe
     }
     if (!MotorBenchSetRefInstance(ch->kind, ch->motor_ptr, absolute))
         return MB_ERR_UNSUPPORTED;
+    ch->position_step_tolerance = extended ? tolerance_deg : 0.0f;
+    if (extended && (ch->kind == MB_MOTOR_M2006 || ch->kind == MB_MOTOR_M3508 || ch->kind == MB_MOTOR_GM6020))
+        ((DJIMotorInstance *)ch->motor_ptr)->position_deadband = tolerance_deg * MotorBenchPositionRatio(ch->kind);
     ch->ref_cmd = relative;
     *target = relative;
     return MB_OK;
+}
+
+uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *target)
+{
+    return MotorBenchPositionStepImpl(channel_id, delta_deg, MB_POSITION_READY_TOLERANCE_DEG, target, 0);
+}
+
+uint8_t MotorBenchPositionStepWithTolerance(uint8_t channel_id, float delta_deg, float tolerance_deg, float *target)
+{
+    return MotorBenchPositionStepImpl(channel_id, delta_deg, tolerance_deg, target, 1);
 }
 
 void MotorBenchEmergencyStop(void)
@@ -1636,12 +1660,18 @@ static void MotorBenchDispatch(uint8_t *buf, uint16_t len)
             MotorBenchHandleSetRef(payload, payload_len);
             break;
         case MB_FRAME_POSITION_STEP:
-            if (payload_len == 7)
+            if (payload_len == 7 || payload_len == 11)
             {
-                float delta, target = 0.0f;
+                float delta, tolerance, target = 0.0f;
                 memcpy(&delta, &payload[3], sizeof(delta));
                 uint8_t ack[8] = {payload[0], payload[1], payload[2], 0};
-                ack[3] = MotorBenchPositionStep(payload[0], delta, &target);
+                if (payload_len == 11)
+                {
+                    memcpy(&tolerance, &payload[7], sizeof(tolerance));
+                    ack[3] = MotorBenchPositionStepWithTolerance(payload[0], delta, tolerance, &target);
+                }
+                else
+                    ack[3] = MotorBenchPositionStep(payload[0], delta, &target);
                 memcpy(&ack[4], &target, sizeof(target));
                 MotorBenchSendTypedFrame(MB_FRAME_POSITION_STEP_ACK, ack, sizeof(ack));
             }
@@ -2101,7 +2131,7 @@ static void MotorBenchSendHeartbeatAck(void)
     ack.fw_version_minor = MB_FW_VERSION_MINOR;
     ack.uptime_s = (uint16_t)(HAL_GetTick() / 1000);
     ack.motor_inventory_count = mb_inventory_used;
-    ack.board_flags = (MotorBenchAnyMotorOnline() ? 0x01 : 0x00) | MB_CAP_POSITION_STEP | MB_CAP_SHAFT_POSITION | MB_CAP_POSITION_READY;
+    ack.board_flags = (MotorBenchAnyMotorOnline() ? 0x01 : 0x00) | MB_CAP_POSITION_STEP | MB_CAP_SHAFT_POSITION | MB_CAP_POSITION_READY | MB_CAP_SPEED_RAMP | MB_CAP_STEP_TOLERANCE | MB_BOARD_FLAG;
 
     uint8_t *p = (uint8_t *)&ack;
     /* CRC 覆盖 type + len + body(len),与 buildFrame() 的规则一致 */

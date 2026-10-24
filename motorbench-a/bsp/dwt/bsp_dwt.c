@@ -20,6 +20,9 @@ static uint64_t CYCCNT64;
 static uint32_t DWT_ReadCycles(void)
 {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+#if defined(__CORTEX_M) && (__CORTEX_M == 7U)
+    DWT->LAR = 0xC5ACCE55u; /* Cortex-M7 cycle counter requires an unlock. */
+#endif
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     return DWT->CYCCNT;
 }
@@ -44,6 +47,9 @@ void DWT_Init(uint32_t CPU_Freq_mHz)
     /* 使能DWT外设 */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 
+#if defined(__CORTEX_M) && (__CORTEX_M == 7U)
+    DWT->LAR = 0xC5ACCE55u;
+#endif
     /* DWT CYCCNT寄存器计数清0 */
     DWT->CYCCNT = (uint32_t)0u;
 

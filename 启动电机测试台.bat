@@ -13,7 +13,7 @@ cd /d "%~dp0motor_bench_host"
 
 echo.
 echo  ==========================================
-echo    RM Motor Bench   (DJI A-board)
+echo    RM Motor Bench   (A / C / MC02)
 echo  ==========================================
 echo.
 echo  [1/4] Work dir: %CD%

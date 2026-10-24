@@ -1,0 +1,106 @@
+#ifndef DMMOTOR_H
+#define DMMOTOR_H
+#include <stdint.h>
+#include "bsp_can.h"
+#include "controller.h"
+#include "motor_def.h"
+#include "daemon.h"
+
+#define DM_MOTOR_CNT 4
+
+#define DM_P_MIN  (-12.5f)
+#define DM_P_MAX  12.5f
+/* DM-J4310-2EC V1.1: MIT spans read from the user's tuning assistant.
+ * Protocol TMAX is an encoding span, not the motor's working torque. */
+#define DM_V_MIN  (-30.0f)
+#define DM_V_MAX  30.0f
+#define DM_T_MIN  (-10.0f)
+#define DM_T_MAX   10.0f
+#define DM4310_RATED_TORQUE 3.0f
+#define DM4310_PEAK_TORQUE  7.0f
+/* 24 V output-shaft no-load speed: 200 rpm; independent of MIT VMAX. */
+#define DM4310_24V_SPEED_LIMIT 20.94f
+/* DM8009P keeps its independent, previously verified MIT spans. */
+#define DM8009P_V_MAX 45.0f
+#define DM8009P_T_MAX 54.0f
+
+typedef enum
+{
+    DM_MODEL_4310 = 0,
+    DM_MODEL_8009P,
+} DMMotorModel_e;
+
+typedef struct 
+{
+    uint8_t id;
+    uint8_t state;
+    float velocity;
+    float last_position;
+    float position;
+    float torque;
+    float T_Mos;
+    float T_Rotor;
+    int32_t total_round;
+}DM_Motor_Measure_s;
+
+typedef struct
+{
+    uint16_t position_des;
+    uint16_t velocity_des;
+    uint16_t torque_des;
+    uint16_t Kp;
+    uint16_t Kd;
+}DMMotor_Send_s;
+
+typedef struct 
+{
+    DM_Motor_Measure_s measure;
+    Motor_Control_Setting_s motor_settings;
+    PIDInstance current_PID;
+    PIDInstance speed_PID;
+    PIDInstance angle_PID;
+    float *other_angle_feedback_ptr;
+    float *other_speed_feedback_ptr;
+    float *speed_feedforward_ptr;
+    float *current_feedforward_ptr;
+    float pid_ref;
+    SpeedRamp_s speed_ramp; /* rad/s^2; position mode bypasses shaping */
+    DMMotorModel_e model;
+    float p_max;
+    float v_max;
+    float t_max;
+    Motor_Working_Type_e stop_flag;
+    CANInstance *motor_can_instace;
+    DaemonInstance *daemon;
+    uint32_t lost_cnt;
+    uint32_t last_disable_ms;
+    uint32_t last_query_ms;
+}DMMotorInstance;
+
+typedef enum
+{
+    DM_CMD_MOTOR_MODE = 0xfc,
+    DM_CMD_RESET_MODE = 0xfd,
+    DM_CMD_ZERO_POSITION = 0xfe,
+    DM_CMD_CLEAR_ERROR = 0xfb
+}DMMotor_Mode_e;
+
+DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config);
+/** Each instance keeps its own MIT limits; legacy init defaults to DM4310. */
+DMMotorInstance *DMMotorInitWithModel(Motor_Init_Config_s *config, DMMotorModel_e model);
+/** Stop and remove the instance from control, CAN and daemon registries. */
+void DMMotorDestroy(DMMotorInstance *motor);
+
+void DMMotorSetRef(DMMotorInstance *motor, float ref);
+
+void DMMotorOuterLoop(DMMotorInstance *motor, Closeloop_Type_e closeloop_type);
+
+void DMMotorEnable(DMMotorInstance *motor);
+
+void DMMotorStop(DMMotorInstance *motor);
+
+void DMMotorCaliEncoder(DMMotorInstance *motor);
+
+void DMMotorControl(void);
+
+#endif // !DMMOTOR

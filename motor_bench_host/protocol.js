@@ -15,6 +15,16 @@ export const FRAME_TAIL = 0x5a;
 /** 单帧最大负载长度,需与固件 MB_PAYLOAD_MAX 一致(越界即判为假帧头) */
 export const MAX_PAYLOAD = 64;
 
+/** Heartbeat board identity is independent of motor/capability flags and firmware version. */
+export function boardLabelFromFlags(flags) {
+  switch (flags & 0x60) {
+    case 0x20: return 'A 板';
+    case 0x40: return 'C 板';
+    case 0x60: return 'MC02 板';
+    default: return '控制板'; // Old firmware remains unnamed.
+  }
+}
+
 /** 帧类型,需与固件 MB_FrameType_e 一致 */
 export const FrameType = {
   HEARTBEAT: 0x01,
@@ -396,15 +406,18 @@ export function buildSetRef(channelId, ref) {
 }
 
 /** Bounded position increment: channel(1), request ID(2), output-shaft degrees(4). */
-export function buildPositionStep(channelId, requestId, delta) {
+export function buildPositionStep(channelId, requestId, delta, tolerance) {
   if (!Number.isInteger(channelId) || channelId < 0 || channelId > 7 ||
       !Number.isInteger(requestId) || requestId < 0 || requestId > 65535 ||
       !Number.isFinite(delta) || Math.abs(delta) < 0.001 || Math.abs(delta) > 36000)
     throw new Error('位置步进参数无效');
-  const payload = Buffer.alloc(7);
+  if (tolerance !== undefined && (!Number.isFinite(tolerance) || tolerance <= 0 || tolerance > Math.abs(delta) * 0.100001))
+    throw new Error('位置步进容差无效');
+  const payload = Buffer.alloc(tolerance === undefined ? 7 : 11);
   payload[0] = channelId;
   payload.writeUInt16LE(requestId, 1);
   payload.writeFloatLE(delta, 3);
+  if (tolerance !== undefined) payload.writeFloatLE(tolerance, 7);
   return buildFrame(FrameType.POSITION_STEP, payload);
 }
 
@@ -617,7 +630,7 @@ export const PID_DEFAULTS = {
   [MotorKind.M2006]: {
     speed: { Kp: 2, Ki: 0, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
     current: { Kp: 0.7, Ki: 0.1, Kd: 0, MaxOut: 5000, IntegralLimit: 5000, improve: 0 },
-    angle: { Kp: 4, Ki: 0, Kd: 0, MaxOut: 600, IntegralLimit: 0, improve: 1 },
+    angle: { Kp: 4, Ki: 5, Kd: 0, MaxOut: 6000, IntegralLimit: 1000, improve: 1 },
   },
   // 大疆 GM6020
   [MotorKind.GM6020]: {

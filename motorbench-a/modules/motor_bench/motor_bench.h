@@ -35,7 +35,18 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 22
+#define MB_FW_VERSION_MINOR 26
+
+/* Heartbeat flags bits 5-6 identify the compiled board; 0 means unknown. */
+#if defined(STM32F427xx)
+#define MB_BOARD_FLAG 0x20u
+#elif defined(STM32F407xx)
+#define MB_BOARD_FLAG 0x40u
+#elif defined(STM32H723xx)
+#define MB_BOARD_FLAG 0x60u
+#else
+#define MB_BOARD_FLAG 0x00u
+#endif
 
 /* Speed-mode target shaping, independent of PID and motor protocol spans. */
 #define MB_SPEED_ACCEL_RAD 100.0f
@@ -66,6 +77,8 @@
 #define MB_CAP_POSITION_STEP 0x02u
 #define MB_CAP_SHAFT_POSITION 0x04u
 #define MB_CAP_POSITION_READY 0x08u
+#define MB_CAP_STEP_TOLERANCE 0x80u
+#define MB_CAP_SPEED_RAMP 0x10u
 /* Output-shaft degrees, shared by firmware retrigger gate and host readiness. */
 #define MB_POSITION_READY_TOLERANCE_DEG 1.0f
 
@@ -161,6 +174,7 @@ typedef struct
     uint8_t status_bit_enable;  /* 1=该通道已使能 */
     float ref_cmd;              /* 最近一次下发的参考值,用于上报 */
     float position_zero;        /* Position origin in driver degrees (DJI rotor), captured on each enable. */
+    float position_step_tolerance; /* Previous feeder ready gate, in output-shaft degrees; 0 = manual. */
 } MB_MotorChannel_s;
 
 /* ============================================================
@@ -668,6 +682,8 @@ uint8_t MotorBenchSetRef(uint8_t channel_id, float ref);
 
 /** Output-shaft degree increment from live feedback; manual targets stay limited to +/-360 degrees. */
 uint8_t MotorBenchPositionStep(uint8_t channel_id, float delta_deg, float *target);
+/** Extended feeder action: shared completion/ready tolerance, cumulative targets. */
+uint8_t MotorBenchPositionStepWithTolerance(uint8_t channel_id, float delta_deg, float tolerance_deg, float *target);
 
 /**
  * @brief 运行期设置某通道某环的 PID 参数

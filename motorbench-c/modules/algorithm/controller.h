@@ -25,6 +25,22 @@
 #define abs(x) ((x > 0) ? x : -x)
 #endif
 
+/* Motor loops run every 1-2 ms; a 100 ms gap invalidates their history. */
+#define PID_MAX_INTERVAL_S 0.1f
+
+/* Rates use the driver's speed units per second; rate=0 bypasses shaping. */
+typedef struct
+{
+    float rate;
+    float zero_rate;
+    float ref;
+    uint32_t clock;
+} SpeedRamp_s;
+
+void SpeedRampReset(SpeedRamp_s *ramp, float measured_speed);
+/* Returns 0 on invalid timing/state; the caller must latch the motor off. */
+uint8_t SpeedRampApply(SpeedRamp_s *ramp, float target, float *ref);
+
 // PID 优化环节使能标志位,通过位与可以判断启用的优化环节;也可以改成位域的形式
 typedef enum
 {
@@ -135,5 +151,8 @@ void PIDReset(PIDInstance *pid);
  * @return float  PID计算输出
  */
 float PIDCalculate(PIDInstance *pid, float measure, float ref);
+
+/* Skip this sample's integral increment while retaining holding torque and timing. */
+float PIDCalculateWithIntegralHold(PIDInstance *pid, float measure, float ref, uint8_t hold_integral);
 
 #endif

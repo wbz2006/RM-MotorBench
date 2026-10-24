@@ -15,6 +15,17 @@ static uint32_t CPU_FREQ_Hz, CPU_FREQ_Hz_ms, CPU_FREQ_Hz_us;
 static uint32_t CYCCNT_RountCount;
 static uint32_t CYCCNT_LAST;
 static uint64_t CYCCNT64;
+/* A debugger can clear trace/cycle-counter enables on detach. Restore them
+ * whenever firmware reads the clock, without resetting its accumulated count. */
+static uint32_t DWT_ReadCycles(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+#if defined(__CORTEX_M) && (__CORTEX_M == 7U)
+    DWT->LAR = 0xC5ACCE55u; /* Cortex-M7 cycle counter requires an unlock. */
+#endif
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    return DWT->CYCCNT;
+}
 //原神启动！！！
 /**
  * @brief 私有函数,用于检查DWT CYCCNT寄存器是否溢出,并更新CYCCNT_RountCount
@@ -23,7 +34,7 @@ static uint64_t CYCCNT64;
  */
 static void DWT_CNT_Update(void)
 {
-    volatile uint32_t cnt_now = DWT->CYCCNT;
+    volatile uint32_t cnt_now = DWT_ReadCycles();
 
     if (cnt_now < CYCCNT_LAST)
         CYCCNT_RountCount++;
@@ -36,6 +47,9 @@ void DWT_Init(uint32_t CPU_Freq_mHz)
     /* 使能DWT外设 */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 
+#if defined(__CORTEX_M) && (__CORTEX_M == 7U)
+    DWT->LAR = 0xC5ACCE55u;
+#endif
     /* DWT CYCCNT寄存器计数清0 */
     DWT->CYCCNT = (uint32_t)0u;
 
@@ -50,7 +64,7 @@ void DWT_Init(uint32_t CPU_Freq_mHz)
 
 float DWT_GetDeltaT(uint32_t *cnt_last)
 {
-    volatile uint32_t cnt_now = DWT->CYCCNT;
+    volatile uint32_t cnt_now = DWT_ReadCycles();
     float dt = ((uint32_t)(cnt_now - *cnt_last)) / ((float)(CPU_FREQ_Hz));
     *cnt_last = cnt_now;
 
@@ -61,7 +75,7 @@ float DWT_GetDeltaT(uint32_t *cnt_last)
 
 double DWT_GetDeltaT64(uint32_t *cnt_last)
 {
-    volatile uint32_t cnt_now = DWT->CYCCNT;
+    volatile uint32_t cnt_now = DWT_ReadCycles();
     double dt = ((uint32_t)(cnt_now - *cnt_last)) / ((double)(CPU_FREQ_Hz));
     *cnt_last = cnt_now;
 
@@ -72,7 +86,7 @@ double DWT_GetDeltaT64(uint32_t *cnt_last)
 
 void DWT_SysTimeUpdate(void)
 {
-    volatile uint32_t cnt_now = DWT->CYCCNT;
+    volatile uint32_t cnt_now = DWT_ReadCycles();
     static uint64_t CNT_TEMP1, CNT_TEMP2, CNT_TEMP3;
 
     DWT_CNT_Update();
@@ -116,20 +130,20 @@ uint64_t DWT_GetTimeline_us(void)
 
 void DWT_Delay(float Delay)
 {
-    uint32_t tickstart = DWT->CYCCNT;
+    uint32_t tickstart = DWT_ReadCycles();
     float wait = Delay;
 
-    while ((DWT->CYCCNT - tickstart) < wait * (float)CPU_FREQ_Hz)
+    while ((DWT_ReadCycles() - tickstart) < wait * (float)CPU_FREQ_Hz)
     {
     }
 }
 
 void DWT_Delay_ms(float Delay)
 {
-    uint32_t tickstart = DWT->CYCCNT;
+    uint32_t tickstart = DWT_ReadCycles();
     float wait = Delay*0.001;
 
-    while ((DWT->CYCCNT - tickstart) < wait * (float)CPU_FREQ_Hz)
+    while ((DWT_ReadCycles() - tickstart) < wait * (float)CPU_FREQ_Hz)
     {
     }
 }

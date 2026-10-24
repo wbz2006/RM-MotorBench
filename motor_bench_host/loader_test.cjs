@@ -34,10 +34,10 @@ if (!process.versions.electron) {
     const motor = { kind: 3, canBus: 1, motorId: 1, rxId: 0 };
     wss.on('connection', ws => {
       socket = ws;
-      ws.send(JSON.stringify({ type: 'hello', capabilities: ['resetChannels', 'setLoop', 'positionStep'] }));
+      ws.send(JSON.stringify({ type: 'hello', capabilities: ['resetChannels', 'setLoop', 'positionStep', 'positionStepTolerance'] }));
       ws.send(JSON.stringify({ type: 'serial', open: true, path: 'MOCK-LOADER' }));
       pulse = setInterval(() => {
-        if (++ticks % 6 === 0) send('heartbeat', { fwVersion: '1.22', boardFlags: capability ? 15 : 7, uptimeS: 10 });
+        if (++ticks % 6 === 0) send('heartbeat', { fwVersion: '1.25', boardFlags: capability ? 159 : 31, uptimeS: 10 });
         if (emitTelemetry) feedback();
       }, 50);
       ws.on('message', raw => {
@@ -65,7 +65,7 @@ if (!process.versions.electron) {
     }
     const steps = () => commands.filter(c => c.type === 'positionStep');
     const acknowledge = (command, result = 0) => {
-      ref = angle + command.delta;
+      ref += command.delta;
       send('positionStepAck', { channelId: 0, requestId: command.requestId, result, target: ref });
     };
     async function start() {
@@ -93,7 +93,10 @@ if (!process.versions.electron) {
       await click('[data-role=calculatorTab]');
       await evaluate('document.querySelector("[data-role=calculatorType]").value="loaderPosition"; document.querySelector("[data-role=calculatorType]").dispatchEvent(new Event("change"))');
       await input('rounds', '8');
-      assert.equal(await value('perShot'), '45');
+      assert.equal(await value('perShot'), '45', 'M2006 gearing is opt-in');
+      assert.equal(await evaluate('document.querySelector("[data-test=gearbox]").checked'), false);
+      await evaluate('document.querySelector("[data-test=gearbox]").click()');
+      assert.equal(await value('perShot'), '1620');
       assert.equal(await evaluate('document.querySelector("[data-test=start]").disabled'), false, 'calculator offers position setup in speed mode');
       await click('[data-test=start]');
       await until(() => evaluate('document.querySelector("[data-role=unit]").textContent === "deg"'), 'position mode');
@@ -110,10 +113,10 @@ if (!process.versions.electron) {
       acknowledge(steps()[0]);
       await until(async () => await value('requested') === '1', 'accepted counter');
       assert.equal(await value('completed'), '0');
-      angle = ref - 1.2;
+      angle = ref - 2.5;
       await delay(250);
-      assert.equal(await value('completed'), '0', 'position outside 1 degree remains busy');
-      assert.match(await text('status'), /剩余 1.2°.*容差 1°/);
+      assert.equal(await value('completed'), '0', 'position outside shared 5% tolerance remains busy');
+      assert.match(await text('status'), /剩余 90°.*容差 81°/);
       angle = ref - 0.81; // Actual reported residual: ~0.81 output degrees, not exact target.
       await until(async () => await value('completed') === '1', 'single settles with real residual');
       await pointer('pointerdown');
@@ -129,26 +132,16 @@ if (!process.versions.electron) {
       acknowledge(steps()[1]); angle = ref;
       await until(async () => await value('completed') === '3', 'double settled');
       assert.equal(await value('requested'), '3');
-      assert.equal(await value('target'), '134.19');
+      assert.equal(await value('target'), '4860', 'nominal pitch is retained across residuals');
       // Feedback can move outside the ready tolerance after the three settled samples.
       // Reject locally before sending a request that the board would reject as busy.
-      angle = ref + 1.2;
+      angle = ref + 4.6;
       await delay(150);
       await pointer('pointerdown'); await pointer('pointerup');
       assert.equal(steps().length, 2, 'drift outside ready tolerance does not send a step');
       assert.match(await text('padLabel'), /等待回稳/);
       angle = ref;
       await delay(150);
-      if (process.env.MOTORBENCH_LOADER_SCREENSHOTS) {
-        fs.mkdirSync(process.env.MOTORBENCH_LOADER_SCREENSHOTS, { recursive: true });
-        for (const width of [1440, 390]) {
-          win.setSize(width, 1050);
-          await evaluate('document.querySelector(".loader-test").scrollIntoView({block:"center"})');
-          await delay(200);
-          assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'no horizontal overflow');
-          fs.writeFileSync(path.join(process.env.MOTORBENCH_LOADER_SCREENSHOTS, `loader-${width}.png`), (await win.webContents.capturePage()).toPNG());
-        }
-      }
       await click('[data-test=stop]');
       await until(() => !enabled, 'exit disables motor');
       assert.equal(await evaluate('document.querySelector("[data-role=num]").disabled'), false);
@@ -190,28 +183,100 @@ if (!process.versions.electron) {
       acknowledge(steps()[5]); angle = ref - 0.81;
       await delay(250);
       assert.equal(await value('completed'), '0', 'strict tolerance is respected, not a forced unlock');
-      assert.equal(await value('positionError'), '0.81');
-      assert.equal(await value('effectiveTolerance'), '0.1');
-      angle = ref - 0.05;
+      assert.equal(await value('positionError'), '29.16');
+      assert.equal(await value('effectiveTolerance'), '1.62');
+      angle = ref - 0.02;
       await until(async () => await value('completed') === '1', 'strict precision settles');
       await click('[data-test=stop]');
       await until(() => !enabled, 'strict precision exit');
       await input('tolerance', '0');
       assert.equal(await evaluate('document.querySelector("[data-test=start]").disabled'), true, 'zero tolerance rejected');
-      await input('tolerance', '1.1');
-      assert.equal(await evaluate('document.querySelector("[data-test=start]").disabled'), true, 'above firmware tolerance rejected');
-      await input('tolerance', '1');
+      await input('tolerance', '10.1');
+      assert.equal(await evaluate('document.querySelector("[data-test=start]").disabled'), true, 'above 10% tolerance rejected');
+      await input('tolerance', '5');
       await input('drive', 'reduction');
       await input('ratio', '36');
       assert.equal(await evaluate('document.querySelector("[data-test=ratioHint]").hidden'), false);
-      assert.match(await text('ratioHint'), /内置 36:1 已自动换算/);
+      assert.match(await text('ratioHint'), /避免与已勾选的内置减速箱重复计算/);
       await input('drive', 'direct');
       assert.equal(await evaluate('document.querySelector("[data-test=ratioHint]").hidden'), true);
+      // Exercise both built-in gearboxes through the real calculator adapter.
+      const gearing = await evaluate(`(async () => {
+        const { initLoaderTest } = await import('./loader-test-ui.js');
+        const results = [];
+        for (const builtInRatio of [36, 19]) {
+          const host = document.createElement('div'); document.body.appendChild(host);
+          let command;
+          const test = initLoaderTest(host, {
+            getState: () => ({ builtInRatio, positionMode:true, enabled:true, angle:0, ref:0, tolerance:1, receivedAt:performance.now() }),
+            disable() {}, displayTarget() {}, onLockChange() {}, trigger(step) { command = step; }
+          });
+          test.show(true);
+          const get = name => host.querySelector('[data-test="' + name + '"]');
+          get('rounds').value = '8'; get('rounds').dispatchEvent(new Event('input'));
+          const uncheckedAngle = get('perShot').value;
+          get('start').click(); get('pad').click();
+          const unchecked = { ...command };
+          test.stop(); get('gearbox').click();
+          const checkedAngle = get('perShot').value;
+          get('start').click(); get('pad').click();
+          results.push({ builtInRatio, uncheckedAngle, checkedAngle, unchecked, checked:{ ...command } });
+          test.destroy(); host.remove();
+        }
+        return results;
+      })()`);
+      for (const result of gearing) {
+        assert.equal(result.uncheckedAngle, '45');
+        assert.equal(result.checkedAngle, String(45 * result.builtInRatio));
+        assert.equal(result.unchecked.delta, 45 / result.builtInRatio);
+        assert.equal(result.unchecked.tolerance, 2.25 / result.builtInRatio);
+        assert.equal(result.checked.delta, 45);
+        assert.equal(result.checked.tolerance, 2.25);
+      }
+      const layout = () => evaluate(`(() => {
+        const root = document.querySelector('.loader-test');
+        const r = root.querySelector('.loader-test-readouts').getBoundingClientRect();
+        const button = root.querySelector('[data-test=start]').getBoundingClientRect();
+        const fields = [...root.querySelectorAll('.loader-test-settings label:not([hidden])')].map(label => {
+          const l = label.getBoundingClientRect(), c = label.querySelector('input,select').getBoundingClientRect();
+          return { top:l.top, controlTop:c.top, controlHeight:c.height };
+        });
+        return { width:r.width, height:r.height, rootHeight:root.getBoundingClientRect().height, buttonOffset:button.top-r.top, fields };
+      })()`);
+      emitTelemetry = false;
+      for (const width of [1440, 860, 390, 320]) {
+        win.setSize(width, 1050);
+        angle = 0; feedback(); await delay(80);
+        const before = await layout();
+        for (const sample of [-0.001, 138.646, -999999.999, 999999.999]) {
+          angle = sample; feedback(); await delay(30);
+          const after = await layout();
+          assert.equal(after.height, before.height, 'numeric changes preserve readout height');
+          assert.equal(after.rootHeight, before.rootHeight, 'numeric changes preserve calculator height');
+          assert.equal(after.buttonOffset, before.buttonOffset, 'numeric changes do not move buttons');
+        }
+        for (const field of before.fields) {
+          assert.equal(field.controlTop - field.top, 44, 'all field controls share the same label height');
+          assert.equal(field.controlHeight, 36);
+        }
+        assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true,
+          `no horizontal overflow at ${width}px: ` + JSON.stringify(await evaluate(`
+            [...document.querySelectorAll('body *')].filter(e => e.getBoundingClientRect().right > innerWidth + 1)
+              .map(e => ({tag:e.tagName, class:e.className, text:e.textContent.slice(0,70), right:e.getBoundingClientRect().right})).slice(-12)`)));
+        if (process.env.MOTORBENCH_LOADER_SCREENSHOTS) {
+          fs.mkdirSync(process.env.MOTORBENCH_LOADER_SCREENSHOTS, { recursive:true });
+          angle = 138.646; feedback(); await delay(40);
+          await evaluate('document.querySelector(".loader-test").scrollIntoView({block:"center"})');
+          fs.writeFileSync(path.join(process.env.MOTORBENCH_LOADER_SCREENSHOTS, `loader-${width}.png`), (await win.webContents.capturePage()).toPNG());
+        }
+      }
+      angle = ref; emitTelemetry = true;
       capability = false;
-      await delay(350);
+      send('heartbeat', { fwVersion: '1.25', boardFlags: 31, uptimeS: 10 });
+      await until(() => evaluate('document.querySelector("[data-test=start]").disabled'), 'old firmware capability received');
       assert.equal(await evaluate('document.querySelector("[data-test=start]").disabled'), true, 'old firmware stays blocked');
       assert.deepEqual(exceptions, []);
-      console.log('PASS loader browser: 45/90 output-shaft degree single/double, calculator mode/enable controls, locked manual input, hold/release/busy guards, ACK and settled counters with 0.81 degree residual, adjustable strict tolerance, drift preflight and repeated gearing hint, reverse, rejection, blur, stale telemetry, old firmware and late ACK');
+      console.log('PASS loader browser: M2006/M3508 opt-in gearing and rotor readouts, shared percentage tolerance, cumulative targets, single/double counts, hold/busy/drift guards, emergency stop and connection failures; stable numeric layout and aligned fields at 1440/860/390/320px');
     } finally {
       clearTimeout(timeout); clearInterval(pulse); win?.destroy();
       for (const client of wss.clients) client.terminate();

@@ -1,0 +1,51 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "MotorBench MC02 DAPLink (OpenOCD)",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/Basic_Framework_MC02.elf",
+            "servertype": "openocd",
+            "serverpath": "openocd",
+            "gdbPath": "arm-none-eabi-gdb",
+            "device": "STM32H723VG",
+            "interface": "swd",
+            "configFiles": ["${workspaceFolder}/openocd_dap.cfg"],
+            "runToEntryPoint": "main",
+            "preLaunchTask": "Build Debug"
+        },
+        {
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: MotorBench MC02 ST-Link",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "deviceName": "STM32H723VGT6",
+            "deviceCore": "Cortex-M7",
+            "runEntry": "main",
+            "serverInterface": "SWD",
+            "imagesAndSymbols": [
+                {"imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"}
+            ]
+        },
+        {
+            "type": "jlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: MotorBench MC02 J-Link",
+            "origin": "snippet",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "deviceName": "STM32H723VGT6",
+            "deviceCore": "Cortex-M7",
+            "serverDevice": "STM32H723VG",
+            "runEntry": "main",
+            "serverInterface": "SWD",
+            "imagesAndSymbols": [
+                {"imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}"}
+            ]
+        }
+    ]
+}

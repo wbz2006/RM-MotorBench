@@ -17,14 +17,20 @@ export function initLoaderTest(host, adapter) {
   let message = '';
   let error = false;
   let target = null;
+  let lastTolerance = null;
 
   function parameters() {
-    const step = calculateLoaderStep(get('drive').value === 'direct' ? 1 : get('ratio').valueAsNumber,
+    const builtInRatio = adapter.getState().builtInRatio;
+    const reduction = (get('drive').value === 'direct' ? 1 : get('ratio').valueAsNumber) *
+      (get('gearbox').checked ? builtInRatio : 1);
+    const step = calculateLoaderStep(reduction,
       get('rounds').valueAsNumber, Number(get('shots').value), Number(get('direction').value));
-    const tolerance = get('tolerance').valueAsNumber;
-    if (!Number.isFinite(tolerance) || tolerance < 0.001 || tolerance > 1)
-      throw new Error('到位容差需为 0.001～1° 输出轴角度');
-    return { ...step, tolerance: Math.min(tolerance, Math.abs(step.delta) / 10) };
+    const percent = get('tolerance').valueAsNumber;
+    if (!Number.isFinite(percent) || percent < 0.1 || percent > 10)
+      throw new Error('到位容差需为本次步进的 0.1～10%');
+    if (Math.abs(step.delta / builtInRatio) < 0.001)
+      throw new Error('本次输出轴步进需至少为 0.001°，请减小每圈发数或增大传动比');
+    return { ...step, tolerance: Math.abs(step.delta) * percent / 100, builtInRatio };
   }
 
   function stop(reason = '测试已退出', disable = true) {
@@ -58,10 +64,10 @@ export function initLoaderTest(host, adapter) {
       }
       if (move.ack && state.receivedAt !== move.lastSample) {
         move.lastSample = state.receivedAt;
-        const atTarget = Math.abs(state.ref - move.target) < 0.1 &&
-          Math.abs(state.angle - move.target) <= move.tolerance;
+        const atTarget = Math.abs(state.ref - move.target) < 0.01 &&
+          Math.abs(state.angle - move.target) <= move.tolerance / move.builtInRatio;
         move.settled = atTarget ? move.settled + 1 : 0;
-        if (move.settled >= 3) {
+        if (move.settled >= 2) {
           completed += move.shots;
           move = null;
           message = '本组已到位 · 松开后可再次按下';
@@ -69,23 +75,27 @@ export function initLoaderTest(host, adapter) {
       }
     }
     get('ratioWrap').hidden = get('drive').value === 'direct';
-    const repeatedGearbox = get('drive').value === 'reduction' && state.builtInRatio > 1 &&
+    get('gearboxWrap').hidden = state.builtInRatio <= 1;
+    get('gearboxLabel').textContent = `计入电机内置减速箱 · ${state.builtInRatio}:1`;
+    get('formula').textContent = `本区角度均为${state.builtInRatio > 1 ? '转子' : '电机轴'}角度。单发角度 = 360° × 外部减速比${get('gearbox').checked && state.builtInRatio > 1 ? ` × 内置 ${state.builtInRatio}:1` : ''} ÷ 每圈发数；${state.builtInRatio > 1 ? '内置减速比仅在勾选时计入。' : '直连时减速比为 1。'}`;
+    const repeatedGearbox = get('gearbox').checked && get('drive').value === 'reduction' && state.builtInRatio > 1 &&
       get('ratio').valueAsNumber === state.builtInRatio;
     get('ratioHint').hidden = !repeatedGearbox;
     get('ratioHint').textContent = repeatedGearbox
-      ? `请确认：这里填的是额外 ${state.builtInRatio}:1 机械传动。电机内置 ${state.builtInRatio}:1 已自动换算；若拨盘直接接输出轴，请选“输出轴直连”。` : '';
-    for (const name of ['rounds', 'drive', 'ratio', 'direction', 'tolerance']) get(name).disabled = armed;
+      ? `请确认外部另有 ${state.builtInRatio}:1 传动，避免与已勾选的内置减速箱重复计算。` : '';
+    for (const name of ['rounds', 'drive', 'ratio', 'gearbox', 'direction', 'tolerance']) get(name).disabled = armed;
     get('shots').disabled = !!move || held;
     get('perShot').value = step ? format(step.perShot) : '—';
     get('delta').value = step ? format(step.delta) : '—';
-    get('target').value = target === null ? '—' : format(target);
-    get('angle').value = Number.isFinite(state.angle) ? format(state.angle) : '—';
-    const positionError = target === null || !Number.isFinite(state.angle) ? null : Math.abs(target - state.angle);
+    get('target').value = target === null ? '—' : format(target * state.builtInRatio);
+    get('angle').value = Number.isFinite(state.angle) ? format(state.angle * state.builtInRatio) : '—';
+    const positionError = target === null || !Number.isFinite(state.angle) ? null : Math.abs(target - state.angle) * state.builtInRatio;
     get('positionError').value = positionError === null ? '—' : format(positionError);
     get('effectiveTolerance').value = step ? format(step.tolerance) : '—';
     get('requested').value = String(requested);
     get('completed').value = String(completed);
-    const moving = state.positionMode && state.enabled && Number.isFinite(state.angle) && Math.abs(state.angle - state.ref) > state.tolerance;
+    const readyTolerance = lastTolerance ?? state.tolerance;
+    const moving = state.positionMode && state.enabled && Number.isFinite(state.angle) && Math.abs(state.angle - state.ref) > readyTolerance;
     get('start').disabled = armed || !!state.reason || !!invalid || moving;
     get('start').textContent = armed ? '测试已启动 · 下方按下触发' : !state.positionMode ? '① 切换为位置环' : !state.enabled ? '② 使能位置环 · 当前位置置零' : '③ 开始测试 · 锁定角度目标';
     get('stop').disabled = !armed;
@@ -97,7 +107,7 @@ export function initLoaderTest(host, adapter) {
     get('status').classList.toggle('error', error || (!armed && !!invalid));
     get('status').textContent = armed ? (move?.ack && positionError !== null
       ? `等待到位 · 剩余 ${format(positionError)}° / 容差 ${format(move.tolerance)}° · 到位后松开并再次按下；如持续不收敛，请检查位置/速度 PID 与负载`
-      : moving ? `位置偏离上一目标 ${format(Math.abs(state.angle - state.ref))}° · 请等待回稳后再按下，不会排队或自动重发` : message) : (invalid || state.reason || message ||
+      : moving ? `位置偏离上一目标 ${format(Math.abs(state.angle - state.ref) * state.builtInRatio)}° · 请等待回稳后再按下，不会排队或自动重发` : message) : (invalid || state.reason || message ||
       (moving ? '请等待当前位置目标到位，再开始测试' : !state.positionMode ? '点击上方按钮切换位置环；确认后可在此使能并开始测试' :
         !state.enabled ? '点击上方按钮使能电机并保持当前位置，随后点击开始测试' : '参数已就绪 · 点击开始测试，再按下方触发区执行'));
   }
@@ -113,25 +123,28 @@ export function initLoaderTest(host, adapter) {
     armed = true;
     requested = completed = 0;
     target = null;
+    lastTolerance = null;
     message = '已接管位置目标 · 在下方区域按下鼠标触发';
     error = false;
     adapter.onLockChange();
     refresh();
   };
   get('stop').onclick = () => stop('测试已退出并停机 · 计数已保留');
-  for (const name of ['rounds', 'drive', 'ratio', 'shots', 'direction', 'tolerance']) {
+  for (const name of ['rounds', 'drive', 'ratio', 'gearbox', 'shots', 'direction', 'tolerance']) {
     get(name).addEventListener('input', () => { message = ''; error = false; refresh(); });
   }
   const pad = get('pad');
   function trigger() {
     const state = adapter.getState();
-    if (move || state.reason || !state.positionMode || !state.enabled ||
-        Math.abs(state.angle - state.ref) > state.tolerance) return refresh();
     const step = parameters();
+    const readyTolerance = lastTolerance ?? state.tolerance;
+    if (move || state.reason || !state.positionMode || !state.enabled ||
+        Math.abs(state.angle - state.ref) > readyTolerance) return refresh();
     move = { ...step, requestId: nextRequestId++ & 0xffff, started: performance.now(), ack: false, settled: 0 };
     error = false;
     message = '等待板端确认本次位置步进…';
-    adapter.trigger({ requestId: move.requestId, delta: step.delta });
+    adapter.trigger({ requestId: move.requestId, delta: step.delta / step.builtInRatio,
+      tolerance: step.tolerance / step.builtInRatio });
     refresh();
   }
   pad.addEventListener('pointerdown', event => {
@@ -168,6 +181,7 @@ export function initLoaderTest(host, adapter) {
       }
       move.ack = true;
       target = move.target = ack.target;
+      lastTolerance = move.tolerance / move.builtInRatio;
       adapter.displayTarget(target);
       requested += move.shots;
       message = `已接受 ${move.shots} 发位置指令 · 等待到位`;

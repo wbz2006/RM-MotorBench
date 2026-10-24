@@ -18,6 +18,8 @@
 #define DM_T_MAX   10.0f
 #define DM4310_RATED_TORQUE 3.0f
 #define DM4310_PEAK_TORQUE  7.0f
+/* 24 V output-shaft no-load speed: 200 rpm; independent of MIT VMAX. */
+#define DM4310_24V_SPEED_LIMIT 20.94f
 /* DM8009P keeps its independent, previously verified MIT spans. */
 #define DM8009P_V_MAX 45.0f
 #define DM8009P_T_MAX 54.0f
@@ -62,6 +64,7 @@ typedef struct
     float *speed_feedforward_ptr;
     float *current_feedforward_ptr;
     float pid_ref;
+    SpeedRamp_s speed_ramp; /* rad/s^2; position mode bypasses shaping */
     DMMotorModel_e model;
     float p_max;
     float v_max;

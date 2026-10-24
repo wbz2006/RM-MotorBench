@@ -725,7 +725,40 @@ static int feeder_steps(void) {
     CHECK(fabsf(a->motor_controller.pid_ref - feeder_origin - feeder_target * 36) < 0.05f);
     a->measure.total_angle = feeder_origin + (feeder_target - 1.1f) * 36.0f;
     CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_POSITION_BUSY);
+    /* Shared feeder tolerance stops end-of-step crawling. New actions retain
+     * the nominal pitch instead of accumulating a small residual every shot. */
     CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
+    float extended_origin = a->measure.total_angle;
+    CHECK(MotorBenchPositionStepWithTolerance(0, 45, 2.25f, &feeder_target) == MB_OK);
+    CHECK(feeder_target == 45 && a->position_deadband == 81);
+    a->measure.total_angle = extended_origin + (45 - 1.5f) * 36;
+    a->measure.speed_aps = 0;
+    a->motor_controller.angle_PID.Kp = 10;
+    a->motor_controller.angle_PID.Iout = 100;
+    tick();
+    CHECK(a->motor_controller.angle_PID.Output == 0 && a->motor_controller.angle_PID.Iout == 0);
+    CHECK(a->motor_controller.speed_PID.Ref == 0); /* speed loop still brakes */
+    CHECK(ref(0) == 45); /* preserve exact nominal position */
+    CHECK(MotorBenchPositionStepWithTolerance(0, 90, 4.5f, &feeder_target) == MB_OK && feeder_target == 135);
+    a->measure.total_angle = extended_origin + (135 - 4.6f) * 36;
+    tick();
+    CHECK(a->motor_controller.angle_PID.Output > 0);
+    CHECK(MotorBenchPositionStepWithTolerance(0, 45, 2.25f, &feeder_target) == MB_ERR_POSITION_BUSY);
+    a->measure.total_angle = extended_origin + (135 - 4.0f) * 36;
+    CHECK(MotorBenchPositionStepWithTolerance(0, -45, 2.25f, &feeder_target) == MB_OK && feeder_target == 90);
+    float preserved_ref = ref(0), preserved_deadband = a->position_deadband;
+    CHECK(MotorBenchPositionStepWithTolerance(0, 45, NAN, &feeder_target) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchPositionStepWithTolerance(0, 45, 0, &feeder_target) == MB_ERR_BAD_PARAM);
+    CHECK(MotorBenchPositionStepWithTolerance(0, 45, 5, &feeder_target) == MB_ERR_BAD_PARAM);
+    CHECK(ref(0) == preserved_ref && a->position_deadband == preserved_deadband);
+    CHECK(MotorBenchSetRef(0, 90) == MB_OK && a->position_deadband == 0);
+    a->measure.total_angle = extended_origin + 90 * 36;
+    receive_hex("${buildPositionStep(0, 124, 45, 2.25).toString('hex')}");
+    CHECK(ref(0) == 135 && a->position_deadband == 81);
+    print_wire("POSITION_TOLERANCE_WIRE");
+    CHECK(MotorBenchSetEnable(0, 0) == MB_OK);
+    CHECK(a->position_deadband == 0);
     CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_NOT_ENABLED);
     CHECK(MotorBenchSetLoop(0, SPEED_LOOP) == MB_OK);
     CHECK(MotorBenchPositionStep(0, 45, &feeder_target) == MB_ERR_UNSUPPORTED);
@@ -792,6 +825,10 @@ static int position_control(const char *speed_pid, const char *angle_pid, const 
     const Closeloop_Type_e masks[] = {ANGLE_LOOP, ANGLE_AND_SPEED_LOOP, ALL_THREE_LOOP};
     for (unsigned n = 0; n < 3; ++n) {
         CHECK(MotorBenchBind(0, MB_MOTOR_M2006, 1, 3, masks[n]) == MB_OK);
+        if (n == 0) {
+            CHECK(MotorBenchQueryPid(0) == MB_OK);
+            print_wire("M2006_DEFAULTS_WIRE");
+        }
         a->daemon->temp_count = 0;
         CHECK(MotorBenchSetEnable(0, 1) == MB_ERR_BAD_PARAM);
         const uint8_t frame[8] = {0x0d, 0xac, 0, 0, 0, 0, 25, 0};
@@ -805,7 +842,8 @@ static int position_control(const char *speed_pid, const char *angle_pid, const 
         CHECK(MotorBenchSetRef(0, 30) == MB_OK);
         tick();
         CHECK(fabsf(a->motor_controller.angle_PID.Err - 1080) < 0.01f);
-        CHECK(fabsf(a->motor_controller.speed_PID.Ref - 600) < 0.01f);
+        CHECK(a->motor_controller.speed_PID.Ref > 4320 && a->motor_controller.speed_PID.Ref <= 5320);
+        CHECK(a->motor_controller.angle_PID.Iout > 0 && a->motor_controller.angle_PID.Iout <= 1000);
         CHECK(output(a) > 0); /* Position PID executes with every legal mask. */
         a->measure.total_angle = origin + 30 * 36;
         a->measure.real_current = 0;
@@ -1547,10 +1585,14 @@ try {
   const clickBody = ui.match(/r\('enable'\)\.onclick = \(\) => \{([\s\S]*?)\n    \};/)[1];
   const handle = server.match(/function handleCommand\(cmd\) \{[\s\S]*?\n\}/)[0];
   const writes = [];
-  const context = { Buffer, Number, buildEnable, buildSetRef,
+  const context = { Buffer, Number, buildEnable, buildSetRef, buildPositionStep,
     buildAllStop, buildUnbind,
     writeToSerial: (buf) => writes.push(buf), broadcast: () => {} };
   vm.runInNewContext(handle, context);
+  context.handleCommand({type:'positionStep',channelId:0,requestId:5,delta:45,tolerance:2.25});
+  const extendedStep = new FrameParser().push(writes.pop())[0];
+  assert.equal(extendedStep.payload.length, 11);
+  assert.equal(extendedStep.payload.readFloatLE(7), 2.25, 'backend forwards shared tolerance to firmware');
   let enabled = false;
   let accepted = true;
   const num = { value: '0' };
@@ -1681,7 +1723,7 @@ try {
     fs.mkdirSync(dir);
     fs.writeFileSync(path.join(dir, 'main.h'), `#pragma once
 #include <stdint.h>
-typedef struct { volatile uint32_t CTRL, CYCCNT; } DwtRegisters;
+typedef struct { volatile uint32_t CTRL, CYCCNT, LAR; } DwtRegisters;
 typedef struct { volatile uint32_t DEMCR; } DebugRegisters;
 extern DwtRegisters dwt;
 extern DebugRegisters debug;
@@ -1697,6 +1739,7 @@ DwtRegisters dwt;
 DebugRegisters debug;
 int main(void) {
     DWT_Init(168);
+    assert(dwt.LAR == 0xC5ACCE55u);
     uint32_t last = 0;
     dwt.CYCCNT = 168000; dwt.CTRL = 0; debug.DEMCR = 0;
     assert(fabsf(DWT_GetDeltaT(&last) - 0.001f) < 0.000001f);
@@ -1716,7 +1759,7 @@ int main(void) {
 }
 `);
     const clockTest = path.join(dir, process.platform === 'win32' ? 'test.exe' : 'test');
-    execFileSync(compiler, ['-std=gnu11', '-O1', '-I', dir, '-I', path.dirname(dwtSource),
+    execFileSync(compiler, ['-std=gnu11', '-D__CORTEX_M=7', '-O1', '-I', dir, '-I', path.dirname(dwtSource),
       path.join(dir, 'test.c'), dwtSource, '-lm', '-o', clockTest], { env, stdio: 'pipe' });
     execFileSync(clockTest, [], { env, stdio: 'pipe' });
     console.log('PASS actual DWT clock restores debugger-cleared enables for delta/timeline/delay without resetting its cycle count');
@@ -1745,7 +1788,10 @@ int main(void) {
     'Middlewares/Third_Party/SEGGER/RTT/SEGGER_RTT_printf.c']
     .map((p) => path.join(root, p));
   const exe = path.join(tmp, 'motor_state.exe');
-  execFileSync(compiler, ['-std=gnu11', '-O1', '-ffunction-sections', '-fdata-sections',
+  const board = path.basename(path.resolve(root));
+  const boardFlag = { 'motorbench-a': 0x20, 'motorbench-c': 0x40, 'motorbench-mc02': 0x60 }[board];
+  const mcu = { 'motorbench-a': 'STM32F427xx', 'motorbench-c': 'STM32F407xx', 'motorbench-mc02': 'STM32H723xx' }[board];
+  execFileSync(compiler, ['-std=gnu11', `-D${mcu}`, '-O1', '-ffunction-sections', '-fdata-sections',
     ...includes, main, ...sources, '-Wl,--gc-sections', '-lm', '-o', exe], { env, stdio: 'pipe' });
   {
     const output = execFileSync(exe, ['feeder-steps'], { env, encoding: 'utf8', stdio: 'pipe' });
@@ -1753,7 +1799,9 @@ int main(void) {
     const stepFrames = new FrameParser().push(Buffer.from(stepWire, 'hex'));
     assert.deepEqual(stepFrames.filter(f => f.type === FrameType.POSITION_STEP_ACK).map(f => parsePositionStepAck(f.payload)),
       [{ channelId: 0, requestId: 123, result: 0, target: 405 }]);
-    assert.equal(parseHeartbeatAck(stepFrames.find(f => f.type === FrameType.HEARTBEAT).payload).boardFlags & 14, 14);
+    assert.equal(parseHeartbeatAck(stepFrames.find(f => f.type === FrameType.HEARTBEAT).payload).boardFlags & 30, 30);
+    const extendedFrames = new FrameParser().push(Buffer.from(output.match(/POSITION_TOLERANCE_WIRE ([0-9a-f]+)/)[1], 'hex'));
+    assert.ok(extendedFrames.some(f => f.type === FrameType.POSITION_STEP_ACK && parsePositionStepAck(f.payload).requestId === 124 && parsePositionStepAck(f.payload).target === 135));
     console.log('PASS single/double large-angle position steps, reverse, busy/offline/stopped guards, firmware ACK, 0.81 output-degree residual, repeated double shots across 1M rotor degrees, large origins, relative limit and retained manual limit');
   }
   if (!process.argv.includes('--feeder-only')) {
@@ -1788,6 +1836,10 @@ int main(void) {
     const angle = buildSetPid(1, 2, { Kp: 0.1, Ki: 0, Kd: 0, MaxOut: 1.75, IntegralLimit: 0.25, scaledLimits: true });
     const bad = buildSetPid(1, 1, { Kp: 0, Ki: 0, Kd: 0, MaxOut: 0, IntegralLimit: 0, scaledLimits: true });
     const output = execFileSync(exe, ['position', speed.toString('hex'), angle.toString('hex'), bad.toString('hex')], { env, encoding: 'utf8', stdio: 'pipe' });
+    const defaultFrames = new FrameParser().push(Buffer.from(output.match(/M2006_DEFAULTS_WIRE ([0-9a-f]+)/)[1], 'hex'));
+    const m2006Defaults = parsePidReport(defaultFrames.find(f => f.type === FrameType.PID_REPORT).payload);
+    assert.deepEqual(m2006Defaults.angle, {Kp:4, Ki:5, Kd:0, MaxOut:6000, IntegralLimit:1000, improve:1});
+    assert.deepEqual(m2006Defaults.angle, PID_DEFAULTS[MotorKind.M2006].angle, 'M2006 factory and browser restore defaults match the commissioned parameters');
     const hex = output.match(/POSITION_WIRE ([0-9a-f]+)/)?.[1];
     const frames = new FrameParser().push(Buffer.from(hex, 'hex'));
     const report = parsePidReport(frames.find(f => f.type === FrameType.PID_REPORT).payload);
@@ -1824,7 +1876,7 @@ int main(void) {
     const fwMinor = Number(fwHeader.match(/#define MB_FW_VERSION_MINOR (\d+)/)[1]);
     assert.equal(heartbeat.payload.length, 8);
     assert.deepEqual(parseHeartbeatAck(heartbeat.payload), {
-      fwVersion: `${fwMajor}.${fwMinor}`, inventoryCount: 3, boardFlags: 15,
+      fwVersion: `${fwMajor}.${fwMinor}`, inventoryCount: 3, boardFlags: 159 | boardFlag,
       anyMotorOnline: true, uptimeS: 1, seq: heartbeat.payload.readUInt16LE(6),
     });
     const fragments = new FrameParser();

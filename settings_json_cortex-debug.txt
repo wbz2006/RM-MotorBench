@@ -1,5 +1,0 @@
-    "cortex-debug.liveWatchRefreshRate": 100,
-    "cortex-debug.JLinkGDBServerPath": "C:\\Program Files (x86)\\SEGGER\\JLink_V722b\\JLinkGDBServerCL.exe",
-    "cortex-debug.armToolchainPath": "C:\\msys64\\mingw64\\bin",
-    "cortex-debug.openocdPath": "C:\\msys64\\mingw64\\bin\\openocd.exe",
-    "cortex-debug.gdbPath": "C:\\msys64\\mingw64\\bin\\arm-none-eabi-gdb.exe",

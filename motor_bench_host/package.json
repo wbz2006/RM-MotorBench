@@ -13,8 +13,12 @@
     "test": "node selftest.js",
     "test:http": "node --test http_test.js",
     "test:guidance": "node guidance_test.cjs",
+    "test:chart": "node chart_test.cjs",
     "test:integration": "node integration_test.js",
     "test:motor-state": "node motor_state_test.js",
+    "test:mc02-usb": "node mc02_usb_test.js",
+    "test:fdcan": "node fdcan_adapter_test.js",
+    "test:firmware-parity": "node --test firmware_parity_test.js",
     "test:setpoint": "node --test setpoint_test.js",
     "test:calculator": "node --test calculator_test.js",
     "test:loader": "node loader_test.cjs"

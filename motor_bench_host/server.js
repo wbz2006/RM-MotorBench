@@ -174,7 +174,7 @@ function handleCommand(cmd) {
       break;
     case 'positionStep':
       try {
-        writeToSerial(buildPositionStep(cmd.channelId, cmd.requestId, cmd.delta));
+        writeToSerial(buildPositionStep(cmd.channelId, cmd.requestId, cmd.delta, cmd.tolerance));
       } catch {
         broadcast({ type: 'positionStepAck', data: { channelId: cmd.channelId,
           requestId: cmd.requestId, result: MBResult.BAD_PARAM, target: 0 } });
@@ -214,7 +214,7 @@ function handleCommand(cmd) {
 
 wss.on('connection', (ws) => {
   broadcast({ type: 'clients', count: wss.clients.size });
-  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels', 'setLoop', 'positionStep'] }));
+  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels', 'setLoop', 'positionStep', 'positionStepTolerance'] }));
   // A page reload does not close the Node-owned USB serial connection.
   ws.send(JSON.stringify({ type: 'serial', open: !!serialPort?.isOpen,
     path: serialPort?.path, baud: serialPort?.baudRate }));

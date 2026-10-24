@@ -1,0 +1,108 @@
+<svg width="1560" height="850" viewBox="0 0 1560 850" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei, PingFang SC, sans-serif">
+  <defs>
+    <marker id="arrOrange" markerWidth="14" markerHeight="10" refX="12" refY="5" viewBox="0 0 14 10" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L14,5 L0,10 L0,0" fill="#ed9745"/>
+    </marker>
+    <marker id="arrTeal" markerWidth="14" markerHeight="10" refX="12" refY="5" viewBox="0 0 14 10" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L14,5 L0,10 L0,0" fill="#358e90"/>
+    </marker>
+  </defs>
+
+  <style>
+    .box { fill: #ffffff; stroke: #323232; stroke-width: 1.6; rx: 14; }
+    .title { font-size: 23px; font-weight: 600; fill: #22302b; text-anchor: middle; }
+    .sub   { font-size: 15.5px; fill: #6b7570; text-anchor: middle; }
+    .label { font-size: 15.5px; fill: #6b7570; }
+    .mono  { font-family: Consolas, 'Courier New', monospace; }
+    .wire  { fill: none; stroke: #323232; stroke-width: 1.6; }
+    .down  { fill: none; stroke: #ed9745; stroke-width: 2; }
+    .up    { fill: none; stroke: #358e90; stroke-width: 2; }
+    .flow-label { font-size: 15px; font-weight: 600; }
+  </style>
+
+  <rect width="1560" height="850" fill="#fbfbfa"/>
+
+  <!-- ===== 顶层：上位机界面（中心 x=780） ===== -->
+  <rect class="box" x="530" y="42" width="500" height="96" rx="14"/>
+  <text class="title" x="780" y="82">浏览器 / MotorBench 桌面版</text>
+  <text class="sub"  x="780" y="112">原生 Web UI · Electron 便携 EXE · 同一套逻辑</text>
+
+  <!-- WebSocket 双向（下行 x=690 / 上行 x=870，关于 780 对称） -->
+  <path class="down" d="M690,138 L690,208" marker-end="url(#arrOrange)"/>
+  <path class="up"   d="M870,208 L870,138" marker-end="url(#arrTeal)"/>
+  <text class="label mono" x="780" y="162" text-anchor="middle">WebSocket</text>
+  <text class="flow-label" x="662" y="180" text-anchor="end" fill="#ed9745">控制指令</text>
+  <text class="flow-label" x="898" y="180" fill="#358e90">遥测 · 清单</text>
+
+  <!-- ===== 中层：Node 服务（中心 x=780） ===== -->
+  <rect class="box" x="470" y="214" width="620" height="104" rx="14"/>
+  <text class="title" x="780" y="254">Node 服务（motor_bench_host）</text>
+  <text class="sub"  x="780" y="284">串口桥 serialport · 心跳 200 ms · 关闭 / 断链转发全停</text>
+
+  <!-- USB 总线分发：竖引线 x=780，水平母线 y=360，三列板卡中心 300 / 780 / 1260 -->
+  <path class="wire" d="M780,318 L780,360"/>
+  <path class="wire" d="M245,360 L1315,360"/>
+  <path class="down" d="M245,360 L245,412" marker-end="url(#arrOrange)"/>
+  <path class="up"   d="M355,412 L355,360" marker-end="url(#arrTeal)"/>
+  <path class="down" d="M725,360 L725,412" marker-end="url(#arrOrange)"/>
+  <path class="up"   d="M835,412 L835,360" marker-end="url(#arrTeal)"/>
+  <path class="down" d="M1205,360 L1205,412" marker-end="url(#arrOrange)"/>
+  <path class="up"   d="M1315,412 L1315,360" marker-end="url(#arrTeal)"/>
+  <text class="label" x="118" y="348">USB 虚拟串口（CDC）· 免驱动 · 波特率任意</text>
+  <text class="label mono" x="1442" y="348" text-anchor="end">× N 块板</text>
+
+  <!-- ===== 板卡层（y=418..530，三列中心 300 / 780 / 1260） ===== -->
+  <rect class="box" x="100" y="418" width="400" height="112" rx="14"/>
+  <text class="title" x="300" y="458">大疆 A 型开发板</text>
+  <text class="sub"  x="300" y="486">STM32F427IIH6 · 电机测试台固件</text>
+  <text class="sub"  x="300" y="510">每块板烧录一次，长期使用</text>
+
+  <rect class="box" x="580" y="418" width="400" height="112" rx="14"/>
+  <text class="title" x="780" y="458">大疆 C 型开发板</text>
+  <text class="sub"  x="780" y="486">STM32F407IGH6 · 电机测试台固件</text>
+  <text class="sub"  x="780" y="510">每块板烧录一次，长期使用</text>
+
+  <rect class="box" x="1060" y="418" width="400" height="112" rx="14"/>
+  <text class="title" x="1260" y="458">达妙 MC02 开发板</text>
+  <text class="sub"  x="1260" y="486">电机测试台固件 · 迁移中</text>
+  <text class="sub"  x="1260" y="510">遵循同一协议，上位机无需修改</text>
+
+  <!-- CAN 双向（箭头空档 355..725 与 835..1205 内放标签，避免压线） -->
+  <path class="down" d="M245,530 L245,602" marker-end="url(#arrOrange)"/>
+  <path class="up"   d="M355,602 L355,530" marker-end="url(#arrTeal)"/>
+  <path class="down" d="M725,530 L725,602" marker-end="url(#arrOrange)"/>
+  <path class="up"   d="M835,602 L835,530" marker-end="url(#arrTeal)"/>
+  <path class="down" d="M1205,530 L1205,602" marker-end="url(#arrOrange)"/>
+  <path class="up"   d="M1315,602 L1315,530" marker-end="url(#arrTeal)"/>
+  <text class="label mono" x="460" y="575">CAN1 / CAN2 · 1 Mbps</text>
+
+  <!-- ===== 电机层（容器 x=100..1460，中心 x=780） ===== -->
+  <rect x="100" y="608" width="1360" height="98" rx="14" fill="#f2f7f6" stroke="#358e90" stroke-width="1.4"/>
+  <text class="title" x="136" y="648" style="text-anchor:start;font-size:19px">CAN 总线上的电机</text>
+  <text class="sub"  x="136" y="676" style="text-anchor:start">按电调拨码 ID 现场添加 · 反馈实时回传</text>
+
+  <g font-size="16.5" text-anchor="middle">
+    <rect x="480" y="634" width="96"  height="44" rx="22" fill="#ffffff" stroke="#323232" stroke-width="1.3"/>
+    <text x="528"  y="662" fill="#22302b">M3508</text>
+    <rect x="596" y="634" width="96"  height="44" rx="22" fill="#ffffff" stroke="#323232" stroke-width="1.3"/>
+    <text x="644"  y="662" fill="#22302b">M2006</text>
+    <rect x="712" y="634" width="106" height="44" rx="22" fill="#ffffff" stroke="#323232" stroke-width="1.3"/>
+    <text x="765"  y="662" fill="#22302b">GM6020</text>
+    <rect x="838" y="634" width="106" height="44" rx="22" fill="#ffffff" stroke="#323232" stroke-width="1.3"/>
+    <text x="891"  y="662" fill="#22302b">DM4310</text>
+    <rect x="964" y="634" width="116" height="44" rx="22" fill="#ffffff" stroke="#323232" stroke-width="1.3"/>
+    <text x="1022" y="662" fill="#22302b">DM8009P</text>
+    <rect x="1100" y="634" width="252" height="44" rx="22" fill="#ffffff" stroke="#9aa39e" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="1226" y="662" fill="#8a938d" font-size="15.5">LK9025 · HT04（待开放）</text>
+  </g>
+
+  <!-- ===== 底部安全特性（三列中心 300 / 780 / 1260，与板卡对齐） ===== -->
+  <g font-size="16.5" text-anchor="middle">
+    <rect x="105"  y="748" width="390" height="52" rx="26" fill="#fff7ee" stroke="#ed9745" stroke-width="1.4"/>
+    <text x="300"  y="781" fill="#8a5a20">心跳断链约 1.5 s 自动全停</text>
+    <rect x="585"  y="748" width="390" height="52" rx="26" fill="#fff7ee" stroke="#ed9745" stroke-width="1.4"/>
+    <text x="780"  y="781" fill="#8a5a20">未使能不出力 · 参考值板端限幅</text>
+    <rect x="1065" y="748" width="390" height="52" rx="26" fill="#fff7ee" stroke="#ed9745" stroke-width="1.4"/>
+    <text x="1260" y="781" fill="#8a5a20">关闭网页 / 服务 → 下发全停</text>
+  </g>
+</svg>

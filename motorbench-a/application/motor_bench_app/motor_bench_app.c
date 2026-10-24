@@ -149,7 +149,7 @@ static const BenchPidSet_s bench_dji_current_pid[BENCH_PID_TABLE_SIZE] = {
 static const BenchPidSet_s bench_dji_angle_pid[BENCH_PID_TABLE_SIZE] = {
     /* deg -> deg/s; bounded commissioning settings for rotor position. */
     [M3508] = {4.0f, 0.0f, 0.0f, 600.0f, 0.0f, PID_Integral_Limit},
-    [M2006] = {4.0f, 0.0f, 0.0f, 600.0f, 0.0f, PID_Integral_Limit},
+    [M2006] = {4.0f, 5.0f, 0.0f, 6000.0f, 1000.0f, PID_Integral_Limit},
     [GM6020] = {8.0f, 0.0f, 0.0f, 500.0f, 100.0f,
                 PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement},
 };

@@ -49,3 +49,12 @@ test('position-step wire preserves angle and request ID, rejects unsafe or malfo
   for (const args of [[8, 0, 45], [0, -1, 45], [0, 0, NaN], [0, 0, 36001], [0, 0, 0]])
     assert.throws(() => buildPositionStep(...args));
 });
+
+test('extended step carries the shared tolerance while keeping legacy frames unchanged', () => {
+  const frame = new FrameParser().push(buildPositionStep(0, 12, 45, 2.25))[0];
+  assert.equal(frame.payload.length, 11);
+  assert.equal(frame.payload.readFloatLE(3), 45);
+  assert.equal(frame.payload.readFloatLE(7), 2.25);
+  for (const tolerance of [0, -1, NaN, Infinity, 4.6])
+    assert.throws(() => buildPositionStep(0, 12, 45, tolerance));
+});

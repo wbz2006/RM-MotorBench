@@ -11,6 +11,40 @@
 #include "controller.h"
 #include "memory.h"
 
+void SpeedRampReset(SpeedRamp_s *ramp, float measured_speed)
+{
+    ramp->ref = measured_speed;
+    DWT_GetDeltaT(&ramp->clock);
+}
+
+uint8_t SpeedRampApply(SpeedRamp_s *ramp, float target, float *ref)
+{
+    if (ramp->rate == 0.0f)
+    {
+        *ref = target;
+        return isfinite(target);
+    }
+    float dt = DWT_GetDeltaT(&ramp->clock);
+    if (!isfinite(dt) || dt <= 0.0f || dt > PID_MAX_INTERVAL_S ||
+        !isfinite(target) || !isfinite(ramp->ref) ||
+        !isfinite(ramp->rate) || ramp->rate < 0.0f ||
+        !isfinite(ramp->zero_rate) || ramp->zero_rate < 0.0f)
+        return 0;
+    /* Reversal stays continuous through zero. Only an explicit zero target
+     * selects faster active braking; neither path resets PID compensation. */
+    float rate = target == 0.0f ? fmaxf(ramp->rate, ramp->zero_rate) : ramp->rate;
+    float step = rate * dt;
+    float delta = target - ramp->ref;
+    if (delta > step)
+        ramp->ref += step;
+    else if (delta < -step)
+        ramp->ref -= step;
+    else
+        ramp->ref = target;
+    *ref = ramp->ref;
+    return 1;
+}
+
 /* ----------------------------下面是pid优化环节的实现---------------------------- */
 
 // 梯形积分
@@ -83,6 +117,12 @@ static void f_Output_Filter(PIDInstance *pid)
 // 输出限幅
 static void f_Output_Limit(PIDInstance *pid)
 {
+    /* Check before clamping: infinity must not become a full-scale command. */
+    if (!isfinite(pid->Output))
+    {
+        PIDReset(pid);
+        return;
+    }
     if (pid->Output > pid->MaxOut)
     {
         pid->Output = pid->MaxOut;
@@ -153,11 +193,22 @@ void PIDReset(PIDInstance *pid)
  */
 float PIDCalculate(PIDInstance *pid, float measure, float ref)
 {
+    return PIDCalculateWithIntegralHold(pid, measure, ref, 0);
+}
+
+float PIDCalculateWithIntegralHold(PIDInstance *pid, float measure, float ref, uint8_t hold_integral)
+{
     // 堵转检测
     if (pid->Improve & PID_ErrorHandle)
         f_PID_ErrorHandle(pid);
 
     pid->dt = DWT_GetDeltaT(&pid->DWT_CNT); // 获取两次pid计算的时间间隔,用于积分和微分
+    if (!isfinite(pid->dt) || pid->dt <= 0.0f || pid->dt > PID_MAX_INTERVAL_S ||
+        !isfinite(measure) || !isfinite(ref) || !isfinite(pid->Iout))
+    {
+        PIDReset(pid);
+        return 0.0f;
+    }
 
     // 保存上次的测量值和误差,计算当前error
     pid->Measure = measure;
@@ -170,7 +221,7 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref)
         // 基本的pid计算,使用位置式
         pid->Pout = pid->Kp * pid->Err;
         pid->ITerm = pid->Ki * pid->Err * pid->dt;
-        pid->Dout = pid->Kd * (pid->Err - pid->Last_Err) / pid->dt;
+        pid->Dout = pid->Kd == 0.0f ? 0.0f : pid->Kd * (pid->Err - pid->Last_Err) / pid->dt;
 
         // 梯形积分
         if (pid->Improve & PID_Trapezoid_Intergral)
@@ -184,6 +235,10 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref)
         // 微分滤波器
         if (pid->Improve & PID_DerivativeFilter)
             f_Derivative_Filter(pid);
+        /* Quantized zero-speed feedback must not accumulate artificial torque.
+         * Keep P/D response and the existing Iout used to balance a load. */
+        if (hold_integral)
+            pid->ITerm = 0;
         // 积分限幅
         if (pid->Improve & PID_Integral_Limit)
             f_Integral_Limit(pid);
@@ -200,8 +255,16 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref)
     }
     else // 进入死区, 则清空积分和输出
     {
-        pid->Output = 0;
+        pid->Output = hold_integral ? pid->Iout : 0;
         pid->ITerm = 0;
+        if (hold_integral)
+            f_Output_Limit(pid);
+    }
+
+    if (!isfinite(pid->Output))
+    {
+        PIDReset(pid);
+        return 0.0f;
     }
 
     // 保存当前数据,用于下次计算

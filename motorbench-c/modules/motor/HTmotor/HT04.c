@@ -154,9 +154,25 @@ __attribute__((noreturn)) void HTMotorTask(void const *argument)
 
     while (1)
     {
+        if (motor->stop_flag != MOTOR_STOP && (!motor->motor_daemon || !DaemonIsOnline(motor->motor_daemon)))
+        {
+            HTMotorStop(motor);
+            motor->pid_ref = 0.0f;
+        }
+        tmp = float_to_uint(0, T_MIN, T_MAX, 12);
+        if (motor->stop_flag == MOTOR_STOP)
+            goto send_torque;
         pid_ref = motor->pid_ref;
         if (setting->motor_reverse_flag == MOTOR_DIRECTION_REVERSE)
             pid_ref *= -1;
+
+        if ((setting->outer_loop_type & SPEED_LOOP) && !(setting->outer_loop_type & ANGLE_LOOP) &&
+            !SpeedRampApply(&motor->speed_ramp, pid_ref, &pid_ref))
+        {
+            HTMotorStop(motor);
+            motor->pid_ref = 0.0f;
+            goto send_torque;
+        }
 
         if ((setting->close_loop_type & ANGLE_LOOP) && setting->outer_loop_type == ANGLE_LOOP)
         {
@@ -194,6 +210,7 @@ __attribute__((noreturn)) void HTMotorTask(void const *argument)
         tmp = float_to_uint(set, T_MIN, T_MAX, 12);
         if (motor->stop_flag == MOTOR_STOP)
             tmp = float_to_uint(0, T_MIN, T_MAX, 12);
+send_torque:
         motor_can->tx_buff[6] = (tmp >> 8);
         motor_can->tx_buff[7] = tmp & 0xff;
 
@@ -245,10 +262,21 @@ void HTMotorControlInit()
 void HTMotorStop(HTMotorInstance *motor)
 {
     motor->stop_flag = MOTOR_STOP;
+    motor->speed_ramp.ref = 0.0f;
+    PIDReset(&motor->speed_PID);
+    PIDReset(&motor->angle_PID);
+    PIDReset(&motor->current_PID);
 }
 
 void HTMotorEnable(HTMotorInstance *motor)
 {
+    if (motor->stop_flag == MOTOR_STOP)
+    {
+        PIDReset(&motor->speed_PID);
+        PIDReset(&motor->angle_PID);
+        PIDReset(&motor->current_PID);
+        SpeedRampReset(&motor->speed_ramp, motor->measure.speed_rads * RAD_2_DEGREE);
+    }
     motor->stop_flag = MOTOR_ENALBED;
 }
 

@@ -149,7 +149,7 @@ static const BenchPidSet_s bench_dji_current_pid[BENCH_PID_TABLE_SIZE] = {
 static const BenchPidSet_s bench_dji_angle_pid[BENCH_PID_TABLE_SIZE] = {
     /* deg -> deg/s; bounded commissioning settings for rotor position. */
     [M3508] = {4.0f, 0.0f, 0.0f, 600.0f, 0.0f, PID_Integral_Limit},
-    [M2006] = {4.0f, 0.0f, 0.0f, 600.0f, 0.0f, PID_Integral_Limit},
+    [M2006] = {4.0f, 5.0f, 0.0f, 6000.0f, 1000.0f, PID_Integral_Limit},
     [GM6020] = {8.0f, 0.0f, 0.0f, 500.0f, 100.0f,
                 PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement},
 };
@@ -455,6 +455,8 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
         DJIMotorInstance *m = DJIMotorInit(&cfg); /* 失败(过滤器耗尽/ID冲突)返回 NULL */
         if (!m)
             return MB_ERR_NO_RESOURCE;
+        m->speed_ramp.rate = MB_SPEED_ACCEL_RPM * 6.0f;
+        m->speed_ramp.zero_rate = MB_SPEED_ZERO_DECEL_RPM * 6.0f;
         *out_instance = m;
         return MB_OK;
     }
@@ -475,17 +477,25 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
         if (kind == MB_MOTOR_DM)
         {
             cfg.controller_param_init_config.speed_PID.Kp = 0.55f;
-            cfg.controller_param_init_config.speed_PID.Ki = 0.0f;
+            cfg.controller_param_init_config.speed_PID.Ki = 0.5f;
             cfg.controller_param_init_config.speed_PID.Kd = 0.0f;
             cfg.controller_param_init_config.speed_PID.MaxOut = 7.0f;
-            cfg.controller_param_init_config.speed_PID.IntegralLimit = 0.0f;
+            cfg.controller_param_init_config.speed_PID.IntegralLimit = 100.0f;
         }
         else if (kind == MB_MOTOR_DM8009P)
-            cfg.controller_param_init_config.speed_PID.MaxOut = 10.0f;
+        {
+            cfg.controller_param_init_config.speed_PID.Kp = 0.55f;
+            cfg.controller_param_init_config.speed_PID.Ki = 5.0f;
+            cfg.controller_param_init_config.speed_PID.Kd = 0.0f;
+            cfg.controller_param_init_config.speed_PID.MaxOut = 17.5f;
+            cfg.controller_param_init_config.speed_PID.IntegralLimit = 100.0f;
+        }
         DMMotorInstance *m = DMMotorInitWithModel(&cfg,
             kind == MB_MOTOR_DM8009P ? DM_MODEL_8009P : DM_MODEL_4310);
         if (!m)
             return MB_ERR_NO_RESOURCE;
+        m->speed_ramp.rate = MB_SPEED_ACCEL_RAD;
+        m->speed_ramp.zero_rate = MB_SPEED_ZERO_DECEL_RAD;
         *out_instance = m;
         return MB_OK;
     }
@@ -501,6 +511,8 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
         LKMotorInstance *m = LKMotorInit(&cfg);
         if (!m)
             return MB_ERR_NO_RESOURCE;
+        m->speed_ramp.rate = MB_SPEED_ACCEL_RAD;
+        m->speed_ramp.zero_rate = MB_SPEED_ZERO_DECEL_RAD;
         *out_instance = m;
         return MB_OK;
     }
@@ -526,6 +538,8 @@ static uint8_t BenchMotorFactory(MB_MotorKind_e kind, uint8_t can_bus, uint8_t m
          *   HT 实例尝试建任务,所以放在"创建成功之后"只调一次即可。
          */
         HTMotorControlInit();
+        m->speed_ramp.rate = MB_SPEED_ACCEL_RAD * RAD_2_DEGREE;
+        m->speed_ramp.zero_rate = MB_SPEED_ZERO_DECEL_RAD * RAD_2_DEGREE;
         *out_instance = m;
         return MB_OK;
     }

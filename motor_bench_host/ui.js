@@ -20,6 +20,7 @@ import {
   MOTOR_ID_MIN,
   MOTOR_ID_MAX,
   LoopType,
+  boardLabelFromFlags,
 } from './protocol.js';
 import { ensureChart, getChartIfExists, dropChart } from './chart.js';
 import { LoopFishbone } from './fishbone.js';
@@ -60,9 +61,13 @@ let channelResetAttempts = 0;
 let serverSupportsReset = false;
 let serverSupportsLoop = false;
 let serverSupportsPositionStep = false;
+let serverSupportsStepTolerance = false;
 let firmwareSupportsPositionStep = false;
 let firmwareSupportsShaftPosition = false;
 let firmwareSupportsPositionReady = false;
+let firmwareSupportsStepTolerance = false;
+let firmwareSupportsSpeedRamp = false;
+let boardLabel = '控制板';
 let firmwareSupportsLoop = false;
 let firmwareVersion = null;
 let channelResetError = '';
@@ -485,8 +490,8 @@ function send(obj) {
 function loaderTestState(i) {
   const t = telemetryByChannel.get(i);
   const mask = boundLoopMasks.get(i) ?? readLoopMask(i);
-  const reason = !serverSupportsPositionStep ? '请重启新版上位机服务以支持位置步进' :
-    !firmwareSupportsPositionStep || !firmwareSupportsShaftPosition || !firmwareSupportsPositionReady ? '请烧录支持输出轴到位容差的新版固件（A 1.22 / C 1.16）' :
+  const reason = !serverSupportsPositionStep || !serverSupportsStepTolerance ? '请重启新版上位机服务以支持步进容差' :
+    !firmwareSupportsPositionStep || !firmwareSupportsShaftPosition || !firmwareSupportsPositionReady || !firmwareSupportsStepTolerance ? '请烧录支持步进容差控制的新版固件（A / C 1.25）' :
     !canControlChannel(i) || !t?.online || performance.now() - t.receivedAt > 500 ? '请检查连接，等待最新电机反馈' :
     pendingPidApplies.has(i) ? '请等待 PID 应用完成' :
     document.hidden ? '请返回当前页面' :
@@ -882,7 +887,7 @@ function renderChannel(i) {
   const feedbackUnit = spec?.feedbackUnit || 'raw';
   r('speedLegend').textContent = `${primaryLabel}（${speedUnit}）`;
   r('torqueLegend').textContent = `${feedbackLabel}（${feedbackUnit}）`;
-  r('chart').setAttribute('aria-label', `${primaryLabel}（${speedUnit}）与${feedbackLabel}（${feedbackUnit}）实时曲线`);
+  r('chart').setAttribute('aria-label', `${primaryLabel}（${speedUnit}）与${feedbackLabel}（${feedbackUnit}）实时曲线，移动鼠标可通过橙色竖线读取交点值`);
   r('targetTitle').textContent = positionMode ? '目标位置 · 每次使能时当前位置为 0°' : '目标设定';
   r('unit').textContent = speedUnit;
   r('slider').min = String(positionMode ? -360 : -(spec?.range || 6000));
@@ -895,7 +900,6 @@ function renderChannel(i) {
   r('num').setAttribute('aria-label', positionMode ? '目标位置角度' : '目标转速数值');
   r('slider').setAttribute('aria-label', positionMode ? '目标位置角度' : '目标转速');
   renderChannelTools(i, positionMode);
-  if (!t) r('chart').removeAttribute('title');
   getChartIfExists(i)?.setUnits(speedUnit, feedbackUnit);
   const controllable = canControlChannel(i);
   r('bind').disabled = !!setupBlockReason() || sessionChannels.has(i) || !!t;
@@ -931,16 +935,18 @@ function renderChannel(i) {
   renderChannelGuidance(i);
   const [fwMajor, fwMinor] = String(firmwareVersion ?? '0.0').split('.').map(Number);
   const speedMode = !!((boundLoopMasks.get(i) ?? readLoopMask(i)) & LoopType.SPEED_LOOP) && !positionMode;
-  const sharedRamp = fwMajor > 1 || (fwMajor === 1 && fwMinor >= 18);
+  // 1.23+ advertises this explicitly; version fallback is only for known A releases.
+  const legacyRampVersion = fwMajor === 1 && fwMinor < 23;
+  const sharedRamp = firmwareSupportsSpeedRamp || (legacyRampVersion && fwMinor >= 18);
   const legacyFastZero = currentChannelKind(i) === MotorKind.DM &&
-    (fwMajor > 1 || (fwMajor === 1 && fwMinor >= 17));
+    legacyRampVersion && fwMinor >= 17;
   const fastZero = !!spec && speedMode && (sharedRamp || legacyFastZero);
   const accel = spec?.unit === 'rpm' ? 30000 : 100;
   const zeroDecel = accel * 2;
   const accelUnit = spec?.unit === 'rpm' ? 'rpm/s' : 'rad/s²';
   const rampHint = fastZero
     ? `普通变速/反向按 ${accel} ${accelUnit} 过渡，目标为 0 时按 ${zeroDecel} ${accelUnit} 快速制动并保持使能；自动输出同样适用，曲线虚线表示最终目标。「停机」立即撤销使能。 `
-    : speedMode && currentChannelKind(i) === MotorKind.DM && fwMajor === 1 && fwMinor === 16
+    : speedMode && currentChannelKind(i) === MotorKind.DM && fwMajor === 1 && fwMinor === 16 && !firmwareSupportsShaftPosition
       ? '速度目标按加减速限幅过渡（默认 10 rad/s²），自动输出同样适用；曲线虚线表示最终目标。「归零」平滑减速，「停机」立即执行。 ' : '';
   r('zero').textContent = fastZero ? '快速归零' : '归零';
   r('zero').classList.toggle('quick-zero', fastZero);
@@ -996,9 +1002,6 @@ function renderChannel(i) {
     if (canvas) {
       const c = ensureChart(i, canvas);
       c.setUnits(speedUnit, feedbackUnit);
-      canvas.title = positionMode
-        ? `最近遥测：位置 ${fmt(t.angle, 3)} deg；转速 ${fmt(t.speed, 3)} ${spec?.unit || 'rpm'}；${feedbackLabel} ${fmt(t.torque, 3)} ${feedbackUnit}`
-        : `最近遥测：转速 ${fmt(t.speed, 3)} ${speedUnit}；${feedbackLabel} ${fmt(t.torque, 3)} ${feedbackUnit}（曲线按当前滤波设置显示）`;
       /*
        * 把界面上的滤波设置同步到实例。
        *
@@ -1758,9 +1761,13 @@ ws.onclose = () => {
   serverSupportsReset = false;
   serverSupportsLoop = false;
   serverSupportsPositionStep = false;
+  serverSupportsStepTolerance = false;
   firmwareSupportsPositionStep = false;
   firmwareSupportsShaftPosition = false;
   firmwareSupportsPositionReady = false;
+  firmwareSupportsStepTolerance = false;
+  firmwareSupportsSpeedRamp = false;
+  boardLabel = '控制板';
   firmwareSupportsLoop = false;
   firmwareVersion = null;
   serialConnected = false;
@@ -1836,6 +1843,7 @@ ws.onmessage = (ev) => {
       serverSupportsReset = msg.capabilities?.includes('resetChannels') === true;
       serverSupportsLoop = msg.capabilities?.includes('setLoop') === true;
       serverSupportsPositionStep = msg.capabilities?.includes('positionStep') === true;
+      serverSupportsStepTolerance = msg.capabilities?.includes('positionStepTolerance') === true;
       if (!serverSupportsReset) {
         channelResetError = '后台版本过旧 · 请重启上位机服务';
         showRegistryMsg(channelResetError, true);
@@ -1873,6 +1881,9 @@ ws.onmessage = (ev) => {
       firmwareSupportsPositionStep = false;
       firmwareSupportsShaftPosition = false;
       firmwareSupportsPositionReady = false;
+      firmwareSupportsStepTolerance = false;
+      firmwareSupportsSpeedRamp = false;
+      boardLabel = '控制板';
       firmwareVersion = null;
       clearTimeout(channelResetTimer);
       channelResetPending = null;
@@ -1893,17 +1904,25 @@ ws.onmessage = (ev) => {
     case 'heartbeat': {
       const d = msg.data;
       const versionChanged = firmwareVersion !== d.fwVersion;
+      boardLabel = boardLabelFromFlags(d.boardFlags);
+      const capabilitiesChanged = firmwareSupportsPositionStep !== !!(d.boardFlags & 0x02) ||
+        firmwareSupportsShaftPosition !== !!(d.boardFlags & 0x04) ||
+        firmwareSupportsPositionReady !== !!(d.boardFlags & 0x08) ||
+        firmwareSupportsSpeedRamp !== !!(d.boardFlags & 0x10) ||
+        firmwareSupportsStepTolerance !== !!(d.boardFlags & 0x80);
       firmwareVersion = d.fwVersion;
       firmwareSupportsPositionStep = !!(d.boardFlags & 0x02);
       firmwareSupportsShaftPosition = !!(d.boardFlags & 0x04);
       firmwareSupportsPositionReady = !!(d.boardFlags & 0x08);
+      firmwareSupportsStepTolerance = !!(d.boardFlags & 0x80);
+      firmwareSupportsSpeedRamp = !!(d.boardFlags & 0x10);
       const [major, minor] = String(d.fwVersion).split('.').map(Number);
       const supported = major > 1 || (major === 1 && minor >= 5);
-      const changed = versionChanged || firmwareSupportsLoop !== supported || !boardOnline;
+      const changed = versionChanged || capabilitiesChanged || firmwareSupportsLoop !== supported || !boardOnline;
       firmwareSupportsLoop = supported;
       noteBoardResponse();
       if (changed) for (const i of channelIds()) renderChannel(i);
-      setLink(true, 'A 板在线');
+      setLink(true, '控制板在线');
       $('#fwText').textContent = `固件 ${d.fwVersion} · ${Math.round(d.uptimeS / 60)} 分钟`;
       // 收到心跳说明板子已在跑,若清单还没拿到就再要一次(见 startInventoryFetch 注释)
       if (!inventory.length) startInventoryFetch();
@@ -1950,7 +1969,7 @@ ws.onmessage = (ev) => {
        * 注意:清单为空是**正常状态**(预置电机已清空,等用户添加),
        * 所以这里不能用 items.length 判断"是否成功"。
        */
-      setLink(true, 'A 板在线');
+      setLink(true, '控制板在线');
       if (inventoryTimer) {
         clearInterval(inventoryTimer);
         inventoryTimer = null;
@@ -2011,7 +2030,7 @@ ws.onmessage = (ev) => {
           channelsReady = true;
           noteBoardResponse();
           for (const i of channelIds()) renderChannel(i);
-          setLink(true, 'A 板在线 · 请重新绑定电机');
+          setLink(true, '控制板在线 · 请重新绑定电机');
         } else sendResetChannel();
         break;
       }
@@ -2084,7 +2103,7 @@ ws.onmessage = (ev) => {
 
     case 'telemetry': {
       noteBoardResponse();
-      setLink(true, 'A 板在线');
+      setLink(true, '控制板在线');
       for (const it of msg.data.items) {
         if (!channelsReady || !sessionChannels.has(it.channelId)) continue;
         const previous = telemetryByChannel.get(it.channelId);
@@ -2198,10 +2217,11 @@ ws.onmessage = (ev) => {
 };
 
 function setLink(ok, text) {
-  if (text === 'A 板在线' && serialConnected && !channelsReady) {
+  if (text === '控制板在线' && serialConnected && !channelsReady) {
     ok = !!channelResetPending;
     text = channelResetPending ? '正在清理旧测试通道…' : channelResetError || '通道未就绪 · 点击同步清单重试';
   }
+  text = text.replace(/^控制板在线/, `${boardLabel}在线`);
   document.body.dataset.link = ok ? 'online' : 'offline';
   $('#linkDot').classList.toggle('online', ok);
   $('#linkText').textContent = text;

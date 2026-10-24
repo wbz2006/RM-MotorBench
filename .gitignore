@@ -14,6 +14,7 @@ motor_bench_host/dist/
 
 # ---- 文档配图(原框架自带,体积大且与本项目无关) ----
 **/.assets/
+# 当前文档配图统一位于 docs/images/，随文档入库。
 
 # ---- 编辑器 / 系统 ----
 .vscode/
@@ -44,3 +45,17 @@ CMakeUserPresets.json
 # ---- 临时文件(推送脚本用,勿提交) ----
 _commit_msg.txt
 _push.js
+
+# ---- MC02 shared VS Code configuration ----
+!motorbench-mc02/.vscode/
+motorbench-mc02/.vscode/*
+!motorbench-mc02/.vscode/settings.json
+!motorbench-mc02/.vscode/extensions.json
+!motorbench-mc02/.vscode/tasks.json
+!motorbench-mc02/.vscode/launch.json
+
+# ---- Local packaging experiments / editor state ----
+motor_bench_host/dist-*/
+motor_bench_host/.tmp-*/
+**/.settings/
+docs/images/.*-render.html
