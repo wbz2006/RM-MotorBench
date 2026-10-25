@@ -21,8 +21,8 @@ if (!process.versions.electron) {
     const timeout = setTimeout(() => { console.error('Chart browser test timed out'); app.exit(1); }, 20000);
     const fixture = `<!doctype html><html><head><link rel="stylesheet" href="/style.css">
       <style>body { padding: 12px; } .channel { display: block; padding: 12px; }
-      .chart-box { height: 300px; } .channel canvas[data-role=chart] { height: 250px; }</style></head>
-      <body><div class="channel"><div class="chart-box"><canvas data-role="chart"></canvas></div></div>
+      .chart-box { height: 300px; } .chart-viewport { height: 250px; }</style></head>
+      <body><div class="channel"><div class="chart-box"><div class="chart-viewport"><canvas data-role="chart"></canvas></div></div></div>
       <script type="module">
         import { MotorChart } from '/chart.js';
         window.chart = new MotorChart(document.querySelector('canvas'));
@@ -50,8 +50,40 @@ if (!process.versions.electron) {
         };
         seed();
       </script></body></html>`;
+    // Use the production template and CSS: a fixed-height fixture hides grid/flex sizing loops.
+    const channelTemplate = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8')
+      .match(/<template id="channelTpl">([\s\S]*?)<\/template>/)[1];
+    const layoutFixture = `<!doctype html><html><head><link rel="stylesheet" href="/style.css"></head>
+      <body><main class="channels"></main><template>${channelTemplate}</template>
+      <script type="module">
+        import { MotorChart } from '/chart.js';
+        window.layoutCharts = [];
+        window.resetLayout = (count = 1) => {
+          layoutCharts.forEach(chart => chart.destroy());
+          document.querySelector('.channels').replaceChildren();
+          for (let i = 0; i < count; i++) {
+            document.querySelector('.channels').append(document.querySelector('template').content.cloneNode(true));
+          }
+          window.layoutCharts = [...document.querySelectorAll('canvas')].map(canvas => new MotorChart(canvas));
+        };
+        window.sampleLayout = async () => {
+          const samples = [];
+          for (let frame = 0; frame < 24; frame++) {
+            layoutCharts.forEach(chart => chart.push(Math.sin(frame) * 20, Math.cos(frame) * 2, 30));
+            await new Promise(requestAnimationFrame);
+            samples.push({
+              pageHeight: document.documentElement.scrollHeight,
+              heights: [...document.querySelectorAll('.channel, .bind-row, .control, .chart-box, canvas')]
+                .map(element => element.getBoundingClientRect().height),
+            });
+          }
+          return samples;
+        };
+        resetLayout();
+      </script></body></html>`;
     const server = http.createServer((req, res) => {
       if (req.url === '/') { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(fixture); }
+      else if (req.url === '/layout') { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(layoutFixture); }
       else if (req.url === '/chart.js' || req.url === '/style.css') {
         res.setHeader('Content-Type', req.url.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8');
         res.end(fs.readFileSync(path.join(__dirname, req.url.slice(1))));
@@ -130,8 +162,51 @@ if (!process.versions.electron) {
       assert.match(await evaluate('chart.tooltip.textContent'), /50 deg/, 'readout matches bucketed curves rather than the unsmoothed samples');
       await evaluate('chart.destroy(); chart.canvas.dispatchEvent(new PointerEvent("pointermove"))');
       assert.equal(await evaluate('document.querySelectorAll(".chart-tooltip").length'), 0, 'destroy removes tooltip and pointer handlers');
+
+      win.setContentSize(1440, 1000);
+      await win.loadURL(`http://127.0.0.1:${server.address().port}/layout`);
+      async function assertStableLayout(label) {
+        const samples = await evaluate('sampleLayout()');
+        const initial = samples[3]; // Allow the first layout and ResizeObserver notifications to settle.
+        for (const sample of samples.slice(4)) {
+          assert.ok(sample.heights.every((height, i) => Math.abs(height - initial.heights[i]) <= 1),
+            `${label}: chart and adjacent controls must not grow during streaming: ${JSON.stringify({ initial, sample })}`);
+          assert.ok(Math.abs(sample.pageHeight - initial.pageHeight) <= 1, `${label}: page height stays stable`);
+        }
+        assert.equal(await evaluate(`layoutCharts.every(chart =>
+          chart.canvas.height === Math.round(chart.canvas.getBoundingClientRect().height * devicePixelRatio)
+          && chart.canvas.width === Math.round(chart.canvas.getBoundingClientRect().width * devicePixelRatio))`),
+          true, `${label}: backing pixels still match the CSS size and device scale`);
+      }
+      for (const dpr of [1, 1.25, 2]) {
+        await win.webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+          width: 1440, height: 1000, deviceScaleFactor: dpr, mobile: false,
+        });
+        await evaluate('resetLayout()');
+        await assertStableLayout(`single channel, DPR ${dpr}`);
+      }
+      await screenshot('chart-layout-desktop');
+      const collapsedHeight = await evaluate('document.querySelector("canvas").getBoundingClientRect().height');
+      await evaluate('document.querySelector(".loop-card details").open = true');
+      await assertStableLayout('expanded PID help');
+      const expandedHeight = await evaluate('document.querySelector("canvas").getBoundingClientRect().height');
+      assert.ok(expandedHeight > collapsedHeight, 'chart still stretches to fit taller adjacent controls');
+      await evaluate('document.querySelector(".loop-card details").open = false');
+      await assertStableLayout('collapsed PID help');
+      const restoredHeight = await evaluate('document.querySelector("canvas").getBoundingClientRect().height');
+      assert.ok(Math.abs(restoredHeight - collapsedHeight) <= 1,
+        `chart can shrink back after controls collapse: ${JSON.stringify({ collapsedHeight, expandedHeight, restoredHeight })}`);
+      await evaluate('resetLayout(2)');
+      await assertStableLayout('two channels');
+      for (const width of [860, 390]) {
+        await win.webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+          width, height: 1000, deviceScaleFactor: 2, mobile: false,
+        });
+        await evaluate('resetLayout()');
+        await assertStableLayout(`single channel, ${width}px`);
+      }
       assert.deepEqual(exceptions, []);
-      console.log('PASS chart: interpolated intersections, orange guide, filtering, live updates, units, empty ranges, clear/leave/destroy, high DPI and narrow layouts.');
+      console.log('PASS chart: interpolated intersections, orange guide, filtering, live updates, units, empty ranges, clear/leave/destroy, high DPI, stable production grid/flex layouts, expand/collapse and narrow layouts.');
     } finally {
       clearTimeout(timeout);
       win?.destroy();

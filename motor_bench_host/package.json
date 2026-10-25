@@ -1,6 +1,6 @@
 {
   "name": "motor-bench-host",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "RoboMaster 多开发板电机测试台 · 上位机（串口桥 + Web UI + 桌面端）",
   "type": "module",
   "private": true,

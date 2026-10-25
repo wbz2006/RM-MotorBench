@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101211" />
     <title>MOTORBENCH / 电机测试台</title>
-    <link rel="stylesheet" href="style.css?v=20261024-loader-control" />
+    <link rel="stylesheet" href="style.css?v=20261025-chart-layout" />
   </head>
   <body>
     <a class="skip-link" href="#channels">跳转到电机通道</a>
@@ -371,8 +371,10 @@
             </select>
             <button data-role="chartClear" class="ghost" title="清空历史采样">清空</button>
           </div>
-          <canvas data-role="chart" width="600" height="170"
-                  role="img" aria-label="电机实时曲线，移动鼠标可通过橙色竖线读取各曲线交点值"></canvas>
+          <div class="chart-viewport">
+            <canvas data-role="chart" width="600" height="170"
+                    role="img" aria-label="电机实时曲线，移动鼠标可通过橙色竖线读取各曲线交点值"></canvas>
+          </div>
           <!--
             空态占位:通道还没收到遥测时曲线是一片纯黑,看上去像坏了。
             用一行说明替代"看着像故障的空白"。
@@ -511,11 +513,11 @@
 
     <footer class="hint">
       <p>
-        <span class="footer-label">UI 20261024-loader-control</span>
+        <span class="footer-label">UI 20261025-chart-layout</span>
       </p>
     </footer>
     </div>
 
-    <script type="module" src="ui.js?v=20261024-loader-control"></script>
+    <script type="module" src="ui.js?v=20261025-chart-layout"></script>
   </body>
 </html>
