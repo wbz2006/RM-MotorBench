@@ -18,6 +18,48 @@
             "dependsOn": "Configure Debug",
             "group": {"kind": "build", "isDefault": true},
             "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Configure Release",
+            "type": "process",
+            "command": "cmake",
+            "args": ["--preset", "Release"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": []
+        },
+        {
+            "label": "Build Release",
+            "type": "process",
+            "command": "cmake",
+            "args": ["--build", "--preset", "Release", "--parallel"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "dependsOn": "Configure Release",
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Flash A (DAPLink, Debug)",
+            "type": "process",
+            "command": "openocd",
+            "args": [
+                "-f", "${workspaceFolder}/openocd_dap.cfg",
+                "-c", "program {build/Debug/basic_framework_ATYPE.elf} verify reset exit"
+            ],
+            "options": {"cwd": "${workspaceFolder}"},
+            "dependsOn": "Build Debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "Flash A (DAPLink, Release)",
+            "type": "process",
+            "command": "openocd",
+            "args": [
+                "-f", "${workspaceFolder}/openocd_dap.cfg",
+                "-c", "program {build/Release/basic_framework_ATYPE.elf} verify reset exit"
+            ],
+            "options": {"cwd": "${workspaceFolder}"},
+            "dependsOn": "Build Release",
+            "problemMatcher": []
         }
     ]
 }

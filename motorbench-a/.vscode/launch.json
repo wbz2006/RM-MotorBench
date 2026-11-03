@@ -2,6 +2,21 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "MotorBench A DAPLink (OpenOCD)",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/basic_framework_ATYPE.elf",
+            "servertype": "openocd",
+            "serverpath": "openocd",
+            "gdbPath": "arm-none-eabi-gdb",
+            "device": "STM32F427IIH6",
+            "interface": "swd",
+            "configFiles": ["${workspaceFolder}/openocd_dap.cfg"],
+            "runToEntryPoint": "main",
+            "preLaunchTask": "Build Debug"
+        },
+        {
             "type": "stlinkgdbtarget",
             "request": "launch",
             "name": "STM32Cube: MotorBench ST-Link",

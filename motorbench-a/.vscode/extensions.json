@@ -1,5 +1,6 @@
 {
     "recommendations": [
-        "stmicroelectronics.stm32-vscode-extension"
+        "stmicroelectronics.stm32-vscode-extension",
+        "marus25.cortex-debug"
     ]
 }
