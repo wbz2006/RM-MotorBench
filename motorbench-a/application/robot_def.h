@@ -5,9 +5,10 @@
 #define MOTOR_BENCH_APP
 #define MOTOR_BENCH_DEFAULT_CONFIG
 
-/* Select exactly one host link. UART uses UART7 at 115200 baud. */
-#define MOTOR_BENCH_LINK_USB
-/* #define MOTOR_BENCH_LINK_UART */
+/* Select exactly one host link. UART7 connects to the ESP32-S3 bridge. */
+// #define MOTOR_BENCH_LINK_USB
+#define MOTOR_BENCH_LINK_UART
+#define MOTOR_BENCH_UART_BAUD_RATE 115200U
 
 #if defined(MOTOR_BENCH_LINK_USB) == defined(MOTOR_BENCH_LINK_UART)
 #error "Select exactly one motor bench host link"

@@ -4,7 +4,7 @@
 
 ![RM-MotorBench 整机接线一览：电池 → 分电板 → 开发板 C 型 → CAN 电机（C610 + M2006），开发板 USB 连电脑](docs/images/overview-photo.png)
 
-网页设定电机种类与转速，指令经 **USB 虚拟串口**下发到永久烧录固件的开发板（支持**大疆 A 型、C 型及达妙 MC02**；MC02 已完成源码迁移和编译，待实机验证），
+网页设定电机种类与转速，指令经 **USB CDC 或 ESP32-S3 Wi-Fi TCP 桥**下发到永久烧录固件的开发板（A 板默认 UART7 连接 ESP32-S3，C 板和达妙 MC02 使用 USB CDC；MC02 已完成源码迁移和编译，待实机验证），
 由开发板驱动 CAN 总线上的常见无刷电机，转速、电流、温度**实时回传**。
 实验室里机械组想测一颗电机，不用再找电控组改代码、烧板子 —— 配置全在网页上，测试变成点几下的事；
 也适合发射机构简单测试（射频换算 + 拨弹盘实测）和自旋靶车（正弦/阶梯速度输出）这类场景。
@@ -41,7 +41,7 @@
 |---|---|
 | 前端 | 原生 Web UI（无框架依赖） |
 | 桥接 | Node + WebSocket + serialport |
-| 传输 | USB CDC 虚拟串口（MC02 使用 HS 外设的全速模式） |
+| 传输 | A 板默认 UART7 + ESP32-S3 Wi-Fi TCP 桥；C 板 / MC02 使用 USB CDC（MC02 使用 HS 外设的全速模式） |
 | 控制 | A 板 STM32F427IIH6 / C 板 STM32F407IGH6 / MC02 STM32H723VGT6 |
 | 驱动 | CAN 总线，支持常见的无刷电机 |
 
@@ -53,6 +53,7 @@
 | [`motorbench-c`](motorbench-c) | **C 板固件**。从 A 板迁入的独立快照，不自动同步，[迁移与验证说明](motorbench-c/README.md) |
 | [`motorbench-mc02`](motorbench-mc02) | **MC02 固件**。H723 / FDCAN / USB CDC 独立工程，[迁移与验证说明](motorbench-mc02/README.md) |
 | [`motor_bench_host`](motor_bench_host) | **上位机**。含 Electron 打包配置与详细使用教程，[上位机说明](motor_bench_host/README.md) |
+| [`esp32s3_wifi_bridge`](esp32s3_wifi_bridge) | **ESP32-S3 Wi-Fi TCP 桥接固件**，[接线、构建与使用说明](esp32s3_wifi_bridge/README.md) |
 | [`docs`](docs) | 三板功能对照与文档配图，[固件对照](docs/FIRMWARE_PARITY.md) |
 | [`tools`](tools) | Windows 启动器与文档配图维护脚本，[使用说明](tools/README.md) |
 | `启动电机测试台.bat` | 双击启动浏览器版上位机 |
@@ -95,8 +96,8 @@ npm start             # 打开 http://127.0.0.1:3000
 
 ![上位机界面：① 连接控制板 ② ＋ 添加电机 ③ 电机通道卡片 ④ 全部急停](docs/images/ui-annotated.png)
 
-1. XT30 接 **24V** 电源，USB 线接开发板 Micro-USB
-2. 网页选串口 → 打开（Windows 设备管理器里产品名 `Motor Bench CDC`，普通 USB 线即可）
+1. XT30 接 **24V** 电源；C 板 / MC02 用 USB 线接开发板 Micro-USB。A 板使用 ESP32-S3 Wi-Fi TCP 桥，按[桥接器说明](esp32s3_wifi_bridge/README.md)连接 UART、供电并烧录。
+2. A 板上位机连接 `RM-MotorBench-ESP32` 热点，在「设备接入 → ESP32-S3 Wi-Fi（TCP）」连接 `192.168.4.1:7000`；C 板 / MC02 在 USB 串口列表中选择对应端口。
 3. 右上角 `＋` 添加电机：型号 / 总线 / 电调 ID（按电调拨码实际值填）
 4. 通道卡片里选电机 → 绑定 → 使能 → 拖动滑块设转速
 5. 列表行末 `×` 移除电机；结束时「停机」或按空格急停

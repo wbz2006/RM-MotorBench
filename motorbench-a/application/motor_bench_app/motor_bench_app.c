@@ -629,20 +629,17 @@ void MotorBenchAppInit(void)
     /*
      * 注册上位机通信通道。
      *
-     * 默认使用 USB 虚拟串口(CDC):A 板板载 Micro USB OTG FS,
-     * 直接插电脑线就能用,不需要外接 USB 转串口模块。
-     * 该工程时钟树为 HSE 12MHz → PLL(M=6,N=168,P=2 → 168MHz,Q=7 → 48MHz),
-     * PLLQ 输出的 48MHz 正好满足 USB OTG FS 的时钟要求,无需额外配置。
-     *
-     * 若实验室习惯用有线串口,把 robot_def.h 里的宏换成 MOTOR_BENCH_LINK_UART。
+     * UART7(PE7/PE8)连接 ESP32-S3 Wi-Fi TCP 桥,上位机通过热点通信。
+     * 需要 USB CDC 时,把 robot_def.h 中的链路宏切换为 MOTOR_BENCH_LINK_USB。
      */
 #if defined(MOTOR_BENCH_LINK_USB)
     MotorBenchInitUSB();
 #elif defined(MOTOR_BENCH_LINK_UART)
     /*
-     * A 板上 UART7(PE7/PE8)与 UART8(PE0/PE1)均已配置 RX DMA 且
-     * 其 DMA 中断已在 stm32f4xx_it.c 中使能,波特率 115200。
+     * ESP32-S3 桥接器的 UART1 与本 UART7 均使用 115200 baud。
      */
+    huart7.Init.BaudRate = MOTOR_BENCH_UART_BAUD_RATE;
+    if (HAL_UART_Init(&huart7) != HAL_OK) Error_Handler();
     MotorBenchInit(&huart7);
 #else
 #error "请在 robot_def.h 中定义 MOTOR_BENCH_LINK_USB 或 MOTOR_BENCH_LINK_UART"
