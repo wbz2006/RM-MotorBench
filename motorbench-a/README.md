@@ -3,6 +3,8 @@
 本目录是当前固件主工程，基于 STM32F427IIH6、CubeMX 和 CMake/Ninja。
 旧 Makefile 工程已从当前目录结构移除，需要时可从 Git 历史查看。
 
+当前 A 板默认通过 UART7（115200, 8-N-1）连接 ESP32-S3 Wi-Fi TCP 桥：A 板 PE8/UART7_TX 接 ESP32-S3 RX，PE7/UART7_RX 接 ESP32-S3 TX，双方共地，UART 电平为 3.3V。上位机连接 ESP32-S3 热点后通过 TCP 控制；桥接器接线、烧录与连接步骤见 [ESP32-S3 桥接说明](../esp32s3_wifi_bridge/README.md)。固件约 1.5 秒收不到上位机心跳时，会停止全部已登记电机并关闭控制链路；恢复 USB CDC 可在 `application/robot_def.h` 中切换链路宏后重新编译烧录。C 板和 MC02 仍使用 USB CDC。
+
 ## 当前固件 1.26：固化 M2006 位置环参数
 
 A、C、MC02 三套工程的电机控制、默认 PID、位置／拨弹测试、断线恢复与快速归零已对齐。
@@ -266,7 +268,7 @@ Debug 使用与旧工程一致的 `-Og` 优化，Release 使用 `-Os`；浮点 A
 
 ## 迁移范围与执行顺序
 
-- 保留动态添加/移除电机、绑定通道、启停、三环 PID 配置、遥测、USB CDC 和 UART7 备用链路。
+- 保留动态添加/移除电机、绑定通道、启停、三环 PID 配置、遥测、USB CDC 和 UART7 ESP32-S3 链路。
 - 电机测试台当前接入 DJI M3508/M2006/GM6020 与 DM4310；原有 LK、HT、舵机等通用驱动源码也保留，尚未因此新增上位机支持。
 - 保留 CAN、DWT、USB、串口、PWM、PID、守护和 RTT。整车底盘、云台、发射、遥控器、裁判系统及 IMU 应用留在旧工程，本工程不创建机器人或 INS 任务。
 - 保留原有外设初始化、时钟、USB VID/PID、PID 数值及心跳超时参数。

@@ -163,6 +163,11 @@ static uint8_t usb_output[1024];
 static unsigned usb_output_len;
 static USBCallback usb_receive;
 static uint16_t factory_rx;
+static USARTInstance uart_instance;
+static uint8_t *uart_output;
+static uint16_t uart_output_len;
+static unsigned uart_sends;
+static USART_TRANSFER_MODE uart_mode;
 static DMMotorInstance *factory_motor;
 static char log_output[4096];
 static size_t log_used;
@@ -188,9 +193,18 @@ uint8_t CDC_Transmit_FS(uint8_t *data, uint16_t len) {
     return 0;
 }
 void USARTSend(USARTInstance *u, uint8_t *data, uint16_t len, USART_TRANSFER_MODE mode) {
-    (void)u; (void)data; (void)len; (void)mode;
+    uart_output = data;
+    uart_output_len = len;
+    uart_mode = mode;
+    ++uart_sends;
+    u->usart_handle->gState = HAL_UART_STATE_READY + 1;
 }
-USARTInstance *USARTRegister(USART_Init_Config_s *c) { (void)c; return NULL; }
+USARTInstance *USARTRegister(USART_Init_Config_s *c) {
+    uart_instance.usart_handle = c->usart_handle;
+    uart_instance.recv_buff_size = c->recv_buff_size;
+    uart_instance.module_callback = c->module_callback;
+    return &uart_instance;
+}
 uint8_t *USBInit(USB_Init_Config_s c) { usb_receive = c.rx_cbk; return usb_buffer; }
 float DWT_GetDeltaT(uint32_t *last) {
     float dt = (now - *last) / 1000.0f;
@@ -1354,6 +1368,38 @@ static int reconnect(void) {
 }
 #endif
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "uart-heartbeat")) {
+        UART_HandleTypeDef uart = { .gState = HAL_UART_STATE_READY };
+        MotorBenchInit(&uart);
+        unsigned len = (unsigned)strlen(argv[2]) / 2;
+        for (unsigned i = 0; i < len; ++i) {
+            unsigned byte;
+            sscanf(argv[2] + i * 2, "%2x", &byte);
+            uart_instance.recv_buff[i] = (uint8_t)byte;
+        }
+        uart_instance.module_callback();
+        CHECK(uart_sends == 1);
+        CHECK(uart_mode == USART_TRANSFER_IT);
+        CHECK(uart_output != uart_instance.recv_buff);
+        uint8_t first[256];
+        memcpy(first, uart_output, uart_output_len);
+        CHECK(uart_output_len == 13 && first[0] == 0xa5 && first[12] == 0x5a);
+        uart_instance.module_callback();
+        CHECK(uart_sends == 1);
+        CHECK(memcmp(first, uart_output, uart_output_len) == 0);
+        for (unsigned i = 0; i < len; ++i) {
+            unsigned byte;
+            sscanf(argv[2] + i * 2, "%2x", &byte);
+            uart_instance.recv_buff[i] = (uint8_t)byte;
+        }
+        uart = (UART_HandleTypeDef){ .gState = HAL_UART_STATE_READY };
+        uart_instance.module_callback();
+        CHECK(uart_sends == 2);
+        printf("UART_HEARTBEAT_WIRE ");
+        for (unsigned i = 0; i < uart_output_len; ++i) printf("%02x", uart_output[i]);
+        puts("");
+        return failures ? 1 : 0;
+    }
 #ifdef MB_AUTO_RECONNECT_TEST
     if (argc == 2 && !strcmp(argv[1], "reconnect")) return reconnect();
 #endif
@@ -1793,6 +1839,15 @@ int main(void) {
   const mcu = { 'motorbench-a': 'STM32F427xx', 'motorbench-c': 'STM32F407xx', 'motorbench-mc02': 'STM32H723xx' }[board];
   execFileSync(compiler, ['-std=gnu11', `-D${mcu}`, '-O1', '-ffunction-sections', '-fdata-sections',
     ...includes, main, ...sources, '-Wl,--gc-sections', '-lm', '-o', exe], { env, stdio: 'pipe' });
+  if (path.basename(root) === 'motorbench-a') {
+    const output = execFileSync(exe, ['uart-heartbeat', buildHeartbeat().toString('hex')], { env, encoding: 'utf8', stdio: 'pipe' });
+    const wire = output.match(/UART_HEARTBEAT_WIRE ([0-9a-f]+)/)[1];
+    const frames = new FrameParser().push(Buffer.from(wire, 'hex'));
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0].type, FrameType.HEARTBEAT);
+    assert.ok(parseHeartbeatAck(frames[0].payload));
+    console.log('PASS A UART7 heartbeat uses IT, retains async TX data, rejects busy sends and resumes after completion');
+  }
   {
     const output = execFileSync(exe, ['feeder-steps'], { env, encoding: 'utf8', stdio: 'pipe' });
     const stepWire = output.match(/POSITION_STEP_WIRE ([0-9a-f]+)/)?.[1];

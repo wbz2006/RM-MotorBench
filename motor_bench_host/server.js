@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { parseTcpPath, TcpPort } from './tcp-port.js';
 import {
   FrameParser,
   FrameType,
@@ -113,6 +114,7 @@ const parser = new FrameParser();
 
 /** 串口实例,未连接时为 null */
 let serialPort = null;
+let serialOpening = Promise.resolve();
 let heartbeatTimer = null;
 let heartbeatBurstTimer = null;
 
@@ -213,8 +215,10 @@ function handleCommand(cmd) {
 }
 
 wss.on('connection', (ws) => {
+  const capabilities = ['resetChannels', 'setLoop', 'positionStep', 'positionStepTolerance'];
+  capabilities.push('wifiTcp');
   broadcast({ type: 'clients', count: wss.clients.size });
-  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities: ['resetChannels', 'setLoop', 'positionStep', 'positionStepTolerance'] }));
+  ws.send(JSON.stringify({ type: 'hello', protocol: 'motor-bench/1.0', capabilities }));
   // A page reload does not close the Node-owned USB serial connection.
   ws.send(JSON.stringify({ type: 'serial', open: !!serialPort?.isOpen,
     path: serialPort?.path, baud: serialPort?.baudRate }));
@@ -230,10 +234,19 @@ wss.on('connection', (ws) => {
       listSerialPorts().catch((e) =>
         ws.send(JSON.stringify({ type: 'error', message: `枚举串口失败: ${e.message}` })),
       );
-    } else if (cmd.type === 'openSerial') {
-      openSerial(cmd.path, cmd.baud ?? args.baud)
+    } else if (cmd.type === 'openSerial' || cmd.type === 'connectWifi') {
+      const wifi = cmd.type === 'connectWifi';
+      if (wifi) {
+        if (typeof cmd.host !== 'string' || !/^[^:\s/]+$/.test(cmd.host) ||
+          !Number.isInteger(cmd.port) || cmd.port < 1 || cmd.port > 65535) {
+          ws.send(JSON.stringify({ type: 'error', message: 'ESP32-S3 Wi-Fi 地址或端口无效' }));
+          return;
+        }
+      }
+      const transportPath = wifi ? `TCP://${cmd.host}:${cmd.port}` : cmd.path;
+      openSerial(transportPath, cmd.baud ?? args.baud)
         .then((info) => ws.send(JSON.stringify({ type: 'serial', open: true, ...info })))
-        .catch((e) => ws.send(JSON.stringify({ type: 'error', message: `打开串口失败: ${e.message}` })));
+        .catch((e) => ws.send(JSON.stringify({ type: 'error', message: `打开${wifi ? 'Wi-Fi' : '串口'}失败: ${e.message}` })));
     } else if (cmd.type === 'closeSerial') {
       closeSerial()
         .then(() => {
@@ -332,7 +345,9 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => broadcast({ type: 'clients', count: wss.clients.size }));
+  ws.on('close', () => {
+    broadcast({ type: 'clients', count: wss.clients.size });
+  });
 });
 
 /* ---------------- 串口 ---------------- */
@@ -347,26 +362,41 @@ async function getSerialPortModule() {
 async function listSerialPorts() {
   const { SerialPort } = await getSerialPortModule();
   const ports = await SerialPort.list();
-  broadcast({ type: 'ports', ports: ports.map((p) => ({ path: p.path, manufacturer: p.manufacturer })) });
+  broadcast({ type: 'ports', ports: ports.map((p) => ({
+    path: p.path,
+    manufacturer: p.manufacturer,
+    friendlyName: p.friendlyName,
+  })) });
 }
 
 async function openSerial(portPath, baud) {
   const { SerialPort } = await getSerialPortModule();
-  if (serialPort && serialPort.isOpen) await closeSerial();
+  const previousOpening = serialOpening;
+  let releaseOpening;
+  serialOpening = new Promise(resolve => { releaseOpening = resolve; });
+  await previousOpening;
+  try {
+    if (serialPort) await closeSerial();
 
-  return new Promise((resolve, reject) => {
-    const sp = new SerialPort(
-      { path: portPath, baudRate: baud, autoOpen: true },
-      (err) => {
-        if (err) return reject(err);
-        broadcast({ type: 'serial', open: true, path: portPath, baud });
-        startHeartbeat();
-        // 立刻拉一次电机清单,让界面马上知道这块板能测哪些电机
-        sp.write(buildInventoryQuery());
-        resolve({ path: portPath, baud });
-      },
-    );
-    sp.on('data', (chunk) => {
+    return await new Promise((resolve, reject) => {
+      const isTcp = portPath.startsWith('TCP://');
+      const tcp = isTcp ? parseTcpPath(portPath) : null;
+      const Port = isTcp ? TcpPort : SerialPort;
+      const options = isTcp ? { ...tcp, autoOpen: true } : { path: portPath, baudRate: baud, autoOpen: true };
+      const sp = new Port(
+        options,
+        (err) => {
+          if (err) {
+            if (serialPort === sp) serialPort = null;
+            if (typeof sp.close === 'function' && isTcp) sp.close(() => reject(err));
+            else reject(err);
+            return;
+          }
+          onTransportOpen(sp, portPath, baud);
+          resolve({ path: portPath, baud });
+        },
+      );
+      sp.on('data', (chunk) => {
       /*
        * 【诊断】原始收包日志。
        * 固件侧已用 [tx] COMPLETE 证明数据离开了芯片,若这里仍然没有任何输出,
@@ -410,26 +440,44 @@ async function openSerial(portPath, baud) {
           if (ack) broadcast({ type: 'positionStepAck', data: ack });
         }
       }
+      });
+      if (isTcp) sp.on('open', () => onTransportOpen(sp, portPath, baud));
+      sp.on('error', (e) => {
+        if (isTcp && !sp.isOpen) return;
+        broadcast({ type: 'error', message: `${isTcp ? 'Wi-Fi TCP' : '串口'}错误: ${e.message}` });
+      });
+      sp.on('close', () => {
+        if (serialPort && serialPort !== sp) return;
+        const reconnectingTcp = isTcp && !sp._manualClose;
+        if (serialPort === sp && !reconnectingTcp) serialPort = null;
+        sp._motorBenchOpenNotified = false;
+        broadcast({ type: 'serial', open: false });
+        stopHeartbeat();
+        console.log(`[RX] 本次连接累计收到 ${rxTotalBytes} 字节,共 ${rxDiagCount} 个数据包`);
+        rxDiagCount = 0;
+        rxTotalBytes = 0;
+      });
+      serialPort = sp;
     });
-    sp.on('error', (e) => broadcast({ type: 'error', message: `串口错误: ${e.message}` }));
-    sp.on('close', () => {
-      if (serialPort && serialPort !== sp) return;
-      if (serialPort === sp) serialPort = null;
-      broadcast({ type: 'serial', open: false });
-      stopHeartbeat();
-      console.log(`[RX] 本次连接累计收到 ${rxTotalBytes} 字节,共 ${rxDiagCount} 个数据包`);
-      rxDiagCount = 0;
-      rxTotalBytes = 0;
-    });
-    serialPort = sp;
-  });
+  } finally {
+    releaseOpening();
+  }
+}
+
+function onTransportOpen(sp, portPath, baud) {
+  if (serialPort !== sp || !sp.isOpen || sp._motorBenchOpenNotified) return;
+  sp._motorBenchOpenNotified = true;
+  broadcast({ type: 'serial', open: true, path: portPath, baud });
+  startHeartbeat();
+  // 立刻拉一次电机清单,让界面马上知道这块板能测哪些电机
+  sp.write(buildInventoryQuery());
 }
 
 async function closeSerial() {
   stopHeartbeat();
   const closingPort = serialPort;
   serialPort = null;
-  if (closingPort && closingPort.isOpen) {
+  if (closingPort && (closingPort.isOpen || closingPort.path?.startsWith('TCP://'))) {
     await new Promise((resolve, reject) => closingPort.close((error) => error ? reject(error) : resolve()));
   }
 }

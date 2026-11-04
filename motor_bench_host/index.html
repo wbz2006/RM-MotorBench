@@ -30,7 +30,7 @@
     <header class="topbar" id="top">
       <div class="brand">
         <span class="brand-word">MOTOR<span>BENCH</span><span class="brand-cursor" aria-hidden="true">_</span></span>
-        <span class="hardware-tag">MULTI-BOARD <span>/</span> USB</span>
+        <span class="hardware-tag">MULTI-BOARD <span>/</span> SERIAL</span>
       </div>
       <div class="link-state">
         <span class="link-label"><span class="dot" id="linkDot"></span><span id="linkText">未连接</span></span>
@@ -60,7 +60,7 @@
           <li data-step="test"><span class="step-number">04</span><span>使能并测试</span><small>观察实际反馈</small></li>
         </ol>
         <div class="workflow-next">
-          <div role="status" aria-live="polite" aria-atomic="true"><strong id="guideTitle">正在连接上位机服务</strong><p id="guideMessage">连接成功后，选择控制板的 USB 串口。</p></div>
+          <div role="status" aria-live="polite" aria-atomic="true"><strong id="guideTitle">正在连接上位机服务</strong><p id="guideMessage">连接成功后，选择控制板的串口。</p></div>
           <button id="guideAction" class="ghost" disabled>请稍候</button>
         </div>
         <details class="context-help first-test-help"><summary>第一次测试怎么做？</summary><p>连接控制板 → 按实际型号、CAN 接口和电调 ID 添加电机 → 选择电机并绑定 → 保持目标为 0，点击使能 → 手动设置适合当前负载的小目标，观察曲线 → 点击停机。默认 PID 是调试起点，可在闭环配置中按需调整。</p><p>随时可点击顶部急停；本页面获得键盘焦点时，空格也会停止全部电机。</p></details>
@@ -70,21 +70,35 @@
 
     <section class="panel setup" id="setup" aria-label="设备接入与电机管理">
       <div class="setup-group" role="group" aria-label="连接控制板">
-        <div class="group-heading"><span class="group-marker" aria-hidden="true">↳</span><strong>连接控制板</strong><span>SERIAL LINK</span></div>
+        <div class="group-heading"><span class="group-marker" aria-hidden="true">↳</span><strong>连接控制板</strong><span>CONTROL LINK</span></div>
         <label>串口
-          <select id="portSelect" title="选择控制板的 USB 串口；不确定时可展开下方教程"><option value="">点击刷新…</option></select>
+          <select id="portSelect" title="选择 USB 串口；ESP32-S3 请使用 Wi-Fi 连接"><option value="">点击刷新…</option></select>
         </label>
         <button id="refreshPorts" title="重新扫描本机串口">刷新</button>
         <button id="openPort" class="primary" title="打开所选串口">连接</button>
         <button id="closePort" class="ghost" title="关闭串口">关闭</button>
         <button id="rescan" class="ghost" title="从板端同步电机列表">同步清单</button>
+        <details id="wifiSetup" class="context-help serial-help" open>
+          <summary>ESP32-S3 Wi-Fi（TCP）</summary>
+          <p>先在 Windows Wi-Fi 菜单连接热点 RM-MotorBench-ESP32（密码 motorbench），再连接桥接器。默认地址为 192.168.4.1，端口为 7000。</p>
+          <div class="wifi-actions">
+            <label>ESP32-S3 地址
+              <input id="wifiHost" value="192.168.4.1" inputmode="url" autocomplete="off">
+            </label>
+            <label>TCP 端口
+              <input id="wifiPort" type="number" min="1" max="65535" value="7000" inputmode="numeric">
+            </label>
+            <button id="connectWifi" type="button" class="primary">连接 Wi-Fi</button>
+          </div>
+          <p id="wifiStatus" role="status"></p>
+        </details>
         <details class="context-help serial-help">
           <summary>如何选择正确的串口？</summary>
           <ol>
             <li>右键点击 Windows 的“开始”图标，选择“设备管理器”。</li>
             <li>展开“端口（COM 和 LPT）”，查看现有的 COM 端口。</li>
-            <li>插拔控制板的 USB 数据线，观察哪个端口在拔下时消失、插回时出现，记下它的 COM 编号（例如 COM5）。</li>
-            <li>回到本页，点击“刷新”，在“串口”中选择相同的 COM 编号，再点击“连接”。</li>
+            <li>USB 连接时插拔数据线确认 COM 口；ESP32-S3 请先连接其 Wi-Fi 热点。</li>
+            <li>USB 选择对应 COM 口后点击“连接”；ESP32-S3 使用上方 Wi-Fi（TCP）入口。</li>
           </ol>
         </details>
         <div class="connection-status" aria-label="通信状态"><span id="serviceState">服务 · 连接中</span><span id="boardState">控制板 · 未连接</span><span id="feedbackState">电机反馈 · 未就绪</span></div>
@@ -518,6 +532,6 @@
     </footer>
     </div>
 
-    <script type="module" src="ui.js?v=20261025-chart-layout"></script>
+    <script type="module" src="ui.js?v=20261104-esp32s3-wifi"></script>
   </body>
 </html>

@@ -3473,5 +3473,38 @@ console.log('\n== 40. LK9025 / HT04 接入测试台 ==');
     wide.payload.readUInt16LE(3) === 0x302);
 }
 
+console.log('\n== 41. ESP32-S3 Wi-Fi link and link-loss motor stop ==');
+{
+  const ui = readFileSync(new URL('./ui.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  const firmware = readFileSync(new URL(
+    '../motorbench-a/modules/motor_bench/motor_bench.c', import.meta.url,
+  ), 'utf8');
+  const config = readFileSync(new URL(
+    '../motorbench-a/application/robot_def.h', import.meta.url,
+  ), 'utf8');
+  const callback = firmware.match(/static void MotorBenchLinkLostCallback\(void \*owner_id\)\s*\{[\s\S]*?\n\}/)?.[0];
+  const stopAll = firmware.match(/static void MotorBenchStopAll\(void\)\s*\{[\s\S]*?\n\}/)?.[0];
+
+  check('A board selects UART as its default host link',
+    /#define MOTOR_BENCH_LINK_UART/.test(config)
+    && !/^\s*#define MOTOR_BENCH_LINK_USB/m.test(config));
+  check('the host UI defaults to the ESP32-S3 TCP bridge',
+    /id="wifiHost" value="192\.168\.4\.1"/.test(html)
+    && /id="wifiPort" type="number" min="1" max="65535" value="7000"/.test(html));
+  check('A board UART matches the ESP32-S3 bridge default baud rate',
+    /#define\s+MOTOR_BENCH_UART_BAUD_RATE\s+115200U?\b/.test(config));
+  check('link loss stops every used motor and clears its enabled state',
+    !!stopAll && /for \(uint8_t i = 0; i < MB_CHANNEL_MAX; i\+\+\)/.test(stopAll)
+    && /MotorBenchForceStopInstance/.test(stopAll)
+    && /status_bit_enable = 0/.test(stopAll));
+  check('link-loss callback stops motors before closing the command gate',
+    !!callback
+    && callback.indexOf('MotorBenchStopAll();') < callback.indexOf('mb_link_online = 0;'));
+  check('link loss is detected by the host heartbeat timeout',
+    /#define\s+MB_LINK_TIMEOUT_COUNT\s+150\b/.test(firmware)
+    && /MotorBenchLinkLostCallback/.test(firmware));
+}
+
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

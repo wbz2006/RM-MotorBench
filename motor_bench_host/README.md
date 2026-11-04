@@ -59,9 +59,13 @@ node server.js --serial COM5 --baud 115200
 node server.js --host 0.0.0.0           # 允许同一局域网的手机/平板访问(谨慎)
 ```
 
-## 使用流程(USB 直连,推荐)
+## 使用流程（USB 或 ESP32-S3 Wi-Fi TCP）
 
-串口选择区保留可展开的“如何选择正确的串口？”教程：右键点击 Windows“开始”图标 → 设备管理器 → 端口（COM 和 LPT），插拔控制板 USB 数据线，记下随插拔消失、出现的 COM 编号；回到网页点击“刷新”，选择同一编号并连接。
+A 板默认经 UART7 连接 ESP32-S3 桥接器。上位机连接桥接器热点 `RM-MotorBench-ESP32`（密码 `motorbench`），在“设备接入 → ESP32-S3 Wi-Fi（TCP）”连接默认地址 `192.168.4.1:7000`。握手成功后，上位机通过 TCP 转发原有 MotorBench 协议；断线后会自动重连，控制板收到心跳超时会停止已登记电机，恢复连接后不会自动重新使能。
+
+接线与烧录：STM32 PE8/UART7_TX 接 ESP32-S3 RX GPIO18，PE7/UART7_RX 接 TX GPIO17，双方共地并使用 3.3 V UART 电平。桥接器默认 UART1 为 115200、8-N-1；具体开发板 GPIO 需按原理图核实。完整步骤见 [ESP32-S3 桥接说明](../esp32s3_wifi_bridge/README.md)。
+
+C 板和 MC02 仍使用 USB CDC；USB 连接在串口列表中选择对应端口。
 
 ### 曲线交点读数
 
@@ -101,16 +105,14 @@ M2006、M3508 默认不计入内置减速比，本区目标、实测、误差均
 浏览器版刷新页面即可使用，无需为此次界面更新重烧固件或重启 Node；桌面便携 EXE 需重新打包才能包含新界面。
 确认页脚版本为 `UI 20261025-chart-layout`。可用 `npm run test:guidance` 在隐藏的 Electron 窗口中验证模拟控制板流程及窄屏布局，不会访问实际串口。
 
-### 接入与测试
+### A 板 ESP32-S3 Wi-Fi TCP 接入与测试
 
-1. 用**一根普通 USB 线**把 A 板插到电脑(板载 Micro USB-OTG FS,接口编号 17)
-   —— 不需要外接 USB 转串口模块
-2. 上电烧录好电机测试台固件
-3. Windows 设备管理器会出现一个新的 **COM 口**(产品名 `Motor Bench CDC`)
-4. 页面点「刷新」选它 → 「打开」
-5. 页面自动拉取固件登记的电机清单并填入下拉框
-6. 选电机 → 「绑定」→ 拖滑块设转速 → 「使能」
-7. 结束务必「停机」或直接点顶部「急停」；页面处于焦点时也可按空格立即全停
+1. 按 [桥接器说明](../esp32s3_wifi_bridge/README.md) 烧录 ESP-IDF 固件，并确认 ESP32-S3 UART1、A 板 UART7 和共地接线正确。
+2. 上位机连接热点 `RM-MotorBench-ESP32`，密码为 `motorbench`；桥接器默认地址为 `192.168.4.1`，TCP 端口为 `7000`。
+3. 在设备接入区点击「连接 Wi-Fi」。等待「ESP32-S3 Wi-Fi 已连接」和「控制板已应答」；前者表示 TCP 握手成功，后者表示 A 板固件已收到心跳。
+4. 页面同步电机清单后，按正常流程绑定、使能和测试。TCP 断开时上位机会自动重连；断链期间固件约 1.5 秒未收到心跳会停止已登记电机，恢复通信后需手动使能。
+
+需要恢复有线 USB CDC 时，在 `motorbench-a/application/robot_def.h` 中启用 `MOTOR_BENCH_LINK_USB`、关闭 `MOTOR_BENCH_LINK_UART`，重新编译烧录；USB 使用板载 Micro USB-OTG FS，Windows 端口名为 `Motor Bench CDC`。C 板和 MC02 固件仍使用 USB CDC。
 
 测试通道卡片数量与板端登记的电机数量一致：添加一颗增加一张，删除后回收多余卡片，没有电机时不显示空通道。
 删除优先移除对应电机的卡片或未使用卡片；其余卡片的绑定、目标、PID、曲线和计算器参数保持。
@@ -303,7 +305,7 @@ M3508 反馈在转子侧，减速比参考 19；DM-J4310-2EC 内置 10:1 减速�
 | 上电默认停止 | 所有电机登记后即为 `MOTOR_STOP`,必须显式「使能」才输出 |
 | 未使能拒写参考值 | 通道未使能时板端拒绝写入并打日志 |
 | 参考值限幅 | 固件侧硬限幅 ±12000,防止误输入打飞电机 |
-| 心跳看门狗 | 上位机 200ms 一跳;约 1.5s 收不到(板端守护 150 拍 × 10ms),A 板自动全停 |
+| 心跳看门狗 | 上位机 200ms 一跳;约 1.5s 收不到(板端守护 150 拍 × 10ms),A 板自动停止全部已登记电机 |
 | 握手门闩 | 链路未建立时,除心跳/查询外的指令一律丢弃 |
 | 急停 | 页面「急停」、空格快捷键、页面关闭、服务 Ctrl+C 退出都会下发全停 |
 | USB 不阻塞 | 固件发送队列满时丢弃帧,不阻塞 500Hz 电机控制任务 |
@@ -339,9 +341,7 @@ Node 实现 —— 比"两边各写一遍 CRC 再对答案"可靠得多。
 | `integration_test.js` | 与固件 CRC 的交叉校验 |
 | `txqueue_test.js` | USB 发送队列行为模型 |
 
-## 换串口
+## 固件链路选择
 
-固件默认 USB;若要换 UART,改
-`application/motor_bench_app/motor_bench_app.c` 里的
-`MotorBenchInit(&huart7)`。该串口必须已在 CubeMX 中开启 RX DMA
-(A 板上 UART7/UART8 的 DMA 中断均已在 `stm32f4xx_it.c` 中使能)。
+A 板默认使用 UART7 连接 ESP32-S3 Wi-Fi TCP 桥，UART 参数为 115200、8-N-1。切回 USB CDC 时修改
+`motorbench-a/application/robot_def.h` 的链路宏并重新编译烧录。UART7 必须保持 CubeMX 中的 RX DMA 配置；当前 A 板工程已配置 UART7 RX DMA 及其中断。

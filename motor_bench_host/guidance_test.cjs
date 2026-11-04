@@ -28,11 +28,16 @@ if (!process.versions.electron) {
     const wss = new WebSocketServer({ server });
     const commands = [];
     const exceptions = [];
-    let socket;
+    let connectedClients = 0;
     let autoReset = false;
     let heartbeat;
     let win;
-    const send = (type, data) => socket.send(JSON.stringify({ type, data }));
+    const broadcast = message => {
+      for (const client of wss.clients) {
+        if (client.readyState === 1) client.send(JSON.stringify(message));
+      }
+    };
+    const send = (type, data) => broadcast({ type, data });
     let fwVersion = '1.12';
     let boardFlags = 0;
     const pulse = () => send('heartbeat', { fwVersion, boardFlags, uptimeS: 60, inventoryCount: 1 });
@@ -61,8 +66,8 @@ if (!process.versions.electron) {
       channelId: 0, online, enabled, ref: 0, speed: 0, torque: 0, angle: 0, temperature: 28,
     }] });
     wss.on('connection', ws => {
-      socket = ws;
-      ws.send(JSON.stringify({ type: 'hello', capabilities: ['resetChannels', 'setLoop'] }));
+      connectedClients++;
+      ws.send(JSON.stringify({ type: 'hello', capabilities: ['resetChannels', 'setLoop', 'wifiTcp'] }));
       ws.send(JSON.stringify({ type: 'serial', open: false }));
       ws.on('message', raw => {
         const command = JSON.parse(raw);
@@ -82,17 +87,34 @@ if (!process.versions.electron) {
       await win.loadURL(`http://127.0.0.1:${server.address().port}`);
       await win.webContents.debugger.sendCommand('Runtime.enable');
       await until(() => evaluate('document.querySelector("#portSelect").textContent.includes("未发现串口")'), 'port scan');
+      await until(() => Promise.resolve(connectedClients === 1), 'WebSocket connection');
+      assert.equal(await evaluate('document.querySelector("#wifiHost").value'), '192.168.4.1');
+      assert.equal(await evaluate('document.querySelector("#wifiPort").value'), '7000');
+      await click('#connectWifi');
+      await until(() => Promise.resolve(commands.some(c => c.type === 'connectWifi')), 'Wi-Fi TCP connect command');
+      assert.deepEqual(commands.find(c => c.type === 'connectWifi'), {
+        type: 'connectWifi', host: '192.168.4.1', port: 7000, baud: 115200,
+      });
+      broadcast({ type: 'serial', open: true, path: 'TCP://192.168.4.1:7000', baud: 115200 });
+      await until(() => evaluate('document.querySelector("#wifiStatus").textContent.includes("已连接")'), 'Wi-Fi connected state');
+      assert.equal(await evaluate('document.querySelector("#closePort").disabled'), false);
       assert.equal(await evaluate('document.querySelector("#openPort").disabled'), true);
       assert.equal(await evaluate('document.querySelector("#addFirstMotor").disabled'), true);
       assert.match(await text('#serviceState'), /已连接/);
-      assert.match(await text('#guideMessage'), /供电和 USB 数据线/);
+      broadcast({ type: 'serial', open: false });
+      await until(() => evaluate('document.querySelector("#wifiStatus").textContent.includes("自动重连")'), 'Wi-Fi reconnect state');
+      assert.equal(await evaluate('document.querySelector("#connectWifi").disabled'), false);
+      broadcast({ type: 'serial', open: true, path: 'TCP://192.168.4.1:7000', baud: 115200 });
+      await until(() => evaluate('document.querySelector("#wifiStatus").textContent.includes("已连接")'), 'Wi-Fi restored state');
       await screenshot('guidance-empty');
 
-      socket.send(JSON.stringify({ type: 'ports', ports: [{ path: 'MOCK-USB', manufacturer: 'Motor Bench CDC' }] }));
+      broadcast({ type: 'serial', open: false });
+      await until(() => evaluate('document.querySelector("#closePort").disabled'), 'Wi-Fi close before USB test');
+      broadcast({ type: 'ports', ports: [{ path: 'MOCK-USB', manufacturer: 'Motor Bench CDC' }] });
       await until(() => evaluate('!document.querySelector("#openPort").disabled'), 'port available');
       await click('#openPort');
       assert.equal(commands.filter(c => c.type === 'enable').length, 0);
-      socket.send(JSON.stringify({ type: 'serial', open: true, path: 'MOCK-USB' }));
+      broadcast({ type: 'serial', open: true, path: 'MOCK-USB' });
       await until(() => evaluate('document.querySelector("#guideTitle").textContent.includes("等待控制板")'), 'serial without board response');
       assert.match(await text('#boardState'), /等待应答/);
       assert.equal(await evaluate('document.querySelector("#addMotor").disabled'), true);
@@ -368,9 +390,9 @@ if (!process.versions.electron) {
       clearInterval(heartbeat);
       await until(() => evaluate('document.querySelector("#boardState").textContent.includes("等待应答")'), 'board timeout');
       assert.equal(await evaluate('document.querySelector("[data-role=enable]").disabled'), true);
-      assert.match(await text('[data-role=channelHint]'), /供电、USB 数据线和固件/);
+      assert.match(await text('[data-role=channelHint]'), /供电、(?:串口连接|UART 接线)和固件/);
 
-      socket.close();
+      for (const client of wss.clients) client.close();
       await until(() => evaluate('document.querySelector("#serviceState").textContent.includes("已断开")'), 'service disconnected');
       assert.equal(await text('#guideAction'), '重新加载');
       assert.equal(await evaluate('document.querySelector("#addMotor").disabled'), true);

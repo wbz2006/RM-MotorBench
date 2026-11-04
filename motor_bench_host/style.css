@@ -196,6 +196,9 @@ h1 { margin: 0; font-size: 31px; font-weight: 600; letter-spacing: 1px; line-hei
 .serial-help { flex-basis: 100%; min-width: 0; }
 .serial-help summary { color: var(--accent); }
 .serial-help ol { margin: 6px 0; padding-left: 20px; line-height: 1.8; }
+.wifi-actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.wifi-actions label { min-width: 0; }
+.wifi-actions input { width: 100%; }
 .first-test-help { padding: 0 18px 10px; }
 .connection-status { display: flex; flex: 1 0 100%; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
 .connection-status span { border: 1px solid var(--line); border-radius: 3px; padding: 3px 7px; color: var(--muted); font-size: 10px; }

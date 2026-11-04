@@ -8,7 +8,7 @@ module.exports = {
   directories: { output: 'dist' },
   electronDist: 'node_modules/electron/dist',
   files: [
-    'desktop.cjs', 'server.js', 'protocol.js',
+    'desktop.cjs', 'server.js', 'protocol.js', 'tcp-port.js',
     'index.html', 'style.css', 'ui.js', 'chart.js', 'fishbone.js',
     'setpoint.js', 'calculator.js', 'calculator-ui.js', 'loader-test-ui.js',
     'README.md', 'package.json',

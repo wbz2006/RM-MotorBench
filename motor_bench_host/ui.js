@@ -715,8 +715,8 @@ function setText(el, text) {
 
 function setupBlockReason() {
   if (ws.readyState !== 1) return ws.readyState === 0 ? '正在连接上位机服务，请稍候。' : '上位机服务已断开，请确认程序正在运行后重新加载页面。';
-  if (!serialConnected) return '请先选择控制板的 USB 串口，点击「连接」。';
-  if (!boardOnline) return '串口已打开，但控制板尚未应答。请检查控制板供电、USB 数据线和固件，再同步清单或重新连接。';
+  if (!serialConnected) return '请先选择串口或连接 ESP32-S3 Wi-Fi。';
+  if (!boardOnline) return '链路已打开，但控制板尚未应答。请检查控制板供电、UART 接线和固件，再同步清单或重新连接。';
   if (!channelsReady) return channelResetError || '正在清理旧测试通道，请等待板端确认。';
   if (!inventoryReceived) return '控制板已应答，正在同步电机清单；若长时间未更新，请点击「同步清单」。';
   return '';
@@ -741,6 +741,7 @@ function renderGuidance() {
   $('#portSelect').disabled = !service || serialConnected;
   $('#openPort').disabled = !service || serialConnected || !$('#portSelect').value;
   $('#closePort').disabled = !service || !serialConnected;
+  $('#connectWifi').disabled = !service || serialConnected;
   $('#rescan').disabled = !service || !serialConnected || !!channelResetPending;
   const addReason = blocked || (pendingMotor ? '正在等待电机增删应答，请稍候。' : '');
   $('#addMotor').disabled = !!addReason;
@@ -763,8 +764,8 @@ function renderGuidance() {
     target = 'reload';
   } else if (!serialConnected) {
     const hasPorts = !!$('#portSelect').value;
-    message = hasPorts ? '选择控制板对应的 USB 串口，然后点击「连接」。串口打开后还需等待控制板应答。'
-      : '未发现可用串口时，请检查控制板供电和 USB 数据线，再刷新串口列表。';
+    message = hasPorts ? '选择控制板对应的串口，然后点击「连接」。串口打开后还需等待控制板应答。'
+      : '未发现可用串口时，请检查 USB 连接；A 板可连接 ESP32-S3 Wi-Fi。';
     action = hasPorts ? '选择串口' : '刷新串口';
     target = hasPorts ? '#portSelect' : '#refreshPorts';
   } else if (blocked) {
@@ -802,7 +803,7 @@ function renderGuidance() {
     el.dataset.state = i < step || (i === 3 && active.length && !blocked) ? 'done' : i === step ? 'current' : 'pending';
     if (i === step && el.dataset.state !== 'done') el.setAttribute('aria-current', 'step');
     else el.removeAttribute('aria-current');
-    setText(el.querySelector('small'), i === 0 ? step > 0 ? '连接已确认' : serialConnected ? '等待板端应答' : '选择 USB 串口'
+    setText(el.querySelector('small'), i === 0 ? step > 0 ? '连接已确认' : serialConnected ? '等待板端应答' : '选择串口'
       : i === 1 ? step > 1 ? '清单已同步' : '型号与 ID'
       : i === 2 ? step > 2 ? '绑定已确认' : '选择控制对象'
       : el.dataset.state === 'done' ? '输出已使能' : '观察实际反馈');
@@ -1367,6 +1368,17 @@ function bindEvents() {
     $('#connectionError').hidden = true;
     send({ type: 'openSerial', path, baud: 115200 });
   };
+  $('#connectWifi').onclick = () => {
+    const host = $('#wifiHost').value.trim();
+    const port = Number($('#wifiPort').value);
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      setText($('#wifiStatus'), '请输入有效的 ESP32-S3 地址和 TCP 端口。');
+      return;
+    }
+    setText($('#wifiStatus'), `正在连接 ${host}:${port}…`);
+    $('#connectionError').hidden = true;
+    send({ type: 'connectWifi', host, port, baud: 115200 });
+  };
   $('#closePort').onclick = () => send({ type: 'closeSerial' });
   $('#rescan').onclick = () => {
     if (!channelsReady) resetTestChannels();
@@ -1862,7 +1874,8 @@ ws.onmessage = (ev) => {
       for (const p of msg.ports) {
         const opt = document.createElement('option');
         opt.value = p.path;
-        opt.textContent = p.manufacturer ? `${p.path} (${p.manufacturer})` : p.path;
+        const details = p.friendlyName || p.manufacturer;
+        opt.textContent = details ? `${p.path} (${details})` : p.path;
         sel.appendChild(opt);
       }
       if ([...sel.options].some(opt => opt.value === selected)) sel.value = selected;
@@ -1871,8 +1884,14 @@ ws.onmessage = (ev) => {
 
     case 'serial': {
       const sameConnection = serialConnected && msg.open && serialPath === msg.path;
+      const previousPath = serialPath;
       serialConnected = !!msg.open;
       serialPath = msg.open ? msg.path : null;
+      if (msg.open && msg.path.startsWith('TCP://')) {
+        setText($('#wifiStatus'), `ESP32-S3 Wi-Fi 已连接（${msg.path.slice(7)}）`);
+      } else if (!msg.open && previousPath?.startsWith('TCP://')) {
+        setText($('#wifiStatus'), 'ESP32-S3 Wi-Fi 已断开，后台正在自动重连…');
+      }
       if (sameConnection) break;
       inventoryReceived = false;
       $('#connectionError').hidden = true;
@@ -1889,7 +1908,10 @@ ws.onmessage = (ev) => {
       channelResetPending = null;
       boardOnline = false;
       boardLastSeen = null;
-      setLink(msg.open, msg.open ? `串口 ${msg.path ?? ''}` : '串口已关闭');
+      setLink(msg.open, msg.open
+        ? msg.path?.startsWith('TCP://') ? 'ESP32-S3 · Wi-Fi 已连接'
+          : `串口 ${msg.path ?? ''}`
+        : '连接已关闭');
       if (msg.open) {
         resetTestChannels();
         startInventoryFetch();

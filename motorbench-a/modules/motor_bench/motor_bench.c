@@ -98,6 +98,7 @@ typedef struct
 
 static MB_LinkType_e mb_link_type = MB_LINK_NONE;
 static USARTInstance *mb_usart = NULL;
+static uint8_t mb_uart_tx_buffer[MB_PAYLOAD_MAX + 5];
 static uint8_t *mb_usb_rx_buffer = NULL; /* bsp/usb 提供的接收缓冲区 */
 
 static MB_InventoryItem_s mb_inventory[MB_CHANNEL_MAX];
@@ -335,9 +336,19 @@ static uint8_t MotorBenchSend(uint8_t *buf, uint16_t size)
 {
     if (mb_link_type == MB_LINK_UART)
     {
-        if (!mb_usart || !MotorBenchTxReady())
+        if (!mb_usart)
             return 0;
-        USARTSend(mb_usart, buf, size, USART_TRANSFER_DMA);
+        /* UART7 has RX DMA only. Keep IT data alive and serialize task/IRQ sends. */
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        if (!MotorBenchTxReady())
+        {
+            __set_PRIMASK(primask);
+            return 0;
+        }
+        memcpy(mb_uart_tx_buffer, buf, size);
+        USARTSend(mb_usart, mb_uart_tx_buffer, size, USART_TRANSFER_IT);
+        __set_PRIMASK(primask);
         return 1;
     }
     if (mb_link_type == MB_LINK_USB)

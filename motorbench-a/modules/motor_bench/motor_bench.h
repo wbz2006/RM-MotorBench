@@ -510,7 +510,7 @@ _Static_assert(sizeof(MB_HeartbeatAck_s) == 5 + MB_HEARTBEAT_ACK_CRC_LEN, "heart
 /**
  * @brief 初始化电机测试台模块,注册上位机通信串口(UART 通道)
  *
- * @param handle 与上位机通信的串口句柄(建议用 A 板 UART7/UART8,115200);
+ * @param handle 与上位机通信的串口句柄(建议用 A 板 UART7,115200);
  *               传 NULL 表示不启用 UART 通道
  *
  * @attention 该串口必须在 CubeMX 中已开启 RX DMA,bsp/usart 依赖
