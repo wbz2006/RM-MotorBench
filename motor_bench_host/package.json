@@ -14,6 +14,7 @@
     "test:http": "node --test http_test.js",
     "test:guidance": "node guidance_test.cjs",
     "test:tcp": "node --test tcp_port_test.js",
+    "test:bridge": "node --test bridge_uart_test.js",
     "test:chart": "node chart_test.cjs",
     "test:integration": "node integration_test.js",
     "test:motor-state": "node motor_state_test.js",
