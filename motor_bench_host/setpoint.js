@@ -11,9 +11,11 @@ export function createSetpointProgram(options, limit) {
   if (!Number.isInteger(cycles)) throw new Error('循环次数需为整数');
   let program;
   if (options.mode === 'sine') {
+    const offset = number(options.offset ?? 0, '基础速度', -limit, limit);
     const amplitude = number(options.amplitude, '幅值', 0, limit);
+    if (Math.abs(offset) + amplitude > limit) throw new Error('基础速度与幅值叠加后超出转速限幅');
     const period = number(options.period, '周期（秒）', 0.5, 3600);
-    program = { mode: 'sine', amplitude, cycleSeconds: period };
+    program = { mode: 'sine', offset, amplitude, cycleSeconds: period };
   } else if (options.mode === 'steps') {
     const text = String(options.steps ?? '').trim();
     if (!text) throw new Error('请填写阶梯目标序列');
@@ -38,7 +40,7 @@ export function sampleSetpoint(program, elapsed) {
   const cycle = Math.floor((elapsed + epsilon) / program.cycleSeconds) + 1;
   const phase = Math.max(0, elapsed - (cycle - 1) * program.cycleSeconds);
   if (program.mode === 'sine') {
-    return { ref: program.amplitude * Math.sin(2 * Math.PI * phase / program.cycleSeconds), done: false, cycle };
+    return { ref: program.offset + program.amplitude * Math.sin(2 * Math.PI * phase / program.cycleSeconds), done: false, cycle };
   }
   const step = Math.min(program.steps.length - 1, Math.floor((phase + epsilon) / program.dwell));
   return { ref: program.steps[step], done: false, cycle, step: step + 1 };

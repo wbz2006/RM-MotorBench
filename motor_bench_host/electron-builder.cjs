@@ -11,6 +11,7 @@ module.exports = {
     'desktop.cjs', 'server.js', 'protocol.js', 'tcp-port.js',
     'index.html', 'style.css', 'ui.js', 'chart.js', 'fishbone.js',
     'setpoint.js', 'calculator.js', 'calculator-ui.js', 'loader-test-ui.js',
+    'browser-buffer.js', 'android-transport.js',
     'README.md', 'package.json',
   ],
   // N-API prebuilds ship with serialport; do not rebuild against Electron headers.

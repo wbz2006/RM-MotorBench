@@ -20,6 +20,15 @@ test('sine is centered at zero and follows amplitude and period across repeated 
   assert.equal(sampleSetpoint(p, 100).ref, 0);
 });
 
+test('sine adds its oscillation around a signed base speed', () => {
+  const p = sine({ offset: 200, amplitude: 120 }, 320);
+  for (const [time, ref] of [[0, 200], [1, 320], [2, 200], [3, 80], [4, 200]]) {
+    near(sampleSetpoint(p, time).ref, ref);
+  }
+  assert.throws(() => sine({ offset: 200, amplitude: 121 }, 320), /叠加后超出转速限幅/);
+  assert.throws(() => sine({ offset: -321 }, 320));
+});
+
 test('step dwell boundaries, signed targets, repetitions and final zero', () => {
   const p = steps();
   for (const [time, ref, step, cycle] of [
@@ -65,6 +74,7 @@ test('infinite sine and steps continue across cycle boundaries until explicitly 
 test('rejects blank, nonfinite, malformed and too-fast or invalid repeat parameters', () => {
   for (const change of [
     { amplitude: NaN }, { amplitude: Infinity }, { amplitude: -1 },
+    { offset: NaN }, { offset: Infinity },
     { period: 0 }, { period: 0.49 }, { period: 3601 }, { cycles: -1 }, { cycles: Infinity }, { cycles: NaN }, { cycles: 1.5 }, { cycles: 1001 },
   ]) assert.throws(() => sine(change));
   for (const change of [{ steps: '' }, { steps: '0,' }, { steps: ',100' }, { steps: '0, bad' }, { steps: 'Infinity' },

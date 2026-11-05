@@ -390,6 +390,7 @@ button.ghost.quick-zero:hover:not(:disabled) { background: #efbd7024; border-col
 .wave-diagram .wave-symbol { fill: var(--accent); font-size: 13px; }
 .wave-diagram .wave-leader { stroke: var(--accent); stroke-dasharray: 3 3; opacity: .6; }
 .setpoint-program .wave-input { position: absolute; padding: 7px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); color: var(--text-dim); }
+.wave-offset { right: 10px; bottom: 8px; width: 27%; min-width: 95px; }
 .wave-amplitude { right: 10px; top: 10px; width: 27%; min-width: 95px; }
 .wave-period { left: 22%; bottom: 8px; width: 30%; min-width: 100px; }
 .wave-dwell { right: 10px; bottom: 10px; width: 32%; min-width: 125px; }
@@ -408,6 +409,39 @@ button.ghost.quick-zero:hover:not(:disabled) { background: #efbd7024; border-col
 footer.hint { margin-top: 23px; padding: 6px 18px 24px; line-height: 1.7; border-top: 1px solid var(--line); }
 footer p { max-width: 1000px; margin: 10px 0 0; font-size: 10px; color: var(--muted); }
 .footer-label { display: inline-block; margin-right: 10px; font: 9px var(--mono); letter-spacing: .7px; color: var(--accent); }
+
+.android-app { padding-left: 0; padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
+.android-app .rail { display: none; }
+.android-app[data-app-screen='connection'] [data-app-page='control'],
+.android-app[data-app-screen='control'] [data-app-page='connection'] { display: none !important; }
+.android-app .estop { background: var(--danger-dim); border-color: #ff766e50; color: var(--danger-hi); }
+.android-app .setup-group > label,
+.android-app #refreshPorts,
+.android-app #openPort,
+.android-app #closePort,
+.android-app #rescan,
+.android-app #wifiSetup > summary,
+.android-app #wifiSetup .wifi-actions > label,
+.android-app #wifiSetup > p:not(.android-wifi-note):not(#wifiStatus) { display: none; }
+.android-app #wifiSetup .wifi-actions { justify-content: flex-start; }
+.android-wifi-note { display: none; }
+.android-app .android-wifi-note { display: block; color: var(--muted); }
+.android-app .setup-group > .serial-help:not(#wifiSetup),
+.android-app .setup-sep,
+.android-app footer,
+.android-app .estop kbd { display: none; }
+.android-app input, .android-app select { font-size: 16px; }
+.android-tabs { position: fixed; inset: auto 0 0; z-index: 40; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 9px max(16px, env(safe-area-inset-right)) calc(9px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); border-top: 1px solid var(--line); background: #101411f5; backdrop-filter: blur(14px); }
+.android-tabs button { display: flex; min-height: 45px; align-items: center; justify-content: center; gap: 9px; border: 1px solid var(--line); background: var(--panel); }
+.android-tabs button span { color: var(--muted); font: 10px var(--mono); }
+.android-tabs button[aria-current='page'] { color: var(--accent); border-color: #b7f76360; background: var(--accent-dim); }
+@media (max-width: 700px) {
+  .android-app .topbar { grid-template-columns: minmax(0, 1fr) auto; }
+  .android-app .workspace { padding-left: 14px; padding-right: 14px; }
+  .android-app .workflow { margin-top: 12px; }
+  .android-app .setup-group { flex-basis: 100%; }
+  .android-app .panel.setup { gap: 12px; }
+}
 
 @media (min-width: 1200px) {
   .channel:only-child { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); grid-template-areas: 'head head' 'hint hint' 'config scope' 'control scope'; align-items: start; gap: 20px; }

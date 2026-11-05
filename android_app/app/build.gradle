@@ -1,0 +1,33 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.rm.motorbench'
+    compileSdk 36
+    buildFeatures { buildConfig true }
+
+    defaultConfig {
+        applicationId 'com.rm.motorbench'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.14.0'
+}
+
+tasks.register('syncMotorBenchWeb', Sync) {
+    from('../../motor_bench_host') {
+        include 'index.html', 'style.css', 'ui.js', 'protocol.js', 'chart.js',
+                'fishbone.js', 'setpoint.js', 'calculator.js', 'calculator-ui.js', 'loader-test-ui.js',
+                'browser-buffer.js', 'android-transport.js'
+    }
+    into layout.buildDirectory.dir('generated/motorbench-web/www')
+}
+
+android.sourceSets.main.assets.srcDir(layout.buildDirectory.dir('generated/motorbench-web').get().asFile)
+tasks.named('preBuild').configure { dependsOn tasks.named('syncMotorBenchWeb') }

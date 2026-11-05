@@ -26,10 +26,11 @@ import { ensureChart, getChartIfExists, dropChart } from './chart.js';
 import { LoopFishbone } from './fishbone.js';
 import { createSetpointProgram, sampleSetpoint } from './setpoint.js';
 import { initCalculator } from './calculator-ui.js';
+import { createAndroidSocket } from './android-transport.js';
 
 /** 各电机种类的参考值限幅与单位；工作转速上限与 MIT 编解码量程独立。 */
 const MOTOR_SPEC = {
-  [MotorKindLabel[1]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // GM6020
+  [MotorKindLabel[1]]: { unit: 'rpm', range: 320, feedbackLabel: '原始电流', feedbackUnit: 'raw', speedLimitHint: '24 V 空载转速上限：±320 rpm；额定转矩下调速范围为 0–132 rpm。' }, // GM6020
   [MotorKindLabel[2]]: { unit: 'rpm', range: 6000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M3508
   [MotorKindLabel[3]]: { unit: 'rpm', range: 7000, feedbackLabel: '原始电流', feedbackUnit: 'raw' }, // M2006
   [MotorKindLabel[4]]: { unit: 'rad/s', range: 20.94, feedbackLabel: '转矩', feedbackUnit: 'N·m', speedLimitHint: '24 V 空载转速上限：±20.94 rad/s（200 rpm）；带载可达转速更低。' }, // MIT VMAX stays 30.
@@ -44,7 +45,10 @@ const pidStateByChannel = new Map(); // ch -> {loop, kind}
 
 const $ = (sel) => document.querySelector(sel);
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
-const ws = new WebSocket(wsUrl);
+const androidApp = !!window.MotorBenchAndroid;
+const ws = androidApp ? createAndroidSocket(window.MotorBenchAndroid) : new WebSocket(wsUrl);
+
+if (androidApp) setupAndroidNavigation();
 
 /** 板端上报的电机清单(来自心跳应答的 inventoryCount,随后由遥测确认) */
 let inventory = [];
@@ -173,6 +177,7 @@ setInterval(() => {
   updateWorkspaceStatus();
   if (!boardOnline || boardLastSeen === null || Date.now() - boardLastSeen < 2000) return;
   boardOnline = false;
+  if (androidApp) setAndroidControlEnabled(false);
   for (const i of pendingPidApplies.keys()) cancelPidResume(i);
   setLink(false, 'A 板无响应 · 数据已中断');
   for (const i of channelIds()) renderChannel(i);
@@ -659,6 +664,7 @@ function startProgram(i) {
     const program = createSetpointProgram({
       mode: r('presetMode').value,
       cycles: r('presetInfinite').checked ? 0 : r('presetCycles').valueAsNumber,
+      offset: r('presetOffset').valueAsNumber,
       amplitude: r('presetAmplitude').valueAsNumber,
       period: r('presetPeriod').valueAsNumber,
       steps: r('presetValues').value,
@@ -685,6 +691,13 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('blur', () => {
   for (const calculator of channelCalculators.values()) {
     if (calculator.positionLocked) calculator.stopPositionTest('窗口失去焦点 · 测试已停机', true);
+  }
+});
+window.addEventListener('motorbenchpause', () => {
+  for (const i of pendingPidApplies.keys()) cancelPidResume(i);
+  stopAllPrograms('应用已转入后台 · 自动输出已停止', true);
+  for (const calculator of channelCalculators.values()) {
+    if (calculator.positionLocked) calculator.stopPositionTest('应用已转入后台 · 测试已停机', true);
   }
 });
 
@@ -715,7 +728,7 @@ function setText(el, text) {
 
 function setupBlockReason() {
   if (ws.readyState !== 1) return ws.readyState === 0 ? '正在连接上位机服务，请稍候。' : '上位机服务已断开，请确认程序正在运行后重新加载页面。';
-  if (!serialConnected) return '请先选择串口或连接 ESP32-S3 Wi-Fi。';
+  if (!serialConnected) return androidApp ? '等待连接 ESP32 热点与控制板。' : '请先选择串口或连接 ESP32-S3 Wi-Fi。';
   if (!boardOnline) return '链路已打开，但控制板尚未应答。请检查控制板供电、UART 接线和固件，再同步清单或重新连接。';
   if (!channelsReady) return channelResetError || '正在清理旧测试通道，请等待板端确认。';
   if (!inventoryReceived) return '控制板已应答，正在同步电机清单；若长时间未更新，请点击「同步清单」。';
@@ -733,7 +746,7 @@ function renderGuidance() {
     setText(el, text);
     el.classList.toggle('is-ready', ok);
   };
-  state('#serviceState', service ? '服务 · 已连接' : ws.readyState === 0 ? '服务 · 连接中' : '服务 · 已断开', service);
+  state('#serviceState', androidApp ? '应用 · 已就绪' : service ? '服务 · 已连接' : ws.readyState === 0 ? '服务 · 连接中' : '服务 · 已断开', service);
   state('#boardState', boardOnline ? '控制板 · 已应答' : serialConnected ? '控制板 · 等待应答' : '控制板 · 未连接', service && serialConnected && boardOnline);
   state('#feedbackState', !boardOnline || !confirmed.length ? '电机反馈 · 未就绪' : `电机反馈 · ${online.length}/${confirmed.length} 在线`, boardOnline && online.length > 0);
   setText($('#connectionMessage'), blocked || '控制板与清单已就绪。登记成功不代表电机在线，绑定后会检查实际反馈。');
@@ -764,10 +777,11 @@ function renderGuidance() {
     target = 'reload';
   } else if (!serialConnected) {
     const hasPorts = !!$('#portSelect').value;
-    message = hasPorts ? '选择控制板对应的串口，然后点击「连接」。串口打开后还需等待控制板应答。'
+    message = androidApp ? '正在连接 RM-MotorBench-ESP32，请在系统提示中允许连接。设备上电后也可点击重试。'
+      : hasPorts ? '选择控制板对应的串口，然后点击「连接」。串口打开后还需等待控制板应答。'
       : '未发现可用串口时，请检查 USB 连接；A 板可连接 ESP32-S3 Wi-Fi。';
-    action = hasPorts ? '选择串口' : '刷新串口';
-    target = hasPorts ? '#portSelect' : '#refreshPorts';
+    action = androidApp ? '重试连接' : hasPorts ? '选择串口' : '刷新串口';
+    target = androidApp ? '#connectWifi' : hasPorts ? '#portSelect' : '#refreshPorts';
   } else if (blocked) {
     title = channelResetError ? '连接尚未就绪' : !boardOnline ? '等待控制板应答' : '正在准备测试通道';
     action = '查看连接状态';
@@ -803,7 +817,7 @@ function renderGuidance() {
     el.dataset.state = i < step || (i === 3 && active.length && !blocked) ? 'done' : i === step ? 'current' : 'pending';
     if (i === step && el.dataset.state !== 'done') el.setAttribute('aria-current', 'step');
     else el.removeAttribute('aria-current');
-    setText(el.querySelector('small'), i === 0 ? step > 0 ? '连接已确认' : serialConnected ? '等待板端应答' : '选择串口'
+    setText(el.querySelector('small'), i === 0 ? step > 0 ? '连接已确认' : serialConnected ? '等待板端应答' : androidApp ? '自动连接热点' : '选择串口'
       : i === 1 ? step > 1 ? '清单已同步' : '型号与 ID'
       : i === 2 ? step > 2 ? '绑定已确认' : '选择控制对象'
       : el.dataset.state === 'done' ? '输出已使能' : '观察实际反馈');
@@ -815,6 +829,7 @@ function renderGuidance() {
   button.disabled = ws.readyState === 0 || (!!pendingMotor && target === 'add');
   button.onclick = () => {
     if (target === 'reload') return location.reload();
+    if (androidApp && boardOnline) showAndroidScreen('control');
     if (target === 'add') return setAddFormOpen(true);
     const el = typeof target === 'string' ? $(target) : target;
     if (!el) return;
@@ -823,7 +838,7 @@ function renderGuidance() {
       ?? el.querySelector('[data-role="enable"]:enabled') ?? el.querySelector('[data-role="channelHint"]') : el;
     if (focus && !focus.matches('button, input, select')) focus.tabIndex = -1;
     focus?.focus({ preventScroll: true });
-    if (target === '#refreshPorts') el.click();
+    if (target === '#refreshPorts' || target === '#connectWifi') el.click();
   };
 }
 
@@ -1225,8 +1240,14 @@ function fillMotorOptions() {
         el.querySelector('[data-role="slider"]').min = String(-spec.range);
         el.querySelector('[data-role="slider"]').max = String(spec.range);
         for (const unit of el.querySelectorAll('[data-role="presetUnit"]')) unit.textContent = spec.unit;
-        const amplitude = spec.unit === 'rad/s' ? 1 : 500;
-        el.querySelector('[data-role="presetAmplitude"]').value = String(amplitude);
+        const amplitude = Math.min(spec.unit === 'rad/s' ? 1 : 500, spec.range / 2);
+        const offsetInput = el.querySelector('[data-role="presetOffset"]');
+        offsetInput.min = String(-spec.range);
+        offsetInput.max = String(spec.range);
+        offsetInput.value = '0';
+        const amplitudeInput = el.querySelector('[data-role="presetAmplitude"]');
+        amplitudeInput.max = String(spec.range);
+        amplitudeInput.value = String(amplitude);
         el.querySelector('[data-role="presetValues"]').value = `0, ${amplitude}, ${amplitude * 2}, ${amplitude}, 0`;
       }
       renderChannel(i);
@@ -1767,6 +1788,7 @@ function bindEvents() {
 ws.onopen = () => {
   setLink(true, '服务已连接');
   send({ type: 'listPorts' });
+  if (androidApp) send({ type: 'connectWifi', host: '192.168.4.1', port: 7000 });
 };
 
 ws.onclose = () => {
@@ -1783,6 +1805,7 @@ ws.onclose = () => {
   firmwareSupportsLoop = false;
   firmwareVersion = null;
   serialConnected = false;
+  if (androidApp) setAndroidControlEnabled(false);
   serialPath = null;
   inventoryReceived = false;
   clearTimeout(channelResetTimer);
@@ -1886,6 +1909,7 @@ ws.onmessage = (ev) => {
       const sameConnection = serialConnected && msg.open && serialPath === msg.path;
       const previousPath = serialPath;
       serialConnected = !!msg.open;
+      if (androidApp && !msg.open) setAndroidControlEnabled(false);
       serialPath = msg.open ? msg.path : null;
       if (msg.open && msg.path.startsWith('TCP://')) {
         setText($('#wifiStatus'), `ESP32-S3 Wi-Fi 已连接（${msg.path.slice(7)}）`);
@@ -1943,6 +1967,7 @@ ws.onmessage = (ev) => {
       const changed = versionChanged || capabilitiesChanged || firmwareSupportsLoop !== supported || !boardOnline;
       firmwareSupportsLoop = supported;
       noteBoardResponse();
+      if (androidApp) setAndroidControlEnabled(true);
       if (changed) for (const i of channelIds()) renderChannel(i);
       setLink(true, '控制板在线');
       $('#fwText').textContent = `固件 ${d.fwVersion} · ${Math.round(d.uptimeS / 60)} 分钟`;
@@ -2248,6 +2273,56 @@ function setLink(ok, text) {
   $('#linkDot').classList.toggle('online', ok);
   $('#linkText').textContent = text;
   updateWorkspaceStatus();
+}
+
+function setupAndroidNavigation() {
+  document.body.classList.add('android-app');
+  document.querySelector('.workspace-head').dataset.appPage = 'control';
+  document.querySelector('.workflow').dataset.appPage = 'connection';
+  document.querySelector('.section-heading:not(.channels-heading)').dataset.appPage = 'connection';
+  document.querySelector('.setup-group').dataset.appPage = 'connection';
+  document.querySelector('.setup-sep').dataset.appPage = 'control';
+  document.querySelector('.motor-registry').dataset.appPage = 'control';
+  document.querySelector('.channels-heading').dataset.appPage = 'control';
+  document.querySelector('#channels').dataset.appPage = 'control';
+  document.querySelector('#channelsEmpty').dataset.appPage = 'control';
+  document.querySelector('footer').dataset.appPage = 'connection';
+
+  const tabs = document.createElement('nav');
+  tabs.className = 'android-tabs';
+  tabs.setAttribute('aria-label', '应用页面');
+  tabs.innerHTML = '<button type="button" data-screen="connection" aria-current="page"><span>01</span>连接</button><button type="button" data-screen="control" disabled><span>02</span>控制</button>';
+  document.body.append(tabs);
+  tabs.addEventListener('click', event => {
+    const button = event.target.closest('button[data-screen]');
+    if (!button || button.disabled) return;
+    showAndroidScreen(button.dataset.screen);
+  });
+  document.querySelector('#connectWifi').textContent = '重试连接';
+  document.body.dataset.appScreen = 'connection';
+}
+
+function showAndroidScreen(screen) {
+  document.body.dataset.appScreen = screen;
+  document.querySelectorAll('.android-tabs button').forEach(tab => {
+    if (tab.dataset.screen === screen) tab.setAttribute('aria-current', 'page');
+    else tab.removeAttribute('aria-current');
+  });
+  window.scrollTo(0, 0);
+}
+
+function setAndroidControlEnabled(connected) {
+  const tab = document.querySelector('.android-tabs [data-screen="control"]');
+  if (!tab) return;
+  const wasDisabled = tab.disabled;
+  tab.disabled = !connected;
+  if (connected && wasDisabled) showAndroidScreen('control');
+  if (!connected && document.body.dataset.appScreen === 'control') {
+    document.body.dataset.appScreen = 'connection';
+    tab.removeAttribute('aria-current');
+    document.querySelector('.android-tabs [data-screen="connection"]').setAttribute('aria-current', 'page');
+    window.scrollTo(0, 0);
+  }
 }
 
 function updateWorkspaceStatus() {

@@ -291,6 +291,15 @@ if (!process.versions.electron) {
         await evaluate('document.querySelector("[data-role=motor]").value = "0"; document.querySelector("[data-role=motor]").dispatchEvent(new Event("change"))');
         await click('[data-role=bind]'); telemetry(true, false);
         await until(() => evaluate('!document.querySelector("[data-role=num]").disabled'), `kind ${kind} ready`);
+        if (kind === 1) {
+          for (const role of ['slider', 'num']) {
+            assert.equal(await evaluate(`document.querySelector('[data-role=${role}]').min`), '-320');
+            assert.equal(await evaluate(`document.querySelector('[data-role=${role}]').max`), '320');
+          }
+          assert.match(await text('[data-role=targetHelp]'), /24 V.*320 rpm.*132 rpm/);
+          assert.equal(await evaluate('document.querySelector("[data-role=presetAmplitude]").value'), '160');
+          assert.equal(await evaluate('document.querySelector("[data-role=presetValues]").value'), '0, 160, 320, 160, 0');
+        }
         assert.equal(await text('[data-role=zero]'), '快速归零');
         assert.equal(await evaluate('document.querySelector("[data-role=zero]").classList.contains("quick-zero")'), true);
         fwVersion = '1.15'; boardFlags = 0x1e; pulse();
@@ -362,6 +371,13 @@ if (!process.versions.electron) {
       await click('[data-role=presetStart]');
       assert.match(await text('[data-role=presetStatus]'), /17\.6/);
       assert.equal(commands.filter(c => c.type === 'setRef').length, beforePreset, 'out-of-range preset sends no target');
+      await evaluate('document.querySelector("[data-role=presetOffset]").value = "5"; document.querySelector("[data-role=presetAmplitude]").value = "2"');
+      const beforeOffsetSine = commands.length;
+      await click('[data-role=presetStart]');
+      await until(() => commands.slice(beforeOffsetSine).some(c => c.type === 'setRef'), 'base-speed sine target sent');
+      const firstOffsetTarget = commands.slice(beforeOffsetSine).find(c => c.type === 'setRef').ref;
+      assert.ok(firstOffsetTarget >= 5 && firstOffsetTarget < 5.5, `sine starts around its base speed: ${firstOffsetTarget}`);
+      await click('[data-role=presetStop]');
 
       await click('[data-role=loopAngle]');
       await until(() => commands.some(c => c.type === 'setLoop' && c.mask === 7), 'position cascade requested');
