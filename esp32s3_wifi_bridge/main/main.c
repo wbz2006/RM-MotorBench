@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "lwip/inet.h"
@@ -43,7 +44,11 @@ static bool send_all(int socket_fd, const uint8_t *data, size_t length)
     size_t sent_total = 0;
     while (sent_total < length) {
         int sent = send(socket_fd, data + sent_total, length - sent_total, 0);
-        if (sent <= 0) return false;
+        if (sent <= 0) {
+            ESP_LOGW(TAG, "TCP send failed: result=%d errno=%d sent=%u/%u", sent, errno,
+                     (unsigned)sent_total, (unsigned)length);
+            return false;
+        }
         sent_total += sent;
     }
     return true;
@@ -84,11 +89,14 @@ static int get_client(void)
 
 static void send_to_client(int socket_fd, const uint8_t *data, size_t length)
 {
+    int64_t start_us = esp_timer_get_time();
     xSemaphoreTake(client_lock, portMAX_DELAY);
     if (client_socket == socket_fd && !send_all(socket_fd, data, length)) {
         shutdown(socket_fd, SHUT_RDWR);
     }
     xSemaphoreGive(client_lock);
+    int64_t duration_ms = (esp_timer_get_time() - start_us) / 1000;
+    if (duration_ms >= 100) ESP_LOGW(TAG, "TCP forwarding delayed: %lld ms bytes=%u", duration_ms, (unsigned)length);
 }
 
 static bool recv_handshake(int socket_fd)
@@ -157,33 +165,64 @@ static void tcp_server_task(void *arg)
         struct timeval send_timeout = {.tv_sec = 2, .tv_usec = 0};
         setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
         int64_t last_received_us = esp_timer_get_time();
+        uint32_t received_bytes = 0;
         uint8_t buffer[TCP_BUFFER_SIZE];
         while (get_client() == socket_fd) {
             int received = recv(socket_fd, buffer, sizeof(buffer), 0);
             if (received > 0) {
                 last_received_us = esp_timer_get_time();
-                uart_write_bytes(BRIDGE_UART, (const char *)buffer, received);
+                received_bytes += received;
+                int written = uart_write_bytes(BRIDGE_UART, (const char *)buffer, received);
+                if (written != received)
+                    ESP_LOGW(TAG, "UART write incomplete: written=%d expected=%d", written, received);
                 continue;
             }
             if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (esp_timer_get_time() - last_received_us < CLIENT_IDLE_TIMEOUT_MS * 1000LL) continue;
                 ESP_LOGW(TAG, "TCP client idle timeout");
             }
+            if (received == 0) ESP_LOGI(TAG, "TCP peer closed connection");
+            else if (errno != EAGAIN && errno != EWOULDBLOCK)
+                ESP_LOGW(TAG, "TCP receive failed: errno=%d", errno);
             break;
         }
         close_client();
-        ESP_LOGI(TAG, "TCP client disconnected");
+        ESP_LOGI(TAG, "TCP client disconnected: received_bytes=%u", (unsigned)received_bytes);
     }
 }
 
 static void uart_to_tcp_task(void *arg)
 {
-    uint8_t buffer[UART_BUFFER_SIZE];
+    static uint8_t buffer[UART_BUFFER_SIZE];
+    uint32_t rx_bytes = 0;
+    uint32_t batches = 0;
+    size_t max_batch = 0;
+    int64_t last_rx_us = esp_timer_get_time();
+    int64_t last_report_us = last_rx_us;
     while (true) {
-        int count = uart_read_bytes(BRIDGE_UART, buffer, sizeof(buffer), pdMS_TO_TICKS(100));
-        int socket_fd = get_client();
-        if (count > 0 && socket_fd >= 0) {
-            send_to_client(socket_fd, buffer, count);
+        // A large blocking read waits for a full batch under continuous telemetry.
+        int count = uart_read_bytes(BRIDGE_UART, buffer, 1, pdMS_TO_TICKS(100));
+        if (count > 0) {
+            size_t buffered = 0;
+            ESP_ERROR_CHECK(uart_get_buffered_data_len(BRIDGE_UART, &buffered));
+            if (buffered > sizeof(buffer) - 1) buffered = sizeof(buffer) - 1;
+            if (buffered > 0) {
+                int extra = uart_read_bytes(BRIDGE_UART, buffer + 1, buffered, 0);
+                if (extra > 0) count += extra;
+            }
+            last_rx_us = esp_timer_get_time();
+            rx_bytes += count;
+            batches++;
+            if ((size_t)count > max_batch) max_batch = count;
+            int socket_fd = get_client();
+            if (socket_fd >= 0) send_to_client(socket_fd, buffer, count);
+        }
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_report_us >= 5000000) {
+            ESP_LOGI(TAG, "UART stats: rx_bytes=%u batches=%u max_batch=%u idle_ms=%lld tcp_connected=%d",
+                     (unsigned)rx_bytes, (unsigned)batches, (unsigned)max_batch,
+                     (now_us - last_rx_us) / 1000, get_client() >= 0);
+            last_report_us = now_us;
         }
     }
 }
@@ -193,7 +232,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
         ESP_LOGI(TAG, "Wi-Fi station connected");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        ESP_LOGI(TAG, "Wi-Fi station disconnected");
+        const wifi_event_ap_stadisconnected_t *event = event_data;
+        ESP_LOGW(TAG, "Wi-Fi station disconnected: reason=%u", event->reason);
         close_client();
     }
 }
@@ -223,6 +263,8 @@ static void wifi_init_softap(void)
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Bridge boot: reset_reason=%d UART=%d baud=%d TX=%d RX=%d immediate_forward=1",
+             esp_reset_reason(), BRIDGE_UART, BRIDGE_UART_BAUD, BRIDGE_UART_TX, BRIDGE_UART_RX);
     esp_err_t nvs_result = nvs_flash_init();
     if (nvs_result == ESP_ERR_NVS_NO_FREE_PAGES || nvs_result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

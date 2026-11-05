@@ -17,6 +17,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { parseTcpPath, TcpPort } from './tcp-port.js';
@@ -76,6 +77,18 @@ function parseArgs(argv) {
 }
 
 const args = parseArgs(process.argv);
+
+const logDir = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'RM-MotorBench', 'logs');
+fs.mkdirSync(logDir, { recursive: true });
+const logPath = path.join(logDir, `link-${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}.jsonl`);
+const linkLog = fs.createWriteStream(logPath, { flags: 'a' });
+linkLog.on('error', error => console.error(`链路诊断日志写入失败: ${error.message}`));
+
+function logLink(event, details) {
+  const entry = { time: new Date().toISOString(), event, ...details };
+  linkLog.write(JSON.stringify(entry) + '\n');
+  console.log(`[${entry.time}] ${event} ${JSON.stringify(details)}`);
+}
 
 /* ---------------- 静态文件服务 ---------------- */
 
@@ -141,6 +154,7 @@ let rxTotalBytes = 0;
 
 function writeToSerial(buf) {
   if (serialPort && serialPort.isOpen) {
+    serialPort._linkStats.txBytes += buf.length;
     serialPort.write(buf);
     return true;
   }
@@ -377,6 +391,7 @@ async function openSerial(portPath, baud) {
   await previousOpening;
   try {
     if (serialPort) await closeSerial();
+    logLink('OPEN_REQUEST', { path: portPath, baud });
 
     return await new Promise((resolve, reject) => {
       const isTcp = portPath.startsWith('TCP://');
@@ -397,6 +412,13 @@ async function openSerial(portPath, baud) {
         },
       );
       sp.on('data', (chunk) => {
+      const stats = sp._linkStats;
+      const now = Date.now();
+      const gapMs = now - stats.lastRxAt;
+      stats.maxRxGapMs = Math.max(stats.maxRxGapMs, gapMs);
+      if (gapMs >= 500) logLink('RX_GAP', { path: portPath, gapMs, packetBytes: chunk.length });
+      stats.lastRxAt = now;
+      stats.rxBytes += chunk.length;
       /*
        * 【诊断】原始收包日志。
        * 固件侧已用 [tx] COMPLETE 证明数据离开了芯片,若这里仍然没有任何输出,
@@ -410,13 +432,26 @@ async function openSerial(portPath, baud) {
       }
       rxTotalBytes += chunk.length;
 
-      for (const fr of parser.push(chunk)) {
+      const frames = parser.push(chunk);
+      if (frames.length) {
+        if (stats.stalled) logLink('BOARD_DATA_RESUMED', { path: portPath, gapMs: now - stats.lastFrameAt });
+        stats.stalled = false;
+        stats.lastFrameAt = now;
+        stats.frames += frames.length;
+      }
+      for (const fr of frames) {
         if (fr.type === FrameType.HEARTBEAT) {
           const ack = parseHeartbeatAck(fr.payload);
-          if (ack) broadcast({ type: 'heartbeat', data: ack });
+          if (ack) {
+            stats.heartbeats++;
+            broadcast({ type: 'heartbeat', data: ack });
+          }
         } else if (fr.type === FrameType.TELEMETRY) {
           const tm = parseTelemetry(fr.payload);
-          if (tm) broadcast({ type: 'telemetry', data: tm });
+          if (tm) {
+            stats.telemetry++;
+            broadcast({ type: 'telemetry', data: tm });
+          }
         } else if (fr.type === FrameType.INVENTORY_REPORT) {
           const inv = parseInventory(fr.payload);
           if (inv) broadcast({ type: 'inventory', data: inv });
@@ -441,12 +476,17 @@ async function openSerial(portPath, baud) {
         }
       }
       });
+      sp.on('diagnostic', details => logLink('TCP', { path: portPath, ...details }));
       if (isTcp) sp.on('open', () => onTransportOpen(sp, portPath, baud));
       sp.on('error', (e) => {
+        logLink('TRANSPORT_ERROR', { path: portPath, code: e.code, message: e.message });
         if (isTcp && !sp.isOpen) return;
         broadcast({ type: 'error', message: `${isTcp ? 'Wi-Fi TCP' : '串口'}错误: ${e.message}` });
       });
       sp.on('close', () => {
+        clearInterval(sp._linkStats?.timer);
+        logLink('TRANSPORT_CLOSED', { path: portPath, manual: !!sp._manualClose,
+          rxBytes: sp._linkStats?.rxBytes, txBytes: sp._linkStats?.txBytes });
         if (serialPort && serialPort !== sp) return;
         const reconnectingTcp = isTcp && !sp._manualClose;
         if (serialPort === sp && !reconnectingTcp) serialPort = null;
@@ -467,15 +507,45 @@ async function openSerial(portPath, baud) {
 function onTransportOpen(sp, portPath, baud) {
   if (serialPort !== sp || !sp.isOpen || sp._motorBenchOpenNotified) return;
   sp._motorBenchOpenNotified = true;
+  startLinkDiagnostics(sp);
   broadcast({ type: 'serial', open: true, path: portPath, baud });
   startHeartbeat();
   // 立刻拉一次电机清单,让界面马上知道这块板能测哪些电机
-  sp.write(buildInventoryQuery());
+  writeToSerial(buildInventoryQuery());
+}
+
+function startLinkDiagnostics(sp) {
+  const now = Date.now();
+  const stats = sp._linkStats = { rxBytes: 0, txBytes: 0, frames: 0, heartbeats: 0,
+    telemetry: 0, lastRxAt: now, lastFrameAt: now, maxRxGapMs: 0, stalled: false };
+  let lastReportAt = now;
+  let reportedRxBytes = 0;
+  logLink('TRANSPORT_OPEN', { path: sp.path });
+  stats.timer = setInterval(() => {
+    const time = Date.now();
+    const frameIdleMs = time - stats.lastFrameAt;
+    if (frameIdleMs >= 1000 && !stats.stalled) {
+      stats.stalled = true;
+      logLink('BOARD_DATA_STALLED', { path: sp.path, frameIdleMs,
+        byteIdleMs: time - stats.lastRxAt, transportOpen: sp.isOpen });
+    }
+    if (time - lastReportAt < 5000) return;
+    logLink('LINK_STATS', { path: sp.path, rxBytes: stats.rxBytes, txBytes: stats.txBytes,
+      rxBytesPerSec: Math.round((stats.rxBytes - reportedRxBytes) * 1000 / (time - lastReportAt)),
+      frames: stats.frames, heartbeats: stats.heartbeats, telemetry: stats.telemetry,
+      maxRxGapMs: stats.maxRxGapMs, byteIdleMs: time - stats.lastRxAt, frameIdleMs });
+    reportedRxBytes = stats.rxBytes;
+    lastReportAt = time;
+  }, 500);
 }
 
 async function closeSerial() {
   stopHeartbeat();
   const closingPort = serialPort;
+  if (closingPort) {
+    clearInterval(closingPort._linkStats?.timer);
+    logLink('CLOSE_REQUEST', { path: closingPort.path });
+  }
   serialPort = null;
   if (closingPort && (closingPort.isOpen || closingPort.path?.startsWith('TCP://'))) {
     await new Promise((resolve, reject) => closingPort.close((error) => error ? reject(error) : resolve()));
@@ -537,6 +607,7 @@ async function shutdown() {
     /* 忽略 */
   }
   await closeSerial();
+  await new Promise(resolve => linkLog.end(resolve));
   process.exit(0);
 }
 process.on('SIGINT', shutdown);
@@ -553,6 +624,8 @@ if (process.send) {
 server.listen(args.port, args.host, () => {
   const port = server.address().port;
   console.log(`电机测试台上位机已启动: http://${args.host}:${port}`);
+  console.log(`链路诊断日志: ${logPath}`);
+  logLink('SERVER_START', { port, pid: process.pid });
   console.log(`默认串口波特率: ${args.baud}`);
   console.log('按 Ctrl+C 退出(退出时会自动下发全停)');
   if (process.send) process.send({ type: 'ready', port });

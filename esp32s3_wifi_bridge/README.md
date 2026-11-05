@@ -20,7 +20,7 @@ GPIO17/18 只是本工程默认值，必须按实际 ESP32-S3 开发板原理图
 
 ## 构建和烧录
 
-使用 ESP-IDF 5.x 的 PowerShell：
+使用 ESP-IDF 5.5 / 6.x 的 PowerShell：
 
 ```powershell
 cd esp32s3_wifi_bridge
@@ -37,3 +37,25 @@ idf.py -p COMx flash monitor
 - TCP keepalive 用于发现 Wi-Fi 链路失效；应用层握手用于防止误连普通 TCP 服务。
 - 断线后不保留待转发的控制帧；上位机恢复后由现有心跳重新建立 STM32 链路，电机不会自动恢复使能。
 - 先用 115200 验证。若实际 UART 仍设为 9600，需同时修改 `BRIDGE_UART_BAUD` 和 STM32 `MOTOR_BENCH_UART_BAUD_RATE`，两端必须一致。
+- UART 上行收到首字节后只读取当前已缓存的数据，立即转发；不能用长超时等待 4096 字节，否则连续 50 Hz 遥测会被攒成数秒一批，触发上位机反馈超时。
+
+在 `motor_bench_host` 中运行 `npm run test:bridge`，使用本机 GCC 编译真实的 UART 转发任务，验证连续 50 Hz 输入和缓存积压时的数据顺序及转发间隔。
+
+## 离线日志采集
+
+在 ESP-IDF PowerShell 中执行（COM34 换成 ESP32 的实际 USB 端口）：
+
+```powershell
+idf.py -p COM34 monitor --timestamps
+```
+
+进入监视器后依次按 `Ctrl+T`、`Ctrl+L` 开启文件记录，终端会显示日志文件路径；
+按 `Ctrl+]` 退出。新版固件启动行包含
+`immediate_forward=1`；每 5 秒打印 `UART stats`，包含 UART 累计收包字节数、
+批次数、最大批次、距上次 UART 收包时长和 TCP 状态。断开时记录 Wi-Fi 原因码、
+TCP 收发错误及空闲超时，发送耗时超过 100 ms 时记录 `TCP forwarding delayed`。
+这些 ESP32 日志需要烧录新版固件后才会出现；修改源码或刷新网页不能更新板上程序。
+
+上位机的持久日志在 `%LOCALAPPDATA%\RM-MotorBench\logs`。对照两份日志：
+UART 持续有数据而上位机长时间不收包，应检查桥接/网络；UART 自身长时间无数据，
+应检查 STM32、UART 接线和两端配置；TCP 或 Wi-Fi 断开会有对应事件。

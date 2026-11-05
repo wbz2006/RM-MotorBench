@@ -61,6 +61,22 @@ node server.js --host 0.0.0.0           # 允许同一局域网的手机/平板�
 
 ## 使用流程（USB 或 ESP32-S3 Wi-Fi TCP）
 
+### 离线复测与链路日志
+
+ESP32 热点默认不提供互联网，但本机上位机仍可离线运行。在本目录执行
+`node server.js --port 3001`，浏览器打开 `http://127.0.0.1:3001/`，再连接热点和页面中的 Wi-Fi TCP。
+已运行旧版后台时需要先退出再启动，刷新网页不会更新后台。
+
+每次启动自动生成日志 `%LOCALAPPDATA%\RM-MotorBench\logs\link-*.jsonl`，不依赖互联网。
+日志文件名及每条记录时间使用 UTC（北京时间加 8 小时）；启动窗口会打印完整路径。
+每 5 秒记录收发字节、接收速率、心跳和遥测帧累计数量、最长收包间隔。
+超过 1 秒无有效协议帧时记录 `BOARD_DATA_STALLED`，恢复记录 `BOARD_DATA_RESUMED`；
+`RX_GAP` 表示收包间隔超过 500 ms，`TCP` 事件记录连接、握手、错误码和重连计划。
+这些日志只观察链路，不改变页面超时或电机停机规则。
+
+复现卡顿后保留该次 `link-*.jsonl`，再切回能上网的网络即可分析。
+ESP32 USB 日志的采集命令见[桥接器说明](../esp32s3_wifi_bridge/README.md)。
+
 A 板默认经 UART7 连接 ESP32-S3 桥接器。上位机连接桥接器热点 `RM-MotorBench-ESP32`（密码 `motorbench`），在“设备接入 → ESP32-S3 Wi-Fi（TCP）”连接默认地址 `192.168.4.1:7000`。握手成功后，上位机通过 TCP 转发原有 MotorBench 协议；断线后会自动重连，控制板收到心跳超时会停止已登记电机，恢复连接后不会自动重新使能。
 
 接线与烧录：STM32 PE8/UART7_TX 接 ESP32-S3 RX GPIO18，PE7/UART7_RX 接 TX GPIO17，双方共地并使用 3.3 V UART 电平。桥接器默认 UART1 为 115200、8-N-1；具体开发板 GPIO 需按原理图核实。完整步骤见 [ESP32-S3 桥接说明](../esp32s3_wifi_bridge/README.md)。

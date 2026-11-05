@@ -63,13 +63,18 @@ export class TcpPort extends EventEmitter {
     this._socket = socket;
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 5000);
-    socket.on('connect', () => socket.write(HANDSHAKE));
+    socket.on('connect', () => {
+      this.emit('diagnostic', { state: 'connected', localAddress: socket.localAddress });
+      socket.write(HANDSHAKE);
+    });
     socket.on('data', chunk => this._onData(chunk));
     socket.on('error', error => {
+      this.emit('diagnostic', { state: 'error', code: error.code, message: error.message });
       if (!this._initialSettled) this._settleInitial(error);
       this.emit('error', error);
     });
-    socket.on('close', () => {
+    socket.on('close', hadError => {
+      this.emit('diagnostic', { state: 'closed', hadError, manual: this._manualClose });
       const wasOpen = this.isOpen;
       if (this._socket === socket) this._socket = null;
       this.isOpen = false;
@@ -90,6 +95,7 @@ export class TcpPort extends EventEmitter {
       }
       this._handshake = this._handshake.subarray(HANDSHAKE_OK.length);
       this.isOpen = true;
+      this.emit('diagnostic', { state: 'handshake_ok' });
       this._hasOpened = true;
       this._retryAttempt = 0;
       this.emit('open');
@@ -112,6 +118,7 @@ export class TcpPort extends EventEmitter {
     if (this._retryTimer) return;
     const delay = RETRY_DELAYS_MS[Math.min(this._retryAttempt, RETRY_DELAYS_MS.length - 1)];
     this._retryAttempt++;
+    this.emit('diagnostic', { state: 'reconnect_scheduled', attempt: this._retryAttempt, delayMs: delay });
     this._retryTimer = setTimeout(() => {
       this._retryTimer = null;
       this._connect();
