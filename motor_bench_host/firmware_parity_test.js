@@ -61,6 +61,18 @@ function sources(board) {
     }
   }
   for (const dir of ['application', 'modules', 'bsp']) visit(dir);
+  const config = files.get('application/robot_def.h');
+  if (board === 'motorbench-a') {
+    assert.match(config, /^#define MOTOR_BENCH_LINK_UART$/m);
+    assert.match(config, /^#define MOTOR_BENCH_UART_BAUD_RATE 115200U$/m);
+    assert.doesNotMatch(config, /^#define MOTOR_BENCH_LINK_USB$/m);
+  } else {
+    assert.match(config, /^#define MOTOR_BENCH_LINK_USB$/m);
+    assert.doesNotMatch(config, /^#define MOTOR_BENCH_LINK_UART$/m);
+  }
+  files.set('application/robot_def.h', config.replace(
+    /\/\* Select exactly one host link\.[\s\S]*?(?=\n#if defined\(MOTOR_BENCH_LINK_USB\))/,
+    '/* Board-specific host link defaults. */\n'));
   return files;
 }
 

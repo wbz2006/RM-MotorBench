@@ -1425,7 +1425,8 @@ uint8_t MotorBenchGetMeasure(uint8_t channel_id, MB_TelemetryItem_s *out)
             break;
         out->measure_speed = m->measure.speed_aps / 6.0f; /* aps -> rpm */
         out->measure_torque = (float)m->measure.real_current;
-        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? (m->measure.total_angle - ch->position_zero) / MotorBenchPositionRatio(ch->kind) : m->measure.angle_single_round;
+        /* Speed mode needs cumulative rotor degrees for host-side feeder recovery. */
+        out->measure_angle = (ch->outer_loop & ANGLE_LOOP) ? (m->measure.total_angle - ch->position_zero) / MotorBenchPositionRatio(ch->kind) : m->measure.total_angle;
         out->temperature = (int8_t)m->measure.temperature;
         /* 先判空再调用,避免 daemon 未注册时解引用空指针 */
         out->status |= (m->daemon && DaemonIsOnline(m->daemon)) ? 0x01 : 0x00;

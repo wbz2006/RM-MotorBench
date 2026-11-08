@@ -7,6 +7,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
+import { FrameParser, FrameType, buildFrame } from './protocol.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const { version } = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
@@ -20,6 +21,10 @@ let child;
 let cdp;
 let exited = false;
 let output = '';
+let bridge;
+const bridgeSockets = new Set();
+const bridgeFrames = [];
+const bridgeErrors = [];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function until(check, description, timeout = 60000) {
@@ -87,7 +92,7 @@ try {
   const checked = await command('Runtime.evaluate', {
     awaitPromise: true, returnByValue: true,
     expression: `(async () => {
-      const assets = ['index.html', 'ui.js', 'style.css', 'protocol.js', 'chart.js', 'fishbone.js', 'setpoint.js', 'calculator.js', 'calculator-ui.js', 'loader-test-ui.js'];
+      const assets = ['index.html', 'ui.js', 'style.css', 'protocol.js', 'chart.js', 'fishbone.js', 'setpoint.js', 'calculator.js', 'calculator-ui.js', 'loader-test-ui.js', 'feeder.js', 'feeder-ui.js'];
       for (const asset of assets) {
         const response = await fetch('/' + asset);
         if (!response.ok || !(await response.text()).length) throw new Error('Missing asset: ' + asset);
@@ -112,15 +117,45 @@ try {
   assert.equal(checked.exceptionDetails, undefined, JSON.stringify(checked.exceptionDetails));
   assert.equal(checked.result.value.nodeExposed, false);
   assert.deepEqual(exceptions, [], JSON.stringify(exceptions));
+  bridge = net.createServer(socket => {
+    bridgeSockets.add(socket);
+    socket.on('error', error => bridgeErrors.push(error));
+    socket.once('close', () => bridgeSockets.delete(socket));
+    socket.once('data', handshake => {
+      assert.equal(handshake.toString(), 'MBW1');
+      const parser = new FrameParser();
+      socket.on('data', bytes => {
+        for (const frame of parser.push(bytes)) {
+          bridgeFrames.push(frame.type);
+          if (frame.type === FrameType.HEARTBEAT)
+            socket.write(buildFrame(FrameType.HEARTBEAT, Buffer.from([1, 27, 0, 191, 10, 0, 0, 0])));
+        }
+      });
+      socket.write(Buffer.from('MBOK'));
+    });
+  });
+  await new Promise(resolve => bridge.listen(0, '127.0.0.1', resolve));
+  await command('Runtime.evaluate', { expression: `document.querySelector('#wifiHost').value = '127.0.0.1'; document.querySelector('#wifiPort').value = '${bridge.address().port}'; document.querySelector('#connectWifi').click();` });
+  await until(async () => {
+    const result = await command('Runtime.evaluate', {
+      expression: "document.querySelector('#wifiStatus').textContent.includes('已连接') && document.querySelector('#fwText').textContent.includes('1.27')",
+      returnByValue: true,
+    });
+    return result.result.value;
+  }, '成品 Wi-Fi 握手与控制板心跳');
+  assert.ok(bridgeFrames.includes(FrameType.HEARTBEAT));
   const screenshot = await command('Page.captureScreenshot');
   await fs.writeFile(path.join(root, 'dist', 'desktop-smoke.png'), Buffer.from(screenshot.data, 'base64'));
   await command('Page.close');
   await until(() => exited, '关闭窗口退出');
+  assert.ok(bridgeFrames.includes(FrameType.ALL_STOP), 'closing the desktop sends ALL_STOP through TCP');
+  await until(() => bridgeSockets.size === 0, '关闭窗口释放 TCP 连接', 5000);
+  assert.ok(bridgeErrors.every(error => error.code === 'ECONNRESET'));
   await until(async () => {
     try { await fetch(page.url, { signal: AbortSignal.timeout(1000) }); return false; }
     catch { return true; }
   }, '串口后台退出', 5000);
-  console.log('PASS portable EXE: Chinese/spaced path, no Node on PATH, desktop UI, assets, native serial enumeration, sandbox and clean exit.');
+  console.log('PASS portable EXE: Chinese/spaced path, no Node on PATH, desktop UI, assets, native serial enumeration, Wi-Fi TCP handshake and heartbeat, sandbox, ALL_STOP and clean exit.');
   console.log(JSON.stringify(checked.result.value));
 } finally {
   cdp?.close();
@@ -128,6 +163,8 @@ try {
     const kill = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
     await new Promise(resolve => kill.once('exit', resolve));
   }
+  for (const socket of bridgeSockets) socket.destroy();
+  if (bridge) await new Promise(resolve => bridge.close(resolve));
   // Only remove this test's own mkdtemp directory.
   assert.ok(path.resolve(temp).startsWith(path.resolve(os.tmpdir()) + path.sep));
   await fs.rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });

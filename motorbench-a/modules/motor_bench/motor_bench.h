@@ -35,7 +35,7 @@
 
 /** 固件版本号,随心跳应答上报给上位机 */
 #define MB_FW_VERSION_MAJOR 1
-#define MB_FW_VERSION_MINOR 26
+#define MB_FW_VERSION_MINOR 27
 
 /* Heartbeat flags bits 5-6 identify the compiled board; 0 means unknown. */
 #if defined(STM32F427xx)

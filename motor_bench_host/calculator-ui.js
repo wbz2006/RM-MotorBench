@@ -1,12 +1,13 @@
 import { calculateLoaderSpeed } from './calculator.js';
 import { initLoaderTest } from './loader-test-ui.js';
+import { initFeederMode } from './feeder-ui.js';
 
 const format = value => value !== 0 && Math.abs(value) < 0.001
   ? value.toExponential(3)
   : String(Number(value.toFixed(3)));
 
 /** Each channel owns its inputs and results; onResult only fills its local target. */
-export function initCalculator(host, prefix, onResult, positionAdapter) {
+export function initCalculator(host, prefix, onResult, positionAdapter, feederAdapter) {
   host.appendChild(document.getElementById('calculatorTpl').content.cloneNode(true));
   const speedBody = host.querySelector('.calculator-body');
   const get = name => host.querySelector(`[data-calc="${name}"]`);
@@ -61,19 +62,32 @@ export function initCalculator(host, prefix, onResult, positionAdapter) {
   });
   update();
   const position = initLoaderTest(host, positionAdapter);
+  const feeder = initFeederMode(host, feederAdapter);
   return {
     get positionLocked() { return position.locked; },
-    refresh: () => type === 'loader' ? update() : position.refresh(),
-    fill: () => type === 'loader' ? update(true) : position.refresh(),
+    get feederLocked() { return feeder.locked; },
+    enableFeeder() {
+      if (type !== 'feeder' || host.closest('[data-role="calculatorPanel"]').hidden) return false;
+      feeder.enable();
+      return true;
+    },
+    refresh() {
+      feeder.refresh();
+      if (type === 'loader') update();
+      if (type === 'loaderPosition') position.refresh();
+    },
+    fill: () => type === 'loader' ? update(true) : type === 'feeder' ? feeder.refresh() : position.refresh(),
     setType(value) {
       type = value;
       speedBody.hidden = type !== 'loader';
       position.show(type === 'loaderPosition');
+      feeder.show(type === 'feeder');
       onResult(null, false);
       if (type === 'loader') update(true);
     },
     stopPositionTest: (message, disable) => position.stop(message, disable),
+    stopFeeder: (message, disable) => feeder.stop(message, disable),
     positionAck: ack => position.acknowledge(ack),
-    destroy: () => position.destroy(),
+    destroy: () => { position.destroy(); feeder.destroy(); },
   };
 }

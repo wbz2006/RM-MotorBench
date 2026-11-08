@@ -7,7 +7,7 @@ import path from 'node:path';
 
 test('bridge forwards continuous 50 Hz UART telemetry without waiting for a full buffer', () => {
   const source = fs.readFileSync(new URL('../esp32s3_wifi_bridge/main/main.c', import.meta.url), 'utf8');
-  const task = source.match(/static void uart_to_tcp_task\(void \*arg\)\n\{[\s\S]*?\n\}/)?.[0];
+  const task = source.match(/static void uart_to_tcp_task\(void \*arg\)\r?\n\{[\s\S]*?\r?\n\}/)?.[0];
   assert.ok(task, 'test must compile the actual bridge task');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-bridge-uart-'));
   const env = { ...process.env };

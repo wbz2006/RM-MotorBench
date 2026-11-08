@@ -421,6 +421,13 @@ function buildChannels(count = inventory.length) {
         displayTarget: target => setDisplayedRef(i, target),
         disable: () => { if (ws.readyState === 1) send({ type: 'enable', channelId: i, enable: false }); },
         onLockChange: () => renderProgram(i),
+      }, {
+        getState: () => feederState(i),
+        enable: ref => send({ type: 'enable', channelId: i, enable: true, ref }, true),
+        setSpeed: ref => send({ type: 'setRef', channelId: i, ref }, true),
+        displayTarget: target => setDisplayedRef(i, target),
+        disable: () => { if (ws.readyState === 1) send({ type: 'enable', channelId: i, enable: false }); },
+        onLockChange: () => renderProgram(i),
       }));
     added.push(i);
   }
@@ -439,9 +446,12 @@ function ch(i) {
 
 /* ---------------- 指令发送 ---------------- */
 
-function send(obj) {
+function send(obj, feederOutput = false) {
   const calculator = channelCalculators.get(obj.channelId);
   if (obj.type === 'setRef' && calculator?.positionLocked) return;
+  if (obj.type === 'setRef' && calculator?.feederLocked && !feederOutput) return;
+  if (calculator?.feederLocked && !feederOutput && ['unbind', 'setLoop', 'pidSet', 'enable'].includes(obj.type))
+    calculator.stopFeeder('控制状态已更改 · 拨弹已退出', obj.type !== 'enable' || obj.enable);
   if (obj.type === 'positionStep') {
     const state = loaderTestState(obj.channelId);
     if (!calculator?.positionLocked || state.reason || !state.positionMode || !state.enabled) return;
@@ -451,6 +461,7 @@ function send(obj) {
   if (obj.type === 'closeSerial' || obj.type === 'removeMotor') {
     for (const item of channelCalculators.values()) {
       if (item.positionLocked) item.stopPositionTest('连接或电机已更改 · 测试已停机', true);
+      if (item.feederLocked) item.stopFeeder('连接或电机已更改 · 拨弹已停机', true);
     }
   }
   if (obj.type === 'stopAll' || obj.type === 'resetChannels' || obj.type === 'closeSerial') {
@@ -512,6 +523,25 @@ function canRunProgram(i) {
     !pendingUnbindChannels.has(i) && !pendingPidApplies.has(i) && !document.hidden;
 }
 
+function feederState(i) {
+  const t = telemetryByChannel.get(i);
+  const mask = boundLoopMasks.get(i) ?? readLoopMask(i);
+  const kind = currentChannelKind(i);
+  const spec = MOTOR_SPEC[MotorKindLabel[kind]];
+  const [major, minor] = String(firmwareVersion ?? '0.0').split('.').map(Number);
+  const reason = !canControlChannel(i) || !t?.online || performance.now() - t.receivedAt > 500 ? '请检查连接，等待最新电机反馈' :
+    !(major > 1 || (major === 1 && minor >= 27)) ? '拨弹盘模式需要累计角度遥测，请更新对应控制板固件至 1.27' :
+    !(mask & LoopType.SPEED_LOOP) || (mask & LoopType.ANGLE_LOOP) ? '请先切换为速度闭环' :
+    pendingPidApplies.has(i) ? '请等待 PID 应用完成' :
+    setpointPrograms.has(i) ? '请先停止预设自动输出' :
+    document.hidden ? '请返回当前页面' :
+    ![t.speed, t.torque, t.angle, t.ref].every(Number.isFinite) ? '速度、负载或角度反馈无效' : '';
+  return { reason, enabled: !!t?.enabled, unit: spec?.unit || 'rpm', limit: spec?.range || 0,
+    loadUnit: spec?.feedbackUnit || 'raw', speed: t?.speed, load: t?.torque, rotorAngle: t?.angle,
+    anglePeriod: [MotorKind.DM, MotorKind.DM8009P].includes(kind) ? 25 * 180 / Math.PI : 0,
+    ref: t?.ref, receivedAt: t?.receivedAt, identity: `${kind}:${ch(i).querySelector('[data-role="motor"]').value}` };
+}
+
 function programMessage(i, message, error = false) {
   const el = ch(i)?.querySelector('[data-role="presetStatus"]');
   if (!el) return;
@@ -555,6 +585,8 @@ function selectChannelTool(i, name) {
   const el = ch(i);
   if (name !== 'calculator' && channelCalculators.get(i)?.positionLocked)
     channelCalculators.get(i).stopPositionTest('已切换工具 · 测试已停机', true);
+  if (name !== 'calculator' && channelCalculators.get(i)?.feederLocked)
+    channelCalculators.get(i).stopFeeder('已切换工具 · 拨弹已停机', true);
   el.dataset.tool = name;
   renderChannel(i);
   if (name === 'calculator') channelCalculators.get(i)?.fill();
@@ -579,6 +611,7 @@ function renderProgram(i) {
   if (!el) return;
   const running = setpointPrograms.has(i);
   const positionLocked = channelCalculators.get(i)?.positionLocked;
+  const feederLocked = channelCalculators.get(i)?.feederLocked;
   const positionMode = !!((boundLoopMasks.get(i) ?? readLoopMask(i)) & LoopType.ANGLE_LOOP);
   const mode = el.querySelector('[data-role="presetMode"]').value;
   el.querySelector('[data-role="presetPanel"]').dataset.running = String(running);
@@ -588,10 +621,10 @@ function renderProgram(i) {
   el.querySelector('[data-role="presetCycleCount"]').hidden = infinite;
   for (const input of el.querySelectorAll('.setpoint-program input, .setpoint-program select')) input.disabled = running || positionMode;
   el.querySelector('[data-role="presetCycles"]').disabled = running || positionMode || infinite;
-  el.querySelector('[data-role="presetStart"]').disabled = running || !canRunProgram(i);
+  el.querySelector('[data-role="presetStart"]').disabled = running || feederLocked || !canRunProgram(i);
   el.querySelector('[data-role="presetStart"]').textContent = running ? '正在输出…' : '▶ 启动预设';
   el.querySelector('[data-role="presetStop"]').disabled = !running;
-  for (const role of ['num', 'slider']) el.querySelector(`[data-role="${role}"]`).disabled = running || positionLocked || !canControlChannel(i) || pendingPidApplies.has(i);
+  for (const role of ['num', 'slider']) el.querySelector(`[data-role="${role}"]`).disabled = running || positionLocked || feederLocked || !canControlChannel(i) || pendingPidApplies.has(i);
   el.querySelector('[data-role="zero"]').disabled = positionLocked || !canControlChannel(i);
   if (positionLocked) {
     const num = el.querySelector('[data-role="num"]');
@@ -620,6 +653,7 @@ function stopAllPrograms(message, disable = false) {
   }
   for (const calculator of channelCalculators.values()) {
     if (calculator.positionLocked) calculator.stopPositionTest(message, disable);
+    if (calculator.feederLocked) calculator.stopFeeder(message, disable);
   }
 }
 
@@ -650,7 +684,7 @@ function tickProgram(i) {
 }
 
 function startProgram(i) {
-  if (setpointPrograms.has(i)) return;
+  if (setpointPrograms.has(i) || channelCalculators.get(i)?.feederLocked) return;
   if (!canRunProgram(i)) return programMessage(i, '请先绑定并使能速度环电机，等待最新反馈', true);
   const el = ch(i);
   const r = (role) => el.querySelector(`[data-role="${role}"]`);
@@ -685,6 +719,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('blur', () => {
   for (const calculator of channelCalculators.values()) {
     if (calculator.positionLocked) calculator.stopPositionTest('窗口失去焦点 · 测试已停机', true);
+    if (calculator.feederLocked) calculator.stopFeeder('窗口失去焦点 · 拨弹已停机', true);
   }
 });
 
@@ -1623,6 +1658,7 @@ function bindEvents() {
       if (!canControlChannel(i)) return;
       const t = telemetryByChannel.get(i);
       const enable = !(t && t.enabled);
+      if (enable && channelCalculators.get(i)?.enableFeeder()) return;
       if (enable && Number(num.value) !== 0) {
         if (!confirm('该通道当前设定值不为 0,使能后电机会立即转动。确认继续?')) return;
       }
@@ -1631,6 +1667,7 @@ function bindEvents() {
 
     r('zero').onclick = () => {
       if (channelCalculators.get(i)?.positionLocked) return;
+      if (channelCalculators.get(i)?.feederLocked) channelCalculators.get(i).stopFeeder('已归零 · 拨弹已退出', false);
       cancelPidResume(i);
       stopProgram(i, '已停止 · 目标已归零');
       slider.value = '0';

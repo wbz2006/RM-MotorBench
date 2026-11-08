@@ -75,6 +75,11 @@ input[type='checkbox'] { width: 14px; height: 14px; accent-color: var(--accent);
 .loader-test { display: grid; gap: 14px; }
 .loader-test > * { min-width: 0; }
 .loader-test[hidden] { display: none; }
+.feeder-mode { display: grid; gap: 14px; min-width: 0; }
+.feeder-mode[hidden] { display: none; }
+.feeder-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.feeder-mode [data-feeder='status'] { min-height: 3.4em; margin: 0; }
+.feeder-mode [data-feeder='status'].error { color: var(--danger); }
 .loader-test-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 155px), 1fr)); gap: 12px; }
 .loader-test-settings label { display: grid; grid-template-rows: 38px 36px; min-width: 0; gap: 6px; }
 .loader-field-title { display: flex; flex-direction: column; justify-content: flex-end; line-height: 18px; }

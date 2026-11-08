@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101211" />
     <title>MOTORBENCH / 电机测试台</title>
-    <link rel="stylesheet" href="style.css?v=20261025-chart-layout" />
+    <link rel="stylesheet" href="style.css?v=20261107-esp32s3-feeder-rate" />
   </head>
   <body>
     <a class="skip-link" href="#channels">跳转到电机通道</a>
@@ -21,9 +21,9 @@
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M2 12h4l3-7 6 14 3-7h4" /></svg>
         <span>控制</span>
       </a>
-      <a class="rail-link" href="#channels" data-open-calculator aria-label="计算器" title="计算器">
+      <a class="rail-link" href="#channels" data-open-calculator aria-label="模式控制器" title="模式控制器">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M8 6h8M8 11h2m4 0h2m-8 4h2m4 0h2m-8 4h2m4 0h2"/></svg>
-        <span>计算</span>
+        <span>模式</span>
       </a>
       <span class="rail-foot" aria-hidden="true">RM / LAB</span>
     </aside>
@@ -196,6 +196,38 @@
         <button type="button" class="loader-test-pad" data-test="pad" disabled aria-label="拨弹测试触发区"><strong data-test="padLabel">鼠标左键按下触发</strong><span>每次按下执行一组 · 长按不重复 · 到位并松开后可再次触发</span></button>
         <p data-test="status" class="preset-status" role="status">填写参数后，使用上方按钮切换位置环、使能并开始测试。</p>
         <p class="calculator-note">到位容差默认本次步进的 5%，连续两帧进入容差即可完成。DJI 电机在容差内停止微小追位，速度环继续制动；下一次从原目标累计，避免逐发丢失角度。测试期间锁定滑块、角度输入及归零；空格急停始终有效。</p>
+      </div>
+    </template>
+
+    <template id="feederModeTpl">
+      <div class="feeder-mode" hidden>
+        <div class="loader-test-settings">
+          <label><span class="loader-field-title">目标射频 <small>发/秒</small></span><input data-feeder="rate" type="number" min="0" step="any" value="8" /></label>
+          <label><span class="loader-field-title">拨盘每圈发数 <small>发/圈</small></span><input data-feeder="rounds" type="number" min="1" step="1" placeholder="按实际拨盘填写" /></label>
+          <label><span class="loader-field-title">传动方式</span><select data-feeder="drive"><option value="direct">直驱 · 1:1</option><option value="reduction">减速传动</option></select></label>
+          <label data-feeder="ratioWrap" hidden><span class="loader-field-title">总减速比 <small>目标轴 : 拨盘</small></span><input data-feeder="ratio" type="number" min="0" step="any" value="36" /></label>
+          <label><span class="loader-field-title">拨弹方向</span><select data-feeder="direction"><option value="1">正向 +</option><option value="-1">负向 −</option></select></label>
+          <label><span class="loader-field-title">基准峰值倍数</span><input data-feeder="factor" type="number" min="1.01" max="10" step="0.05" value="1.3" /></label>
+          <label><span class="loader-field-title">负载阈值 <small data-feeder="loadUnit">raw</small></span><input data-feeder="threshold" type="number" min="0" step="any" placeholder="采集后自动填入，可调整" disabled /></label>
+          <label><span class="loader-field-title">低速判据 <small>实际正向转速 / 目标 %</small></span><input data-feeder="lowSpeed" type="number" min="1" max="79" value="30" /></label>
+          <label><span class="loader-field-title">判定持续时间 <small>ms · 至少两个遥测间隔</small></span><input data-feeder="detectMs" type="number" min="100" max="5000" step="50" value="300" /></label>
+          <label><span class="loader-field-title">回退角度 <small>拨弹盘 °</small></span><input data-feeder="reverseAngle" type="number" min="0.1" max="360" step="any" value="10" /></label>
+          <label><span class="loader-field-title">回退转速 <small>拨弹盘 rpm</small></span><input data-feeder="reverseRpm" type="number" min="0.1" max="600" step="any" value="10" /></label>
+          <label><span class="loader-field-title">回退超时 <small>秒</small></span><input data-feeder="reverseTimeout" type="number" min="0.5" max="30" step="0.5" value="3" /></label>
+          <label><span class="loader-field-title">连续解卡上限 <small>次</small></span><input data-feeder="retries" type="number" min="1" max="10" step="1" value="3" /></label>
+        </div>
+        <p class="calculator-note">DJI 目标轴为转子，M2006 / M3508 总减速比需计入内置 36 / 19；DM 目标轴为输出轴，直连拨盘选 1:1。填写本区参数后点击上方使能，自动按目标转速运行、采集基准并启用防卡弹；采集期间请确认正常带弹运行。</p>
+        <div class="loader-test-readouts">
+          <span><span>目标转速</span><output data-feeder="target">—</output></span>
+          <span><span>实时负载绝对值</span><output data-feeder="load">—</output></span>
+          <span><span>正常峰值 / 样本数</span><output data-feeder="baseline">未采集</output></span>
+          <span><span>当前状态</span><output data-feeder="phase">未接管</output></span>
+          <span><span>本轮卡弹次数</span><output data-feeder="jams">0</output></span>
+          <span title="本轮卡弹次数 ÷ 按拨弹盘实际转角估算的发数；回退后重复拨过的角度不重复计数，采样阶段不计入。"><span>卡弹率（估算）</span><output data-feeder="jamRate">—</output><output data-feeder="jamRatio">0 / 0 发</output></span>
+        </div>
+        <div class="feeder-actions"><button type="button" data-feeder="capture">重新采集并启用 · 3 秒</button><button type="button" class="primary" data-feeder="start" disabled>使用当前基准启动</button><button type="button" data-feeder="stop">停止拨弹</button></div>
+        <p class="calculator-note" data-feeder="status" role="status"></p>
+        <p class="calculator-note">阈值默认取正常遥测负载峰值 × 1.3，本轮固定；修改射频、传动、方向或电机后需重采。DJI 使用原始电流 raw，DM 使用转矩 N·m。超阈值且低速持续满足才解卡；启动和恢复后等待 1 秒，再开始判定。正常回稳 1 秒后重置连续解卡次数。电脑端按遥测角度结束回退，实际角度受反馈与通信延迟影响；空格急停始终有效。</p>
       </div>
     </template>
 
@@ -448,7 +480,7 @@
           <div class="channel-tools">
             <div class="tool-tabs" role="tablist" aria-label="通道工具">
               <button data-role="presetTab" role="tab" aria-selected="true">自动输出</button>
-              <button data-role="calculatorTab" role="tab" aria-selected="false" tabindex="-1">计算器</button>
+              <button data-role="calculatorTab" role="tab" aria-selected="false" tabindex="-1">模式控制器</button>
             </div>
             <div class="setpoint-program" data-role="presetPanel" role="tabpanel">
               <div class="preset-content" data-role="presetContent">
@@ -506,7 +538,7 @@
               </div>
             </div>
             <div class="channel-calculator" data-role="calculatorPanel" role="tabpanel" hidden>
-              <label class="calculator-picker">计算器类型<select data-role="calculatorType"><option value="loader">射频 → 转速</option><option value="loaderPosition">单发 / 双发位置测试</option></select></label>
+              <label class="calculator-picker">控制模式<select data-role="calculatorType"><option value="loader">射频 → 转速</option><option value="feeder">拨弹盘 · 速度闭环防卡弹</option><option value="loaderPosition">单发 / 双发位置测试</option></select></label>
               <div data-role="calculatorContent"></div>
               <p data-role="calculatorWriteStatus" class="preset-status" role="status"></p>
             </div>
@@ -527,11 +559,11 @@
 
     <footer class="hint">
       <p>
-        <span class="footer-label">UI 20261025-chart-layout</span>
+        <span class="footer-label">UI 20261107-esp32s3-feeder-rate</span>
       </p>
     </footer>
     </div>
 
-    <script type="module" src="ui.js?v=20261104-esp32s3-wifi"></script>
+    <script type="module" src="ui.js?v=20261107-esp32s3-feeder-rate"></script>
   </body>
 </html>

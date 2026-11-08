@@ -617,6 +617,10 @@ static int loop_switch(void) {
     CHECK(MotorBenchSetPid(0, MB_PID_LOOP_ANGLE, 4.5f, 0, 0, 100, 0, 0) == MB_OK);
     CHECK(MotorBenchSetEnable(0, 1) == MB_OK);
     CHECK(MotorBenchSetRef(0, 300) == MB_OK);
+    a->measure.total_angle = 72180;
+    a->measure.angle_single_round = 180;
+    MB_TelemetryItem_s speed_feedback;
+    CHECK(MotorBenchGetMeasure(0, &speed_feedback) == MB_OK && speed_feedback.measure_angle == 72180);
     CHECK(MotorBenchSetEnable(1, 1) == MB_OK);
     CHECK(MotorBenchSetRef(1, 3) == MB_OK);
     tick(); DMMotorControl();
@@ -1573,7 +1577,7 @@ try {
     const edit = ui.slice(editStart, ui.indexOf('    for (const role of', editStart));
     const ackStart = ui.indexOf("    case 'pidAck': {");
     const ack = ui.slice(ackStart, ui.indexOf("    case 'error': {", ackStart));
-    const send = ui.slice(ui.indexOf('function send(obj)'), ui.indexOf('/* ---------------- 自动转速输出'));
+    const send = ui.slice(ui.indexOf('function send(obj,'), ui.indexOf('/* ---------------- 自动转速输出'));
     const cleanup = ui.slice(ui.indexOf('function cancelPidResume'), ui.indexOf('function clearTestChannels'));
     assert.ok(editStart > 0 && ackStart > 0);
     const commands = [], stops = [], pending = new Map();
@@ -1642,9 +1646,9 @@ try {
   let enabled = false;
   let accepted = true;
   const num = { value: '0' };
-  const click = new Function('telemetryByChannel', 'i', 'num', 'confirm', 'send', 'canControlChannel', clickBody);
+  const click = new Function('telemetryByChannel', 'i', 'num', 'confirm', 'send', 'canControlChannel', 'channelCalculators', clickBody);
   const runClick = () => click(new Map([[1, { enabled }]]), 1, num, () => accepted,
-    (cmd) => context.handleCommand(cmd), () => true);
+    (cmd) => context.handleCommand(cmd), () => true, new Map());
   runClick();
   let frames = new FrameParser().push(writes.pop());
   assert.equal(frames.length, 2);
@@ -1729,7 +1733,7 @@ try {
   const closeFunction = server.match(/async function closeSerial\(\) \{[\s\S]*?\n\}/)?.[0];
   let completeClose;
   const closeContext = { serialPort: { isOpen: true, close: callback => { completeClose = callback; } },
-    stopHeartbeat: () => {} };
+    stopHeartbeat: () => {}, clearInterval, logLink: () => {} };
   vm.runInNewContext(closeFunction, closeContext);
   const closing = closeContext.closeSerial();
   assert.equal(closeContext.serialPort, null);

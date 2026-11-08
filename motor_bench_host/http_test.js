@@ -31,9 +31,9 @@ test('static assets bypass cache and versioned root loads the current PID interf
       assert.equal(await response.text(), fs.readFileSync(path.join(root, file), 'utf8'), route);
     }
     const html = await (await fetch(base + '/?v=20261019-dm4310-defaults')).text();
-    assert.match(html, /UI 20261025-chart-layout/);
-    assert.match(html, /style\.css\?v=20261025-chart-layout/);
-    assert.match(html, /ui\.js\?v=20261104-esp32s3-wifi/);
+    assert.match(html, /UI 20261107-esp32s3-feeder-rate/);
+    assert.match(html, /style\.css\?v=20261107-esp32s3-feeder-rate/);
+    assert.match(html, /ui\.js\?v=20261107-esp32s3-feeder-rate/);
     assert.doesNotMatch(html, /pid-workflow-note|pidTuningHint|data-role="pidLoop"/);
     assert.match(html, /data-role="pidPanel" data-loop="0"/);
     assert.match(html, /pMaxOutUnit/);
